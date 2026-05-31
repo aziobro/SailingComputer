@@ -21,8 +21,8 @@
 #define NTRIP_RECONNECT_MS   30000
 #define NTRIP_FAILOVER_COUNT 3
 
-// COG smoothing — suppress updates below this speed (knots)
-#define COG_MIN_SOG_KTS   0.3f
+// COG smoothing — default minimum speed; overridden by Config::cogMinSog at runtime
+#define COG_MIN_SOG_DEFAULT 0.1f
 // EMA alpha range: alpha=MIN at COG_MIN_SOG, alpha=MAX at COG_FAST_SOG and above
 // Lower alpha = heavier smoothing (more lag); higher = faster response
 #define COG_ALPHA_MIN     0.05f   // heavy smoothing at low speed
@@ -55,6 +55,9 @@ struct Config {
     // Antenna heading offset (degrees added to UM982 heading before use)
     // Default 90° for port/starboard aft-rail mounting (ANT1=stbd, ANT2=port)
     float headingOffset   = 90.0f;
+
+    // Minimum SOG (knots) required before COG updates — suppresses GPS noise at rest
+    float cogMinSog       = COG_MIN_SOG_DEFAULT;
 
     // AP credentials (editable)
     char apSSID[64]       = DEFAULT_AP_SSID;
@@ -94,7 +97,8 @@ public:
             }
         }
 
-        cfg.headingOffset = prefs.getFloat("hdgOffset", 90.0f);
+        cfg.headingOffset = prefs.getFloat("hdgOffset",  90.0f);
+        cfg.cogMinSog     = prefs.getFloat("cogMinSog",  COG_MIN_SOG_DEFAULT);
 
         prefs.getString("apSSID", cfg.apSSID,     sizeof(cfg.apSSID));
         prefs.getString("apPass", cfg.apPassword, sizeof(cfg.apPassword));
@@ -120,7 +124,8 @@ public:
             snprintf(key, sizeof(key), "n%denabled", i); prefs.putBool(key,    cfg.ntrip[i].enabled);
         }
 
-        prefs.putFloat ("hdgOffset", cfg.headingOffset);
+        prefs.putFloat ("hdgOffset",  cfg.headingOffset);
+        prefs.putFloat ("cogMinSog",  cfg.cogMinSog);
         prefs.putString("apSSID", cfg.apSSID);
         prefs.putString("apPass", cfg.apPassword);
         prefs.end();

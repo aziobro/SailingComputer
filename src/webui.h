@@ -125,7 +125,10 @@ inline String getWebUI() {
       <h2>Antenna</h2>
       <label>Heading Offset (&deg;)</label>
       <input type="number" name="headingOffset" id="headingOffset" value="90" min="-360" max="360" step="0.1">
-      <p style="font-size:0.8rem;color:#8899aa;margin:0.25rem 0 0">Degrees added to UM982 heading. Default 90&deg; for port/starboard aft-rail mounting (ANT1=stbd, ANT2=port). Set 0 for fore/aft mounting.</p>
+      <p style="font-size:0.8rem;color:#8899aa;margin:0.25rem 0 0.75rem">Degrees added to UM982 heading. Default 90&deg; for port/starboard aft-rail mounting (ANT1=stbd, ANT2=port). Set 0 for fore/aft mounting.</p>
+      <label>COG Minimum SOG (knots)</label>
+      <input type="number" name="cogMinSog" id="cogMinSog" value="0.1" min="0" max="5" step="0.1">
+      <p style="font-size:0.8rem;color:#8899aa;margin:0.25rem 0 0">COG is frozen below this speed to suppress GPS position noise. Default 0.1 kts. Increase if COG is still unstable at rest.</p>
     </div>
     <div class="card">
       <h2>NTRIP Corrections</h2>
@@ -227,7 +230,7 @@ function updateStatus() {
     if (d.cog != null) {
       cogEl.textContent = Number(d.cog).toFixed(1) + '\u00b0';
       cogEl.style.opacity = d.cogValid ? '1' : '0.4';
-      cogEl.title = d.cogValid ? '' : 'Frozen \u2014 speed below 0.3 kts';
+      cogEl.title = d.cogValid ? '' : 'Frozen \u2014 speed below ' + (d.cogMinSog || 0.1) + ' kts';
     }
     setText('s-hdop', d.hdop != null ? Number(d.hdop).toFixed(2) : '--');
     setText('s-alt',  d.altitude != null ? Number(d.altitude).toFixed(1) + ' m' : '--');
@@ -287,6 +290,7 @@ function loadConfig() {
     document.getElementById('apMode').checked = d.apMode;
     document.getElementById('wifiSSID').value  = d.wifiSSID || '';
     document.getElementById('headingOffset').value = d.headingOffset != null ? d.headingOffset : 90;
+    document.getElementById('cogMinSog').value     = d.cogMinSog     != null ? d.cogMinSog     : 0.1;
     document.getElementById('apSSID').value    = d.apSSID || '';
     buildNtripSources(d.ntrip || [{},{},{}]);
     toggleAPFields();

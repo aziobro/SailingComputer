@@ -144,7 +144,7 @@ static void parseHDT(const char* s) {
 // Below COG_MIN_SOG_KTS the filter is frozen — GPS position noise at low speed
 // causes wild COG swings that are meaningless for navigation.
 static void updateCOG(float rawCog, float speedKts) {
-    if (speedKts < COG_MIN_SOG_KTS) return; // frozen — not moving
+    if (speedKts < cfgMgr.cfg.cogMinSog) return; // frozen — speed below configured threshold
 
     if (!cogInitialized) {
         cogFiltered    = rawCog;
@@ -154,7 +154,8 @@ static void updateCOG(float rawCog, float speedKts) {
 
     // Alpha scales linearly from COG_ALPHA_MIN at minimum speed to
     // COG_ALPHA_MAX at COG_FAST_SOG_KTS and above.
-    float t     = (speedKts - COG_MIN_SOG_KTS) / (COG_FAST_SOG_KTS - COG_MIN_SOG_KTS);
+    float minSog = cfgMgr.cfg.cogMinSog;
+    float t      = (speedKts - minSog) / (COG_FAST_SOG_KTS - minSog);
     float alpha = COG_ALPHA_MIN + constrain(t, 0.0f, 1.0f) * (COG_ALPHA_MAX - COG_ALPHA_MIN);
 
     // Circular EMA — blend sin/cos components then recover the angle.
@@ -440,7 +441,8 @@ static void handleStatus() {
     json += "\"hdtValid\":"      + String(hdtValid ? "true" : "false") + ",";
     json += "\"sog\":"           + String(sog, 2) + ",";
     json += "\"cog\":"           + String(cogFiltered, 1) + ",";
-    json += "\"cogValid\":"      + String(cogInitialized && sog >= COG_MIN_SOG_KTS ? "true" : "false") + ",";
+    json += "\"cogValid\":"      + String(cogInitialized && sog >= cfgMgr.cfg.cogMinSog ? "true" : "false") + ",";
+    json += "\"cogMinSog\":"     + String(cfgMgr.cfg.cogMinSog, 2) + ",";
     json += "\"sats\":"          + String(satCount) + ",";
     json += "\"hdop\":"          + String(hdop, 2) + ",";
     json += "\"altitude\":"      + String(altitude, 2) + ",";
@@ -474,6 +476,7 @@ static void handleGetConfig() {
     }
     json += "],";
     json += "\"headingOffset\":" + String(cfg.headingOffset, 1) + ",";
+    json += "\"cogMinSog\":"     + String(cfg.cogMinSog, 2) + ",";
     json += "\"apSSID\":\"" + String(cfg.apSSID) + "\"";
     json += "}";
     webServer.send(200, "application/json", json);
@@ -511,6 +514,7 @@ static void handleSaveConfig() {
     }
 
     if (webServer.hasArg("headingOffset")) cfg.headingOffset = webServer.arg("headingOffset").toFloat();
+    if (webServer.hasArg("cogMinSog"))     cfg.cogMinSog     = webServer.arg("cogMinSog").toFloat();
     if (webServer.hasArg("apSSID"))    strlcpy(cfg.apSSID, webServer.arg("apSSID").c_str(), sizeof(cfg.apSSID));
     if (webServer.hasArg("apPassword")) { String v = webServer.arg("apPassword"); if (v.length() > 0 && v != "(unchanged)") strlcpy(cfg.apPassword, v.c_str(), sizeof(cfg.apPassword)); }
     cfgMgr.save();
