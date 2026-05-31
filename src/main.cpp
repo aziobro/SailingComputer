@@ -4,6 +4,7 @@
 #include <WiFiServer.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <Update.h>
 #include "config.h"
 #include "webui.h"
 #include "um982.h"
@@ -501,6 +502,79 @@ static void handleRestart() {
     ESP.restart();
 }
 
+// ── OTA firmware update ────────────────────────────────────────────────────────
+
+static bool otaError = false;
+
+// Receives the binary upload chunk by chunk and writes it to flash.
+static void handleOTAUpload() {
+    HTTPUpload& upload = webServer.upload();
+
+    if (upload.status == UPLOAD_FILE_START) {
+        otaError = false;
+        Serial.printf("[OTA] Receiving: %s (%u bytes)\n",
+                      upload.filename.c_str(), upload.totalSize);
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+            otaError = true;
+            Serial.printf("[OTA] begin() failed: %s\n", Update.errorString());
+        }
+
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (!otaError) {
+            if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+                otaError = true;
+                Serial.printf("[OTA] write() failed: %s\n", Update.errorString());
+            }
+        }
+
+    } else if (upload.status == UPLOAD_FILE_END) {
+        if (!otaError) {
+            if (!Update.end(true)) {
+                otaError = true;
+                Serial.printf("[OTA] end() failed: %s\n", Update.errorString());
+            } else {
+                Serial.printf("[OTA] Flash complete — %u bytes written\n", upload.totalSize);
+            }
+        }
+    }
+}
+
+// Called after upload completes — sends result page then reboots on success.
+static void handleOTAComplete() {
+    if (otaError) {
+        webServer.send(500, "text/html",
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>OTA Failed</title>"
+            "<style>body{font-family:system-ui;background:#0a1628;color:#e0e8f0;"
+            "display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}"
+            ".box{background:#0d1f3c;border:1px solid #1e3a5f;border-radius:8px;padding:2rem;max-width:400px;text-align:center;}"
+            "h2{color:#ff6b6b;} a{color:#4a9eff;}</style></head>"
+            "<body><div class='box'><h2>&#10007; Update Failed</h2>"
+            "<p>" + String(Update.errorString()) + "</p>"
+            "<p><a href='/'>Back to dashboard</a></p>"
+            "</div></body></html>");
+    } else {
+        webServer.send(200, "text/html",
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>OTA Success</title>"
+            "<style>body{font-family:system-ui;background:#0a1628;color:#e0e8f0;"
+            "display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}"
+            ".box{background:#0d1f3c;border:1px solid #1e3a5f;border-radius:8px;padding:2rem;max-width:400px;text-align:center;}"
+            "h2{color:#4ade80;} .note{color:#8899aa;font-size:0.85rem;}"
+            "</style>"
+            "<script>setTimeout(()=>location.href='/',9000)</script>"
+            "</head><body><div class='box'>"
+            "<h2>&#10003; Update Successful</h2>"
+            "<p>Firmware flashed. Device is restarting&hellip;</p>"
+            "<p class='note'>Redirecting to dashboard in 9 seconds.</p>"
+            "</div></body></html>");
+        delay(500);
+        ESP.restart();
+    }
+}
+
 // ── Setup ─────────────────────────────────────────────────────────────────────
 
 void setup() {
@@ -554,6 +628,7 @@ void setup() {
     webServer.on("/config/save", HTTP_POST, handleSaveConfig);
     webServer.on("/restart",     HTTP_POST, handleRestart);
     webServer.on("/um982reset",  HTTP_POST, handleUM982Reset);
+    webServer.on("/update",      HTTP_POST, handleOTAComplete, handleOTAUpload);
     webServer.begin();
     Serial.println("[Web] HTTP server started");
     Serial.println("[Boot] Ready");

@@ -140,13 +140,40 @@ inline String getWebUI() {
 <div id="system" class="page">
   <div class="card">
     <h2>System</h2>
-    <p style="font-size:0.85rem; color:#7a9ab8; margin-bottom:16px;">
+    <p style="font-size:0.85rem;color:#7a9ab8;margin-bottom:1rem;">
       NMEA sentences are broadcast on TCP port <strong style="color:#5ab4e8">10110</strong>.<br>
       Connect SignalK, OpenCPN, or any chart plotter to <span id="sysIP">--</span>:10110.
     </p>
     <button class="btn btn-danger" onclick="doRestart()">Restart Device</button>
     <button class="btn btn-danger" onclick="doUM982Reset()" style="margin-top:0.5rem">UM982 Factory Reset</button>
     <p style="font-size:0.8rem;color:#8899aa;margin-top:0.25rem">Only use if heading/pitch stops working. Wipes UM982 config and reconfigures signal groups. Takes ~15 seconds.</p>
+  </div>
+  <div class="card">
+    <h2>Firmware Update (OTA)</h2>
+    <p style="font-size:0.85rem;color:#7a9ab8;margin-bottom:1rem;">
+      Build with PlatformIO, then upload
+      <code style="background:#0a1628;padding:2px 6px;border-radius:4px">.pio/build/esp32dev/firmware.bin</code>.
+      The device will restart automatically after a successful flash.
+    </p>
+    <form id="otaForm" method="POST" action="/update" enctype="multipart/form-data">
+      <input type="file" name="firmware" id="otaFile" accept=".bin" required
+        style="display:none" onchange="document.getElementById('otaFileName').textContent=this.files[0].name">
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <button type="button" class="btn btn-primary" onclick="document.getElementById('otaFile').click()">
+          Choose .bin file
+        </button>
+        <span id="otaFileName" style="color:#8899aa;font-size:0.85rem">No file chosen</span>
+      </div>
+      <div id="otaProgress" style="display:none;margin-top:0.75rem">
+        <div style="background:#0a1628;border-radius:4px;height:8px;overflow:hidden">
+          <div id="otaBar" style="background:#4a9eff;height:100%;width:0%;transition:width 0.3s"></div>
+        </div>
+        <p id="otaStatus" style="font-size:0.85rem;color:#8899aa;margin:0.25rem 0 0">Uploading...</p>
+      </div>
+      <button type="submit" class="btn btn-danger" style="margin-top:0.75rem" onclick="startOTA(event)">
+        Upload &amp; Flash
+      </button>
+    </form>
   </div>
 </div>
 
@@ -298,6 +325,47 @@ function doUM982Reset() {
   if (!confirm('Factory reset the UM982? This takes ~15 seconds and will temporarily lose fix.')) return;
   toast('UM982 reset in progress (~15s)...');
   fetch('/um982reset', {method:'POST'}).catch(()=>{});
+}
+function startOTA(e) {
+  e.preventDefault();
+  var file = document.getElementById('otaFile').files[0];
+  if (!file) { alert('Please choose a firmware.bin file first.'); return; }
+  if (!confirm('Flash ' + file.name + ' (' + (file.size/1024).toFixed(1) + ' KB)?\nThe device will restart after flashing.')) return;
+
+  var form = document.getElementById('otaForm');
+  var progress = document.getElementById('otaProgress');
+  var bar = document.getElementById('otaBar');
+  var status = document.getElementById('otaStatus');
+  progress.style.display = 'block';
+
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/update');
+  xhr.upload.onprogress = function(e) {
+    if (e.lengthComputable) {
+      var pct = Math.round(e.loaded / e.total * 100);
+      bar.style.width = pct + '%';
+      status.textContent = 'Uploading... ' + pct + '%';
+    }
+  };
+  xhr.onload = function() {
+    if (xhr.status === 200) {
+      bar.style.width = '100%';
+      bar.style.background = '#4ade80';
+      status.textContent = 'Flash successful! Device restarting...';
+      document.open(); document.write(xhr.responseText); document.close();
+    } else {
+      bar.style.background = '#ff6b6b';
+      status.textContent = 'Flash failed! (' + xhr.status + ')';
+      document.open(); document.write(xhr.responseText); document.close();
+    }
+  };
+  xhr.onerror = function() {
+    bar.style.background = '#ff6b6b';
+    status.textContent = 'Upload error — check connection.';
+  };
+  var fd = new FormData();
+  fd.append('firmware', file);
+  xhr.send(fd);
 }
 </script>
 </body>
