@@ -21,6 +21,14 @@
 #define NTRIP_RECONNECT_MS   30000
 #define NTRIP_FAILOVER_COUNT 3
 
+// COG smoothing — suppress updates below this speed (knots)
+#define COG_MIN_SOG_KTS   0.3f
+// EMA alpha range: alpha=MIN at COG_MIN_SOG, alpha=MAX at COG_FAST_SOG and above
+// Lower alpha = heavier smoothing (more lag); higher = faster response
+#define COG_ALPHA_MIN     0.05f   // heavy smoothing at low speed
+#define COG_ALPHA_MAX     0.25f   // light smoothing at high speed
+#define COG_FAST_SOG_KTS  3.0f   // speed at which alpha reaches COG_ALPHA_MAX
+
 // STA WiFi connect timeout (ms)
 #define WIFI_CONNECT_TIMEOUT_MS 15000
 

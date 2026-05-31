@@ -222,8 +222,13 @@ function updateStatus() {
     var hdtEl = document.getElementById('s-hdtsrc');
     hdtEl.textContent = d.hdtValid ? 'Dual Antenna' : 'No ANT2 Lock';
     hdtEl.className = 'stat-value ' + (d.hdtValid ? 'ok' : 'warn');
-    setText('s-sog',  d.sog  != null ? Number(d.sog).toFixed(1)  : '--');
-    setText('s-cog',  d.cog  != null ? Number(d.cog).toFixed(1) + '\u00b0' : '--\u00b0');
+    setText('s-sog', d.sog != null ? Number(d.sog).toFixed(1) : '--');
+    var cogEl = document.getElementById('s-cog');
+    if (d.cog != null) {
+      cogEl.textContent = Number(d.cog).toFixed(1) + '\u00b0';
+      cogEl.style.opacity = d.cogValid ? '1' : '0.4';
+      cogEl.title = d.cogValid ? '' : 'Frozen \u2014 speed below 0.3 kts';
+    }
     setText('s-hdop', d.hdop != null ? Number(d.hdop).toFixed(2) : '--');
     setText('s-alt',  d.altitude != null ? Number(d.altitude).toFixed(1) + ' m' : '--');
     setText('s-wifimode', d.wifiMode || '--');

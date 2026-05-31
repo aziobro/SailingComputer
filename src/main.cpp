@@ -5,6 +5,7 @@
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <Update.h>
+#include <math.h>
 #include "config.h"
 #include "webui.h"
 #include "um982.h"
@@ -23,7 +24,9 @@ static int    fixQuality = 0;
 static int    satCount = 0;
 static float  latitude = 0, longitude = 0, heading = 0, sog = 0, cog = 0;
 static float  hdop = 0, altitude = 0;
-static float  roll = 0;       // labeled "Roll" — pitch of athwartships baseline = boat heel
+static float  roll = 0;          // labeled "Roll" — pitch of athwartships baseline = boat heel
+static float  cogFiltered = 0;   // smoothed COG using circular EMA; frozen below COG_MIN_SOG_KTS
+static bool   cogInitialized = false; // true once cogFiltered has been seeded
 static bool   hdtValid = false;
 static bool   rollValid = false;
 
@@ -136,17 +139,47 @@ static void parseHDT(const char* s) {
     }
 }
 
+// Apply speed-weighted circular EMA to COG.
+// Uses sin/cos averaging to correctly handle the 359°→0° wrap.
+// Below COG_MIN_SOG_KTS the filter is frozen — GPS position noise at low speed
+// causes wild COG swings that are meaningless for navigation.
+static void updateCOG(float rawCog, float speedKts) {
+    if (speedKts < COG_MIN_SOG_KTS) return; // frozen — not moving
+
+    if (!cogInitialized) {
+        cogFiltered    = rawCog;
+        cogInitialized = true;
+        return;
+    }
+
+    // Alpha scales linearly from COG_ALPHA_MIN at minimum speed to
+    // COG_ALPHA_MAX at COG_FAST_SOG_KTS and above.
+    float t     = (speedKts - COG_MIN_SOG_KTS) / (COG_FAST_SOG_KTS - COG_MIN_SOG_KTS);
+    float alpha = COG_ALPHA_MIN + constrain(t, 0.0f, 1.0f) * (COG_ALPHA_MAX - COG_ALPHA_MIN);
+
+    // Circular EMA — blend sin/cos components then recover the angle.
+    float rawRad  = rawCog    * DEG_TO_RAD;
+    float filtRad = cogFiltered * DEG_TO_RAD;
+    float sinBlend = alpha * sinf(rawRad)  + (1.0f - alpha) * sinf(filtRad);
+    float cosBlend = alpha * cosf(rawRad)  + (1.0f - alpha) * cosf(filtRad);
+    cogFiltered = atan2f(sinBlend, cosBlend) * RAD_TO_DEG;
+    if (cogFiltered < 0.0f) cogFiltered += 360.0f;
+}
+
 static void parseVTG(const char* s) {
     char buf[256];
     strlcpy(buf, s, sizeof(buf));
     char* tok = strtok(buf, ",");
     int field = 0;
+    float rawCog = cog; // keep previous value if field is empty
     while (tok) {
         field++;
-        if (field == 2) cog = atof(tok);
-        if (field == 6) sog = atof(tok);  // field 6 = knots
+        if (field == 2) rawCog = atof(tok);  // true course
+        if (field == 6) sog    = atof(tok);  // speed in knots
         tok = strtok(nullptr, ",");
     }
+    cog = rawCog;               // raw value (kept for reference)
+    updateCOG(rawCog, sog);     // update filtered COG
 }
 
 // Parse Unicore #HEADINGA message for heading + pitch
@@ -406,7 +439,8 @@ static void handleStatus() {
     json += "\"heading\":"       + String(heading, 2) + ",";
     json += "\"hdtValid\":"      + String(hdtValid ? "true" : "false") + ",";
     json += "\"sog\":"           + String(sog, 2) + ",";
-    json += "\"cog\":"           + String(cog, 2) + ",";
+    json += "\"cog\":"           + String(cogFiltered, 1) + ",";
+    json += "\"cogValid\":"      + String(cogInitialized && sog >= COG_MIN_SOG_KTS ? "true" : "false") + ",";
     json += "\"sats\":"          + String(satCount) + ",";
     json += "\"hdop\":"          + String(hdop, 2) + ",";
     json += "\"altitude\":"      + String(altitude, 2) + ",";
