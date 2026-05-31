@@ -1,0 +1,11 @@
+# PlatformIO build artifacts
+.pio/
+
+# macOS
+.DS_Store
+
+# Claude session files
+.claude/
+
+# Sensitive config (NVS is on-device, but just in case)
+*.env
