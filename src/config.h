@@ -59,6 +59,9 @@ struct Config {
     // Minimum SOG (knots) required before COG updates — suppresses GPS noise at rest
     float cogMinSog       = COG_MIN_SOG_DEFAULT;
 
+    // Broadcast NMEA sentences over BLE (Nordic UART Service) for iOS/Android GPS apps
+    bool  bleNmea         = false;
+
     // AP credentials (editable)
     char apSSID[64]       = DEFAULT_AP_SSID;
     char apPassword[64]   = DEFAULT_AP_PASSWORD;
@@ -99,6 +102,7 @@ public:
 
         cfg.headingOffset = prefs.getFloat("hdgOffset",  90.0f);
         cfg.cogMinSog     = prefs.getFloat("cogMinSog",  COG_MIN_SOG_DEFAULT);
+        cfg.bleNmea       = prefs.getBool ("bleNmea",    false);
 
         prefs.getString("apSSID", cfg.apSSID,     sizeof(cfg.apSSID));
         prefs.getString("apPass", cfg.apPassword, sizeof(cfg.apPassword));
@@ -126,6 +130,7 @@ public:
 
         prefs.putFloat ("hdgOffset",  cfg.headingOffset);
         prefs.putFloat ("cogMinSog",  cfg.cogMinSog);
+        prefs.putBool  ("bleNmea",    cfg.bleNmea);
         prefs.putString("apSSID", cfg.apSSID);
         prefs.putString("apPass", cfg.apPassword);
         prefs.end();

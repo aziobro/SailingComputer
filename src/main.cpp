@@ -9,6 +9,7 @@
 #include "config.h"
 #include "webui.h"
 #include "um982.h"
+#include "ble_nmea.h"
 
 // Set to true to echo raw Serial1 bytes to debug console (helps verify UM982 is talking)
 #define DEBUG_NMEA_RAW false
@@ -448,6 +449,8 @@ static void handleStatus() {
     json += "\"altitude\":"      + String(altitude, 2) + ",";
     json += "\"roll\":"          + String(roll, 2) + ",";
     json += "\"rollValid\":"     + String(rollValid ? "true" : "false") + ",";
+    json += "\"bleEnabled\":"     + String(bleEnabled     ? "true" : "false") + ",";
+    json += "\"bleConnected\":"   + String(bleConnected   ? "true" : "false") + ",";
     json += "\"ntripConnected\":" + String(ntripConnected ? "true" : "false") + ",";
     json += "\"ntripActiveIdx\":" + String(ntripActiveIdx) + ",";
     json += "\"ntripBytesIn\":"  + String(ntripBytesIn) + ",";
@@ -477,6 +480,7 @@ static void handleGetConfig() {
     json += "],";
     json += "\"headingOffset\":" + String(cfg.headingOffset, 1) + ",";
     json += "\"cogMinSog\":"     + String(cfg.cogMinSog, 2) + ",";
+    json += "\"bleNmea\":"       + String(cfg.bleNmea ? "true" : "false") + ",";
     json += "\"apSSID\":\"" + String(cfg.apSSID) + "\"";
     json += "}";
     webServer.send(200, "application/json", json);
@@ -514,7 +518,13 @@ static void handleSaveConfig() {
     }
 
     if (webServer.hasArg("headingOffset")) cfg.headingOffset = webServer.arg("headingOffset").toFloat();
-    if (webServer.hasArg("cogMinSog"))     cfg.cogMinSog     = webServer.arg("cogMinSog").toFloat();
+    if (webServer.hasArg("cogMinSog"))  cfg.cogMinSog = webServer.arg("cogMinSog").toFloat();
+    if (webServer.hasArg("bleNmea")) {
+        String v = webServer.arg("bleNmea");
+        cfg.bleNmea = (v == "true" || v == "on" || v == "1");
+    } else {
+        cfg.bleNmea = false;
+    }
     if (webServer.hasArg("apSSID"))    strlcpy(cfg.apSSID, webServer.arg("apSSID").c_str(), sizeof(cfg.apSSID));
     if (webServer.hasArg("apPassword")) { String v = webServer.arg("apPassword"); if (v.length() > 0 && v != "(unchanged)") strlcpy(cfg.apPassword, v.c_str(), sizeof(cfg.apPassword)); }
     cfgMgr.save();
@@ -532,6 +542,18 @@ static void handleUM982Reset() {
     Serial.println("[Web] UM982 factory reset requested");
     delay(100);
     um982FactoryReset(Serial1);
+}
+
+static void handleBleToggle() {
+    if (webServer.hasArg("bleNmea")) {
+        String v = webServer.arg("bleNmea");
+        cfgMgr.cfg.bleNmea = (v == "true" || v == "on" || v == "1");
+        cfgMgr.save();
+        Serial.printf("[BLE] %s — restarting\n", cfgMgr.cfg.bleNmea ? "enabled" : "disabled");
+    }
+    webServer.send(200, "application/json", "{\"ok\":true}");
+    delay(300);
+    ESP.restart();
 }
 
 static void handleRestart() {
@@ -628,6 +650,9 @@ void setup() {
 
     um982Init(Serial1);
 
+    if (cfgMgr.cfg.bleNmea)
+        bleNmeaInit("SailingComputer");
+
     Config& cfg = cfgMgr.cfg;
 
     if (cfg.apMode || strlen(cfg.wifiSSID) == 0) {
@@ -667,6 +692,7 @@ void setup() {
     webServer.on("/restart",     HTTP_POST, handleRestart);
     webServer.on("/um982reset",  HTTP_POST, handleUM982Reset);
     webServer.on("/update",      HTTP_POST, handleOTAComplete, handleOTAUpload);
+    webServer.on("/ble/toggle",  HTTP_POST, handleBleToggle);
     webServer.begin();
     Serial.println("[Web] HTTP server started");
     Serial.println("[Boot] Ready");
@@ -688,12 +714,19 @@ void loop() {
                 processNmeaLine(nmeaLine);
                 // Only broadcast standard $ NMEA sentences — skip proprietary # Unicore messages
                 if (nmeaLine[0] == '$') {
-                    // Replace raw $GPHDT with corrected heading sentence
+                    // Replace raw $GPHDT with a corrected-heading sentence
                     if (strncmp(nmeaLine, "$GPHDT", 6) == 0 ||
                         strncmp(nmeaLine, "$GNHDT", 6) == 0) {
-                        broadcastHDT();
+                        broadcastHDT();          // TCP clients
+                        if (bleEnabled) {        // BLE clients
+                            char body[32], sentence[48];
+                            snprintf(body,     sizeof(body),     "GPHDT,%.4f,T", heading);
+                            snprintf(sentence, sizeof(sentence), "$%s*%02X", body, nmeaChecksum(body));
+                            bleNmeaSend(sentence);
+                        }
                     } else {
                         broadcastNmea(nmeaLine);
+                        bleNmeaSend(nmeaLine);   // BLE (no-op if not connected)
                     }
                 }
             }

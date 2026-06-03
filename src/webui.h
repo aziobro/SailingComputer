@@ -93,6 +93,7 @@ inline String getWebUI() {
       <div class="stat"><div class="stat-label">NTRIP</div><div class="stat-value" id="s-ntrip">--</div></div>
       <div class="stat"><div class="stat-label">NTRIP Source</div><div class="stat-value" id="s-ntrip-src" style="font-size:0.85rem">--</div></div>
       <div class="stat"><div class="stat-label">RTCM Bytes</div><div class="stat-value" id="s-rtcm">0</div></div>
+      <div class="stat" id="s-ble-tile" style="display:none"><div class="stat-label">Bluetooth GPS</div><div class="stat-value" id="s-ble">--</div></div>
     </div>
   </div>
 </div>
@@ -150,6 +151,20 @@ inline String getWebUI() {
     <button class="btn btn-danger" onclick="doRestart()">Restart Device</button>
     <button class="btn btn-danger" onclick="doUM982Reset()" style="margin-top:0.5rem">UM982 Factory Reset</button>
     <p style="font-size:0.8rem;color:#8899aa;margin-top:0.25rem">Only use if heading/pitch stops working. Wipes UM982 config and reconfigures signal groups. Takes ~15 seconds.</p>
+  </div>
+  <div class="card">
+    <h2>Bluetooth GPS</h2>
+    <p style="font-size:0.85rem;color:#7a9ab8;margin-bottom:1rem">
+      Broadcasts NMEA sentences over BLE so iOS/Android navigation apps
+      (SW Maps, iNavX, etc.) can use this device as an external GPS receiver.
+      Uses the <strong>Nordic UART Service</strong> profile.<br>
+      <span style="color:#8899aa;font-size:0.8rem">Note: a device restart is required when toggling BLE on or off.</span>
+    </p>
+    <div class="toggle-row">
+      <input type="checkbox" id="bleNmea" name="bleNmea" onchange="saveBleNmea(this)">
+      <label for="bleNmea">Enable Bluetooth GPS (BLE NMEA)</label>
+    </div>
+    <p id="ble-status-text" style="font-size:0.85rem;margin-top:0.5rem;color:#8899aa">--</p>
   </div>
   <div class="card">
     <h2>Firmware Update (OTA)</h2>
@@ -244,6 +259,31 @@ function updateStatus() {
     ntrip.textContent = d.ntripConnected ? 'Connected' : 'Off';
     ntrip.className = 'stat-value ' + (d.ntripConnected ? 'ok' : 'err');
     setText('s-ntrip-src', d.ntripConnected ? 'Source ' + ((d.ntripActiveIdx||0)+1) : '--');
+
+    // BLE status tile — only show if BLE is enabled
+    var bleTile = document.getElementById('s-ble-tile');
+    var bleEl   = document.getElementById('s-ble');
+    if (d.bleEnabled) {
+      bleTile.style.display = '';
+      bleEl.textContent  = d.bleConnected ? 'Connected' : 'Advertising';
+      bleEl.className    = 'stat-value ' + (d.bleConnected ? 'ok' : 'warn');
+    } else {
+      bleTile.style.display = 'none';
+    }
+
+    // Update BLE toggle and status text on System tab
+    var bleCb = document.getElementById('bleNmea');
+    if (bleCb) bleCb.checked = d.bleEnabled;
+    var bleStatusText = document.getElementById('ble-status-text');
+    if (bleStatusText) {
+      if (d.bleEnabled) {
+        bleStatusText.textContent = d.bleConnected ? 'Client connected' : 'Advertising as "SailingComputer" — open your GPS app and scan for Bluetooth devices';
+        bleStatusText.style.color = d.bleConnected ? '#4ade80' : '#8899aa';
+      } else {
+        bleStatusText.textContent = 'Disabled';
+        bleStatusText.style.color = '#8899aa';
+      }
+    }
   }).catch(function(e) { console.error('Status fetch error:', e); });
 }
 setInterval(updateStatus, 2000);
@@ -290,7 +330,9 @@ function loadConfig() {
     document.getElementById('apMode').checked = d.apMode;
     document.getElementById('wifiSSID').value  = d.wifiSSID || '';
     document.getElementById('headingOffset').value = d.headingOffset != null ? d.headingOffset : 90;
-    document.getElementById('cogMinSog').value     = d.cogMinSog     != null ? d.cogMinSog     : 0.1;
+    document.getElementById('cogMinSog').value = d.cogMinSog != null ? d.cogMinSog : 0.1;
+    var bleCb = document.getElementById('bleNmea');
+    if (bleCb) bleCb.checked = d.bleNmea || false;
     document.getElementById('apSSID').value    = d.apSSID || '';
     buildNtripSources(d.ntrip || [{},{},{}]);
     toggleAPFields();
@@ -326,6 +368,16 @@ document.getElementById('configForm').addEventListener('submit', function(e) {
   }).catch(() => toast('Error saving', false));
 });
 
+function saveBleNmea(cb) {
+  var data = new URLSearchParams();
+  data.append('bleNmea', cb.checked ? 'true' : 'false');
+  fetch('/ble/toggle', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: data.toString()})
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.ok) toast('BLE setting saved — restarting...');
+      else toast('Error saving BLE setting', false);
+    }).catch(function() { toast('Error saving BLE setting', false); });
+}
 function doRestart() {
   if (!confirm('Restart the device?')) return;
   fetch('/restart', {method:'POST'}).then(() => toast('Restarting...')).catch(()=>{});
