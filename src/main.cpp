@@ -344,14 +344,14 @@ static bool ntripConnect(int idx) {
         return false;
     }
 
-    // Use HTTP/1.1 with Connection:close to prevent keep-alive / chunked issues
+    // HTTP/1.0 keeps things simple for streaming — no chunked encoding,
+    // no keep-alive negotiation. NTRIP is a raw streaming protocol.
     String req = "GET /";
     req += src.mount;
-    req += " HTTP/1.1\r\nHost: ";
+    req += " HTTP/1.0\r\nHost: ";
     req += src.host;
     req += "\r\nNtrip-Version: Ntrip/2.0\r\n";
     req += "User-Agent: NTRIP SailingComputer/1.0\r\n";
-    req += "Connection: close\r\n";
     if (strlen(src.user) > 0) {
         req += "Authorization: Basic ";
         req += base64Encode(String(src.user) + ":" + String(src.pass));
@@ -442,10 +442,10 @@ static void ntripLoop() {
         return;
     }
 
-    // Send GGA position to caster every 5 seconds — required by NTRIP protocol.
+    // Send GGA position to caster every 3 seconds — required by NTRIP protocol.
     // Sent immediately on connect and periodically thereafter.
     static uint32_t lastGgaTx = 0;
-    if (millis() - lastGgaTx > 5000) {
+    if (millis() - lastGgaTx > 3000) {
         ntripSendGGA();
         lastGgaTx = millis();
     }
