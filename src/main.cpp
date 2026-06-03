@@ -59,6 +59,9 @@ static WebServer webServer(80);
 // WiFi
 static bool staConnected = false;
 
+// FreeRTOS task handles
+static TaskHandle_t ntripTaskHandle = nullptr;
+
 // ── Base64 ────────────────────────────────────────────────────────────────────
 
 static const char b64chars[] =
@@ -281,12 +284,15 @@ static void ntripUpdateEnabled() {
             ntripAnyEnabled = true;
         }
     }
-    if (!ntripAnyEnabled)
+    if (!ntripAnyEnabled) {
         Serial.println("[NTRIP] No sources configured — set up NTRIP in the Configuration tab");
-    else
+    } else {
+        int count = 0;
+        for (int i = 0; i < NTRIP_SOURCES; i++)
+            if (cfgMgr.cfg.ntrip[i].enabled && strlen(cfgMgr.cfg.ntrip[i].host) > 0) count++;
         Serial.printf("[NTRIP] %d source(s) enabled — starting on source %d\n",
-                      [&]{ int n=0; for(int i=0;i<NTRIP_SOURCES;i++) if(cfgMgr.cfg.ntrip[i].enabled && strlen(cfgMgr.cfg.ntrip[i].host)>0) n++; return n; }(),
-                      ntripActiveIdx);
+                      count, ntripActiveIdx);
+    }
 }
 
 // Find the next enabled source starting after idx (wraps around)
@@ -467,6 +473,19 @@ static void ntripLoop() {
     }
 }
 
+// ── NTRIP FreeRTOS task ───────────────────────────────────────────────────────
+//
+// Runs on Core 0 alongside the WiFi stack so ntripConnect() blocking calls
+// (DNS + TCP + HTTP handshake, up to 7 seconds) never stall the NMEA reader
+// on Core 1. Serial2 and ntripClient are only touched by this task.
+
+static void ntripTask(void* /*param*/) {
+    for (;;) {
+        ntripLoop();
+        vTaskDelay(pdMS_TO_TICKS(10));  // yield 10ms — avoids starving WiFi stack
+    }
+}
+
 // ── WiFi ──────────────────────────────────────────────────────────────────────
 
 static void startAP() {
@@ -491,35 +510,56 @@ static void handleRoot() {
 }
 
 static void handleStatus() {
-    const char* fixLabel[] = {
+    static const char* fixLabels[] = {
         "No Fix","GPS","DGPS","PPS","RTK Fixed","RTK Float",
         "Dead Reck","Manual","Sim","WAAS"
     };
-    String json = "{";
-    json += "\"fix\":"           + String(fixQuality) + ",";
-    json += "\"fixLabel\":\""    + String(fixQuality <= 9 ? fixLabel[fixQuality] : "Unknown") + "\",";
-    json += "\"lat\":"           + String(latitude,  7) + ",";
-    json += "\"lon\":"           + String(longitude, 7) + ",";
-    json += "\"heading\":"       + String(heading, 2) + ",";
-    json += "\"hdtValid\":"      + String(hdtValid ? "true" : "false") + ",";
-    json += "\"sog\":"           + String(sog, 2) + ",";
-    json += "\"cog\":"           + String(cogFiltered, 1) + ",";
-    json += "\"cogValid\":"      + String(cogInitialized && sog >= cfgMgr.cfg.cogMinSog ? "true" : "false") + ",";
-    json += "\"cogMinSog\":"     + String(cfgMgr.cfg.cogMinSog, 2) + ",";
-    json += "\"sats\":"          + String(satCount) + ",";
-    json += "\"hdop\":"          + String(hdop, 2) + ",";
-    json += "\"altitude\":"      + String(altitude, 2) + ",";
-    json += "\"roll\":"          + String(roll, 2) + ",";
-    json += "\"rollValid\":"     + String(rollValid ? "true" : "false") + ",";
-    json += "\"bleEnabled\":"     + String(bleEnabled     ? "true" : "false") + ",";
-    json += "\"bleConnected\":"   + String(bleConnected   ? "true" : "false") + ",";
-    json += "\"ntripConnected\":" + String(ntripConnected ? "true" : "false") + ",";
-    json += "\"ntripActiveIdx\":" + String(ntripActiveIdx) + ",";
-    json += "\"ntripBytesIn\":"  + String(ntripBytesIn) + ",";
-    json += "\"wifiMode\":\""    + String(cfgMgr.cfg.apMode ? "AP" : "Station") + "\",";
-    json += "\"ip\":\""          + WiFi.localIP().toString() + "\",";
-    json += "\"apIP\":\""        + WiFi.softAPIP().toString() + "\"";
-    json += "}";
+    // Use a stack buffer — avoids repeated heap allocs from String +=
+    char json[512];
+    snprintf(json, sizeof(json),
+        "{"
+        "\"fix\":%d,"
+        "\"fixLabel\":\"%s\","
+        "\"lat\":%.7f,"
+        "\"lon\":%.7f,"
+        "\"heading\":%.2f,"
+        "\"hdtValid\":%s,"
+        "\"sog\":%.2f,"
+        "\"cog\":%.1f,"
+        "\"cogValid\":%s,"
+        "\"cogMinSog\":%.2f,"
+        "\"sats\":%d,"
+        "\"hdop\":%.2f,"
+        "\"altitude\":%.2f,"
+        "\"roll\":%.2f,"
+        "\"rollValid\":%s,"
+        "\"bleEnabled\":%s,"
+        "\"bleConnected\":%s,"
+        "\"ntripConnected\":%s,"
+        "\"ntripActiveIdx\":%d,"
+        "\"ntripBytesIn\":%u,"
+        "\"wifiMode\":\"%s\","
+        "\"ip\":\"%s\","
+        "\"apIP\":\"%s\""
+        "}",
+        fixQuality,
+        fixQuality <= 9 ? fixLabels[fixQuality] : "Unknown",
+        latitude, longitude,
+        heading,
+        hdtValid      ? "true" : "false",
+        sog, cogFiltered,
+        (cogInitialized && sog >= cfgMgr.cfg.cogMinSog) ? "true" : "false",
+        cfgMgr.cfg.cogMinSog,
+        satCount, hdop, altitude, roll,
+        rollValid     ? "true" : "false",
+        bleEnabled    ? "true" : "false",
+        bleConnected  ? "true" : "false",
+        ntripConnected ? "true" : "false",
+        ntripActiveIdx, ntripBytesIn,
+        cfgMgr.cfg.apMode ? "AP" : "Station",
+        WiFi.localIP().toString().c_str(),
+        WiFi.softAPIP().toString().c_str()
+    );
     webServer.send(200, "application/json", json);
 }
 
@@ -706,6 +746,9 @@ void setup() {
     cfgMgr.load();
     ntripUpdateEnabled();
 
+    // Increase RX buffer before begin() — default 256 bytes overflows during
+    // ntripConnect() blocking calls (~350 bytes/sec from UM982 at 1 Hz).
+    Serial1.setRxBufferSize(2048);
     Serial1.begin(NMEA_BAUD, SERIAL_8N1, SERIAL1_RX, SERIAL1_TX);
     Serial2.begin(RTCM_BAUD, SERIAL_8N1, SERIAL2_RX, SERIAL2_TX);
     Serial.println("[Boot] UART initialized");
@@ -757,6 +800,12 @@ void setup() {
     webServer.on("/ble/toggle",  HTTP_POST, handleBleToggle);
     webServer.begin();
     Serial.println("[Web] HTTP server started");
+
+    // Launch NTRIP on Core 0 (WiFi stack core) with 8KB stack — TCP/DNS
+    // operations need headroom. Priority 2 yields to the WiFi stack (priority 23).
+    xTaskCreatePinnedToCore(
+        ntripTask, "ntrip", 8192, nullptr, 2, &ntripTaskHandle, 0);
+    Serial.println("[NTRIP] Task started on Core 0");
     Serial.println("[Boot] Ready");
 }
 
@@ -798,18 +847,20 @@ void loop() {
         }
     }
 
-    ntripLoop();
-
-    // Monitor STA reconnection
+    // Monitor STA reconnection — rate-limited to once per second to avoid
+    // hammering the WiFi stack with status queries every loop iteration.
     if (!cfgMgr.cfg.apMode) {
-        bool connected = (WiFi.status() == WL_CONNECTED);
-        if (!connected && staConnected) {
-            staConnected = false;
-            ntripDisconnect();
-            Serial.println("[WiFi] Lost connection");
-        } else if (connected && !staConnected) {
-            staConnected = true;
-            Serial.printf("[WiFi] Reconnected: %s\n", WiFi.localIP().toString().c_str());
+        static uint32_t lastWifiCheck = 0;
+        if (millis() - lastWifiCheck > 1000) {
+            lastWifiCheck = millis();
+            bool connected = (WiFi.status() == WL_CONNECTED);
+            if (!connected && staConnected) {
+                staConnected = false;
+                Serial.println("[WiFi] Lost connection");
+            } else if (connected && !staConnected) {
+                staConnected = true;
+                Serial.printf("[WiFi] Reconnected: %s\n", WiFi.localIP().toString().c_str());
+            }
         }
     }
 }
