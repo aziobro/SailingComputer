@@ -304,6 +304,29 @@ static void ntripDisconnect() {
     ntripConnected = false;
 }
 
+// Build a GGA sentence from current position and send it to the NTRIP caster.
+// Casters need this to provide the right corrections for the rover location.
+static void ntripSendGGA() {
+    if (fixQuality == 0) return;  // no position yet — don't send empty GGA
+
+    float lat = fabsf(latitude);
+    float lon = fabsf(longitude);
+    int   latDeg = (int)lat;  float latMin = (lat - latDeg) * 60.0f;
+    int   lonDeg = (int)lon;  float lonMin = (lon - lonDeg) * 60.0f;
+
+    char body[96];
+    snprintf(body, sizeof(body),
+             "GPGGA,000000.00,%02d%08.5f,%c,%03d%08.5f,%c,%d,%02d,%.1f,%.1f,M,0.0,M,,",
+             latDeg, latMin, latitude  >= 0 ? 'N' : 'S',
+             lonDeg, lonMin, longitude >= 0 ? 'E' : 'W',
+             fixQuality, satCount, hdop, altitude);
+
+    char sentence[110];
+    snprintf(sentence, sizeof(sentence), "$%s*%02X\r\n", body, nmeaChecksum(body));
+    ntripClient.print(sentence);
+    Serial.printf("[NTRIP%d] Sent GGA to caster\n", ntripActiveIdx);
+}
+
 static bool ntripConnect(int idx) {
     NtripSource& src = cfgMgr.cfg.ntrip[idx];
     if (!src.enabled || strlen(src.host) == 0) return false;
@@ -321,11 +344,14 @@ static bool ntripConnect(int idx) {
         return false;
     }
 
+    // Use HTTP/1.1 with Connection:close to prevent keep-alive / chunked issues
     String req = "GET /";
     req += src.mount;
-    req += " HTTP/1.0\r\nHost: ";
+    req += " HTTP/1.1\r\nHost: ";
     req += src.host;
-    req += "\r\nNtrip-Version: Ntrip/2.0\r\nUser-Agent: NTRIP SailingComputer/1.0\r\n";
+    req += "\r\nNtrip-Version: Ntrip/2.0\r\n";
+    req += "User-Agent: NTRIP SailingComputer/1.0\r\n";
+    req += "Connection: close\r\n";
     if (strlen(src.user) > 0) {
         req += "Authorization: Basic ";
         req += base64Encode(String(src.user) + ":" + String(src.pass));
@@ -334,26 +360,33 @@ static bool ntripConnect(int idx) {
     req += "\r\n";
     ntripClient.print(req);
 
+    // Wait for the HTTP response and drain all headers
     uint32_t t = millis();
+    bool got200 = false;
     while (ntripClient.connected() && millis() - t < 5000) {
-        if (ntripClient.available()) {
-            String line = ntripClient.readStringUntil('\n');
-            Serial.printf("[NTRIP%d] < %s\n", idx, line.c_str());
-            if (line.indexOf("200") >= 0) {
-                while (ntripClient.available()) {
-                    line = ntripClient.readStringUntil('\n');
-                    if (line.length() <= 2) break;
-                }
-                ntripConnected = true;
-                ntripFailCount = 0;
-                Serial.printf("[NTRIP%d] Connected OK\n", idx);
-                return true;
+        if (!ntripClient.available()) continue;
+        String line = ntripClient.readStringUntil('\n');
+        Serial.printf("[NTRIP%d] < %s\n", idx, line.c_str());
+        if (!got200 && line.indexOf("200") >= 0) {
+            got200 = true;
+            // Drain remaining HTTP headers (blank line marks end of headers)
+            uint32_t t2 = millis();
+            while (ntripClient.connected() && millis() - t2 < 2000) {
+                if (!ntripClient.available()) continue;
+                String hdr = ntripClient.readStringUntil('\n');
+                if (hdr.length() <= 2) break;  // blank line = end of headers
             }
-            if (line.indexOf("401") >= 0) {
-                Serial.printf("[NTRIP%d] Auth failed\n", idx);
-                ntripClient.stop();
-                return false;
-            }
+            ntripConnected = true;
+            ntripFailCount = 0;
+            Serial.printf("[NTRIP%d] Connected OK\n", idx);
+            // Send GGA immediately so strict casters don't time out
+            ntripSendGGA();
+            return true;
+        }
+        if (line.indexOf("401") >= 0) {
+            Serial.printf("[NTRIP%d] Auth failed\n", idx);
+            ntripClient.stop();
+            return false;
         }
     }
     ntripClient.stop();
@@ -409,27 +442,12 @@ static void ntripLoop() {
         return;
     }
 
-    // NTRIP protocol requires the rover to send its GGA position back to the
-    // caster every ~5 seconds. Without this many casters (e.g. rtkdata.online)
-    // drop the connection after the first RTCM burst.
+    // Send GGA position to caster every 5 seconds — required by NTRIP protocol.
+    // Sent immediately on connect and periodically thereafter.
     static uint32_t lastGgaTx = 0;
-    if (millis() - lastGgaTx > 5000 && fixQuality > 0) {
-        // Build a minimal GGA from current parsed position
-        char ggaBuf[100];
-        float lat = fabsf(latitude);
-        float lon = fabsf(longitude);
-        int latDeg = (int)lat;  float latMin = (lat - latDeg) * 60.0f;
-        int lonDeg = (int)lon;  float lonMin = (lon - lonDeg) * 60.0f;
-        snprintf(ggaBuf, sizeof(ggaBuf),
-                 "GPGGA,000000.00,%02d%08.5f,%c,%03d%08.5f,%c,%d,%02d,%.1f,%.1f,M,0.0,M,,",
-                 latDeg, latMin, latitude  >= 0 ? 'N' : 'S',
-                 lonDeg, lonMin, longitude >= 0 ? 'E' : 'W',
-                 fixQuality, satCount, hdop, altitude);
-        char sentence[110];
-        snprintf(sentence, sizeof(sentence), "$%s*%02X\r\n", ggaBuf, nmeaChecksum(ggaBuf));
-        ntripClient.print(sentence);
+    if (millis() - lastGgaTx > 5000) {
+        ntripSendGGA();
         lastGgaTx = millis();
-        Serial.printf("[NTRIP%d] Sent GGA to caster\n", ntripActiveIdx);
     }
 
     int avail = ntripClient.available();
