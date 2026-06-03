@@ -409,6 +409,29 @@ static void ntripLoop() {
         return;
     }
 
+    // NTRIP protocol requires the rover to send its GGA position back to the
+    // caster every ~5 seconds. Without this many casters (e.g. rtkdata.online)
+    // drop the connection after the first RTCM burst.
+    static uint32_t lastGgaTx = 0;
+    if (millis() - lastGgaTx > 5000 && fixQuality > 0) {
+        // Build a minimal GGA from current parsed position
+        char ggaBuf[100];
+        float lat = fabsf(latitude);
+        float lon = fabsf(longitude);
+        int latDeg = (int)lat;  float latMin = (lat - latDeg) * 60.0f;
+        int lonDeg = (int)lon;  float lonMin = (lon - lonDeg) * 60.0f;
+        snprintf(ggaBuf, sizeof(ggaBuf),
+                 "GPGGA,000000.00,%02d%08.5f,%c,%03d%08.5f,%c,%d,%02d,%.1f,%.1f,M,0.0,M,,",
+                 latDeg, latMin, latitude  >= 0 ? 'N' : 'S',
+                 lonDeg, lonMin, longitude >= 0 ? 'E' : 'W',
+                 fixQuality, satCount, hdop, altitude);
+        char sentence[110];
+        snprintf(sentence, sizeof(sentence), "$%s*%02X\r\n", ggaBuf, nmeaChecksum(ggaBuf));
+        ntripClient.print(sentence);
+        lastGgaTx = millis();
+        Serial.printf("[NTRIP%d] Sent GGA to caster\n", ntripActiveIdx);
+    }
+
     int avail = ntripClient.available();
     if (avail > 0) {
         uint8_t buf[256];
