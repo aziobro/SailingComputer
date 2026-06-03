@@ -273,14 +273,20 @@ static void acceptNmeaClients() {
 // Recompute ntripAnyEnabled — call after config load or save.
 static void ntripUpdateEnabled() {
     ntripAnyEnabled = false;
+    ntripActiveIdx  = 0;
     for (int i = 0; i < NTRIP_SOURCES; i++) {
         if (cfgMgr.cfg.ntrip[i].enabled && strlen(cfgMgr.cfg.ntrip[i].host) > 0) {
+            if (!ntripAnyEnabled)
+                ntripActiveIdx = i;  // start on the first enabled source
             ntripAnyEnabled = true;
-            break;
         }
     }
     if (!ntripAnyEnabled)
         Serial.println("[NTRIP] No sources configured — set up NTRIP in the Configuration tab");
+    else
+        Serial.printf("[NTRIP] %d source(s) enabled — starting on source %d\n",
+                      [&]{ int n=0; for(int i=0;i<NTRIP_SOURCES;i++) if(cfgMgr.cfg.ntrip[i].enabled && strlen(cfgMgr.cfg.ntrip[i].host)>0) n++; return n; }(),
+                      ntripActiveIdx);
 }
 
 // Find the next enabled source starting after idx (wraps around)
@@ -360,11 +366,26 @@ static void ntripLoop() {
     if (!ntripAnyEnabled) return;
 
     if (!ntripConnected) {
+        // If the active source is disabled or has no host, skip to the next
+        // enabled source immediately — don't burn a reconnect timeout on it.
+        NtripSource& active = cfgMgr.cfg.ntrip[ntripActiveIdx];
+        if (!active.enabled || strlen(active.host) == 0) {
+            int next = ntripNextSource(ntripActiveIdx);
+            if (next >= 0) {
+                Serial.printf("[NTRIP] Source %d disabled — switching to source %d\n",
+                              ntripActiveIdx, next);
+                ntripActiveIdx = next;
+                ntripFailCount = 0;
+                ntripLastAttempt = 0;  // attempt immediately
+            }
+            return;
+        }
+
         uint32_t now = millis();
         if (now - ntripLastAttempt < NTRIP_RECONNECT_MS) return;
         ntripLastAttempt = now;
 
-        // Failover: after NTRIP_FAILOVER_COUNT consecutive fails, try next source
+        // After NTRIP_FAILOVER_COUNT consecutive connection failures, try next source
         if (ntripFailCount >= NTRIP_FAILOVER_COUNT) {
             int next = ntripNextSource(ntripActiveIdx);
             if (next >= 0 && next != ntripActiveIdx) {
