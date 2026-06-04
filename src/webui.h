@@ -1,9 +1,8 @@
 #pragma once
-#include <Arduino.h>
 
-// Returns the web UI HTML as a String.
-inline String getWebUI() {
-    return R"rawhtml(<!DOCTYPE html>
+// Returns the web UI HTML as a C string (stored in flash / rodata).
+inline const char* getWebUI() {
+    static const char ui[] = R"rawhtml(<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -173,6 +172,11 @@ inline String getWebUI() {
     <h2>Sailing Performance</h2>
     <div class="stat-grid">
       <div class="stat">
+        <div class="stat-label">Tack</div>
+        <div class="stat-value" id="s-tack">--</div>
+        <div style="font-size:0.7rem;color:#8899aa;margin-top:2px" id="s-tack-sub">from heel angle</div>
+      </div>
+      <div class="stat">
         <div class="stat-label">Leeway</div>
         <div class="stat-value" id="s-leeway">--</div>
         <div style="font-size:0.7rem;color:#8899aa;margin-top:2px" id="s-leeway-dir">heading vs track</div>
@@ -188,9 +192,14 @@ inline String getWebUI() {
         <div style="font-size:0.7rem;color:#8899aa;margin-top:2px">fwd speed (kts)</div>
       </div>
     </div>
+    <div id="s-favor-row" style="display:none;margin-top:0.6rem;padding:0.5rem 0.7rem;border-radius:6px;background:#0d1f33;font-size:0.8rem">
+      <span style="color:#8899aa">Current favor: </span>
+      <span id="s-favor-val" style="font-weight:bold"></span>
+      <span id="s-favor-desc" style="color:#8899aa;margin-left:0.4rem"></span>
+    </div>
     <p style="font-size:0.75rem;color:#556677;margin:0.5rem 0 0">
       Leeway = COG &minus; Heading &mdash; includes keel slip &amp; tidal current.
-      Positive = slipping to starboard.
+      Tack from heel angle (&gt;3&deg; threshold). Current favor = lateral drift toward windward.
     </p>
   </div>
   <div class="card">
@@ -359,6 +368,26 @@ function updateStatus() {
     setText('s-alt',  d.altitude != null ? Number(d.altitude).toFixed(1) + ' m' : '--');
 
     // Sailing performance metrics
+    var roll = d.rollValid ? Number(d.roll) : 0;
+    var tack = (d.rollValid && roll >  3) ? 'port'
+             : (d.rollValid && roll < -3) ? 'starboard'
+             : 'unknown';
+    var tackEl  = document.getElementById('s-tack');
+    var tackSub = document.getElementById('s-tack-sub');
+    if (tack === 'port') {
+      tackEl.textContent  = 'Port';
+      tackEl.style.color  = '#f87171'; // red
+      tackSub.textContent = roll.toFixed(1) + '° stbd heel';
+    } else if (tack === 'starboard') {
+      tackEl.textContent  = 'Starboard';
+      tackEl.style.color  = '#60a5fa'; // blue
+      tackSub.textContent = Math.abs(roll).toFixed(1) + '° port heel';
+    } else {
+      tackEl.textContent  = '--';
+      tackEl.style.color  = '#8899aa';
+      tackSub.textContent = 'heel < 3°';
+    }
+
     if (d.sailingValid) {
       var leeway = Number(d.leeway);
       var lateral = Number(d.lateralDrift);
@@ -372,12 +401,37 @@ function updateStatus() {
         leeway > 0.5 ? '▶ starboard slip' : leeway < -0.5 ? '◀ port slip' : 'on track';
       document.getElementById('s-lateral-dir').textContent =
         lateral > 0 ? '▶ starboard' : lateral < 0 ? '◀ port' : 'centered';
+
+      // Current favor: lateral drift component toward windward on current tack.
+      // Port tack: windward = port → favorable when lateral < 0 → favor = -lateral
+      // Starboard tack: windward = starboard → favorable when lateral > 0 → favor = +lateral
+      var favorRow = document.getElementById('s-favor-row');
+      if (tack !== 'unknown') {
+        var favor = tack === 'port' ? -lateral : lateral;
+        favorRow.style.display = '';
+        var favorVal  = document.getElementById('s-favor-val');
+        var favorDesc = document.getElementById('s-favor-desc');
+        favorVal.textContent = (favor >= 0 ? '+' : '') + favor.toFixed(2) + ' kts';
+        if (favor > 0.1) {
+          favorVal.style.color  = '#4ade80';
+          favorDesc.textContent = 'current helping — stay on ' + tack + ' tack';
+        } else if (favor < -0.1) {
+          favorVal.style.color  = '#f87171';
+          favorDesc.textContent = 'current hurting — consider tacking';
+        } else {
+          favorVal.style.color  = '#8899aa';
+          favorDesc.textContent = 'current neutral';
+        }
+      } else {
+        favorRow.style.display = 'none';
+      }
     } else {
       setText('s-leeway',  '--');
       setText('s-lateral', '--');
       setText('s-drive',   '--');
       document.getElementById('s-leeway-dir').textContent  = 'needs heading + speed';
       document.getElementById('s-lateral-dir').textContent = 'sideways speed';
+      document.getElementById('s-favor-row').style.display = 'none';
     }
     setText('s-wifimode', d.wifiMode || '--');
     var ip = d.wifiMode === 'AP' ? d.apIP : d.ip;
@@ -641,6 +695,7 @@ function startOTA(e) {
 
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/update');
+  xhr.setRequestHeader('Content-Type', 'application/octet-stream');
   xhr.upload.onprogress = function(e) {
     if (e.lengthComputable) {
       var pct = Math.round(e.loaded / e.total * 100);
@@ -664,11 +719,10 @@ function startOTA(e) {
     bar.style.background = '#ff6b6b';
     status.textContent = 'Upload error — check connection.';
   };
-  var fd = new FormData();
-  fd.append('firmware', file);
-  xhr.send(fd);
+  xhr.send(file);
 }
 </script>
 </body>
 </html>)rawhtml";
+    return ui;
 }
