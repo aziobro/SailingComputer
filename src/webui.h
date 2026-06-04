@@ -86,6 +86,30 @@ inline String getWebUI() {
     </div>
   </div>
   <div class="card">
+    <h2>Sailing Performance</h2>
+    <div class="stat-grid">
+      <div class="stat">
+        <div class="stat-label">Leeway</div>
+        <div class="stat-value" id="s-leeway">--</div>
+        <div style="font-size:0.7rem;color:#8899aa;margin-top:2px" id="s-leeway-dir">heading vs track</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Lateral Drift</div>
+        <div class="stat-value" id="s-lateral">--</div>
+        <div style="font-size:0.7rem;color:#8899aa;margin-top:2px" id="s-lateral-dir">sideways speed</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Drive</div>
+        <div class="stat-value" id="s-drive">--</div>
+        <div style="font-size:0.7rem;color:#8899aa;margin-top:2px">fwd speed (kts)</div>
+      </div>
+    </div>
+    <p style="font-size:0.75rem;color:#556677;margin:0.5rem 0 0">
+      Leeway = COG &minus; Heading &mdash; includes keel slip &amp; tidal current.
+      Positive = slipping to starboard.
+    </p>
+  </div>
+  <div class="card">
     <h2>Connections</h2>
     <div class="stat-grid">
       <div class="stat"><div class="stat-label">WiFi Mode</div><div class="stat-value" id="s-wifimode">--</div></div>
@@ -247,8 +271,30 @@ function updateStatus() {
       cogEl.style.opacity = d.cogValid ? '1' : '0.4';
       cogEl.title = d.cogValid ? '' : 'Frozen \u2014 speed below ' + (d.cogMinSog || 0.1) + ' kts';
     }
-    setText('s-hdop', d.hdop != null ? Number(d.hdop).toFixed(2) : '--');
+    setText('s-hdop', d.hdop     != null ? Number(d.hdop).toFixed(2) : '--');
     setText('s-alt',  d.altitude != null ? Number(d.altitude).toFixed(1) + ' m' : '--');
+
+    // Sailing performance metrics
+    if (d.sailingValid) {
+      var leeway = Number(d.leeway);
+      var lateral = Number(d.lateralDrift);
+      setText('s-leeway',  leeway.toFixed(1) + '°');
+      setText('s-lateral', Math.abs(lateral).toFixed(2) + ' kts');
+      setText('s-drive',   Number(d.driveSpeed).toFixed(2) + ' kts');
+      // Direction labels
+      var leewayEl = document.getElementById('s-leeway');
+      leewayEl.style.color = Math.abs(leeway) > 5 ? '#f59e0b' : '#4ade80';
+      document.getElementById('s-leeway-dir').textContent =
+        leeway > 0.5 ? '▶ starboard slip' : leeway < -0.5 ? '◀ port slip' : 'on track';
+      document.getElementById('s-lateral-dir').textContent =
+        lateral > 0 ? '▶ starboard' : lateral < 0 ? '◀ port' : 'centered';
+    } else {
+      setText('s-leeway',  '--');
+      setText('s-lateral', '--');
+      setText('s-drive',   '--');
+      document.getElementById('s-leeway-dir').textContent  = 'needs heading + speed';
+      document.getElementById('s-lateral-dir').textContent = 'sideways speed';
+    }
     setText('s-wifimode', d.wifiMode || '--');
     var ip = d.wifiMode === 'AP' ? d.apIP : d.ip;
     setText('s-ip', ip || '--');

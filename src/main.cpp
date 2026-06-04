@@ -26,10 +26,47 @@ static int    satCount = 0;
 static float  latitude = 0, longitude = 0, heading = 0, sog = 0, cog = 0;
 static float  hdop = 0, altitude = 0;
 static float  roll = 0;          // labeled "Roll" — pitch of athwartships baseline = boat heel
-static float  cogFiltered = 0;   // smoothed COG using circular EMA; frozen below COG_MIN_SOG_KTS
+static float  cogFiltered = 0;   // smoothed COG using circular EMA; frozen below cogMinSog
 static bool   cogInitialized = false; // true once cogFiltered has been seeded
 static bool   hdtValid = false;
 static bool   rollValid = false;
+
+// ── Derived sailing metrics ───────────────────────────────────────────────────
+// All require both a valid heading and a valid (moving) COG.
+//
+// leewayAngle   — degrees between heading and COG, normalised to ±180°
+//                 positive = slipping to starboard, negative = slipping to port
+//                 Combines true leeway (keel, heel, sail trim) + tidal current.
+//
+// lateralDrift  — sideways component of SOG (knots): SOG × sin(leeway)
+//                 Positive = drifting starboard, negative = drifting port.
+//
+// driveSpeed    — forward component of SOG along heading axis (knots): SOG × cos(leeway)
+//                 Approximates speed through water when current is small.
+static float  leewayAngle   = 0;
+static float  lateralDrift  = 0;
+static float  driveSpeed    = 0;
+static bool   sailingMetricsValid = false;
+
+static void updateSailingMetrics() {
+    // Need valid heading AND moving COG
+    if (!hdtValid || !cogInitialized || sog < cfgMgr.cfg.cogMinSog) {
+        sailingMetricsValid = false;
+        return;
+    }
+
+    // Leeway = angle between where the bow points and where the boat goes.
+    // Normalise to ±180° so +10° means "slipping 10° to starboard".
+    float diff = cogFiltered - heading;
+    while (diff >  180.0f) diff -= 360.0f;
+    while (diff < -180.0f) diff += 360.0f;
+    leewayAngle  = diff;
+
+    float radians    = leewayAngle * DEG_TO_RAD;
+    lateralDrift     = sog * sinf(radians);   // knots sideways (+ = stbd)
+    driveSpeed       = sog * cosf(radians);   // knots forward along heading
+    sailingMetricsValid = true;
+}
 
 // Apply the user-configured heading offset (loaded from NVS, default 90°)
 static float applyHeadingOffset(float h) {
@@ -140,6 +177,7 @@ static void parseHDT(const char* s) {
         if (field == 2 && strlen(tok) > 0) {
             heading  = applyHeadingOffset(atof(tok));
             hdtValid = true;
+            updateSailingMetrics();
         }
         tok = strtok(nullptr, ",");
     }
@@ -185,8 +223,9 @@ static void parseVTG(const char* s) {
         if (field == 6) sog    = atof(tok);  // speed in knots
         tok = strtok(nullptr, ",");
     }
-    cog = rawCog;               // raw value (kept for reference)
-    updateCOG(rawCog, sog);     // update filtered COG
+    cog = rawCog;
+    updateCOG(rawCog, sog);
+    updateSailingMetrics();
 }
 
 // Parse Unicore #HEADINGA message for heading + pitch
@@ -564,6 +603,10 @@ static void handleStatus() {
         "\"altitude\":%.2f,"
         "\"roll\":%.2f,"
         "\"rollValid\":%s,"
+        "\"leeway\":%.1f,"
+        "\"lateralDrift\":%.2f,"
+        "\"driveSpeed\":%.2f,"
+        "\"sailingValid\":%s,"
         "\"bleEnabled\":%s,"
         "\"bleConnected\":%s,"
         "\"ntripConnected\":%s,"
@@ -582,8 +625,10 @@ static void handleStatus() {
         (cogInitialized && sog >= cfgMgr.cfg.cogMinSog) ? "true" : "false",
         cfgMgr.cfg.cogMinSog,
         satCount, hdop, altitude, roll,
-        rollValid     ? "true" : "false",
-        bleEnabled    ? "true" : "false",
+        rollValid             ? "true" : "false",
+        leewayAngle, lateralDrift, driveSpeed,
+        sailingMetricsValid   ? "true" : "false",
+        bleEnabled            ? "true" : "false",
         bleConnected  ? "true" : "false",
         ntripConnected ? "true" : "false",
         ntripActiveIdx, ntripBytesIn,
