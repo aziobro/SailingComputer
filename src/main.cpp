@@ -49,6 +49,8 @@ static WiFiClient ntripClient;
 static bool       ntripConnected   = false;
 static uint32_t   ntripLastAttempt = 0;
 static uint32_t   ntripBytesIn     = 0;
+static uint32_t   ntripConnectTime = 0;   // millis() when connection was established
+static uint32_t   ntripSessionBytes = 0;  // bytes received in current session
 static int        ntripActiveIdx   = 0;   // which source we're currently using
 static int        ntripFailCount   = 0;   // consecutive failures on active source
 static bool       ntripAnyEnabled  = false; // cached: at least one source is configured
@@ -350,14 +352,15 @@ static bool ntripConnect(int idx) {
         return false;
     }
 
-    // HTTP/1.0 keeps things simple for streaming — no chunked encoding,
-    // no keep-alive negotiation. NTRIP is a raw streaming protocol.
+    // HTTP/1.1 with keep-alive — NTRIP is a persistent stream so we must NOT
+    // send Connection:close which tells the server to close after one response.
     String req = "GET /";
     req += src.mount;
-    req += " HTTP/1.0\r\nHost: ";
+    req += " HTTP/1.1\r\nHost: ";
     req += src.host;
     req += "\r\nNtrip-Version: Ntrip/2.0\r\n";
     req += "User-Agent: NTRIP SailingComputer/1.0\r\n";
+    req += "Accept: rtk/rtcm\r\n";
     if (strlen(src.user) > 0) {
         req += "Authorization: Basic ";
         req += base64Encode(String(src.user) + ":" + String(src.pass));
@@ -382,8 +385,10 @@ static bool ntripConnect(int idx) {
                 String hdr = ntripClient.readStringUntil('\n');
                 if (hdr.length() <= 2) break;  // blank line = end of headers
             }
-            ntripConnected = true;
-            ntripFailCount = 0;
+            ntripConnected    = true;
+            ntripFailCount    = 0;
+            ntripConnectTime  = millis();
+            ntripSessionBytes = 0;
             Serial.printf("[NTRIP%d] Connected OK\n", idx);
             // Send GGA immediately so strict casters don't time out
             ntripSendGGA();
@@ -442,9 +447,34 @@ static void ntripLoop() {
     }
 
     if (!ntripClient.connected()) {
-        Serial.printf("[NTRIP%d] Connection dropped\n", ntripActiveIdx);
+        uint32_t sessionSecs = (millis() - ntripConnectTime) / 1000;
+
+        // Read any final bytes the server sent — may be a status/error message
+        String serverMsg = "";
+        while (ntripClient.available()) {
+            char c = (char)ntripClient.read();
+            if (c >= 0x20 && c < 0x7f) serverMsg += c;
+        }
+
+        if (serverMsg.length() > 0)
+            Serial.printf("[NTRIP%d] Server message: %s\n", ntripActiveIdx, serverMsg.c_str());
+
+        Serial.printf("[NTRIP%d] Disconnected after %us / %u bytes\n",
+                      ntripActiveIdx, sessionSecs, ntripSessionBytes);
+
         ntripDisconnect();
-        ntripFailCount++;
+
+        // If we received data this session it was a server-initiated close (e.g. session
+        // time limit). Reconnect immediately — don't wait the full reconnect interval.
+        // Only apply the backoff timer to outright connection failures (0 bytes received).
+        if (ntripSessionBytes > 0) {
+            Serial.printf("[NTRIP%d] Server closed session — reconnecting immediately\n",
+                          ntripActiveIdx);
+            ntripLastAttempt = 0;   // reconnect on next loop iteration
+            // Don't increment failCount — this was a clean close, not a failure
+        } else {
+            ntripFailCount++;       // genuine failure — count toward failover
+        }
         return;
     }
 
@@ -462,7 +492,8 @@ static void ntripLoop() {
         int n = ntripClient.read(buf, min(avail, (int)sizeof(buf)));
         if (n > 0) {
             Serial2.write(buf, n);
-            ntripBytesIn += n;
+            ntripBytesIn    += n;
+            ntripSessionBytes += n;
             static uint32_t lastRtcmLog = 0;
             if (millis() - lastRtcmLog > 5000) {
                 Serial.printf("[NTRIP%d] RTCM flowing — total %u bytes\n",
