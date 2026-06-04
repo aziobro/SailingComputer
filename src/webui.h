@@ -54,6 +54,12 @@ inline String getWebUI() {
   .toggle-row { display: flex; align-items: center; margin-bottom: 12px; }
   .toggle-row label { margin: 0 0 0 8px; font-size: 0.9rem; color: #e0e8f0; }
   input[type=checkbox] { width: auto; margin: 0; accent-color: #5ab4e8; transform: scale(1.3); cursor: pointer; }
+
+  /* Instrument panel */
+  .instruments { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; align-items: flex-start; }
+  .instrument  { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  .instrument-label { font-size: 0.7rem; color: #5a7a9a; text-transform: uppercase; letter-spacing: 0.5px; }
+  .instr-legend { font-size: 0.72rem; color: #8899aa; margin-top: 2px; }
 </style>
 </head>
 <body>
@@ -85,6 +91,84 @@ inline String getWebUI() {
       <div class="stat"><div class="stat-label">Altitude (m)</div><div class="stat-value" id="s-alt">--</div></div>
     </div>
   </div>
+  <div class="card">
+    <h2>Navigation Instruments</h2>
+    <div class="instruments">
+
+      <!-- Compass rose: heading (blue) + COG (amber) + leeway arc -->
+      <div class="instrument">
+        <svg id="compass-svg" viewBox="-115 -115 230 230" width="220" height="220">
+          <!-- Outer ring -->
+          <circle r="112" fill="#091a36" stroke="#1e4080" stroke-width="1.5"/>
+          <!-- Tick marks and cardinal labels inserted by JS -->
+          <g id="c-ticks"></g>
+          <g id="c-labels"></g>
+          <!-- Inner reference ring -->
+          <circle r="78" fill="none" stroke="#1e3a5f" stroke-width="0.5" stroke-dasharray="2,6"/>
+          <!-- Leeway arc -->
+          <path id="c-arc" fill="none" stroke-width="4" stroke-linecap="round" opacity="0.75"/>
+          <!-- COG pointer (amber arrow) -->
+          <g id="c-cog">
+            <line x1="0" y1="18" x2="0" y2="-88" stroke="#f59e0b" stroke-width="2"/>
+            <polygon points="0,-100 -7,-82 7,-82" fill="#f59e0b"/>
+            <line x1="-6" y1="18" x2="6" y2="18" stroke="#f59e0b" stroke-width="1.5"/>
+          </g>
+          <!-- Heading pointer (boat silhouette, blue) -->
+          <g id="c-hdg">
+            <polygon points="0,-94 -9,-54 -4,-54 -4,16 4,16 4,-54 9,-54" fill="#4a9eff"/>
+            <polygon points="-9,-54 9,-54 12,-38 -12,-38" fill="#2a7fd4" opacity="0.7"/>
+          </g>
+          <!-- Hub -->
+          <circle r="20" fill="#091a36" stroke="#1e4080" stroke-width="1.5"/>
+          <text id="c-hdg-num" y="-3" text-anchor="middle" fill="#4a9eff" font-size="9" font-weight="bold">---</text>
+          <text id="c-cog-num" y="9"  text-anchor="middle" fill="#f59e0b" font-size="9">---</text>
+        </svg>
+        <div class="instr-legend">
+          <span style="color:#4a9eff">&#9650; Heading</span> &nbsp;
+          <span style="color:#f59e0b">&#9650; COG</span>
+        </div>
+      </div>
+
+      <!-- Heel / roll inclinometer -->
+      <div class="instrument">
+        <svg id="heel-svg" viewBox="-110 -75 220 150" width="220" height="150">
+          <!-- Background -->
+          <rect x="-108" y="-73" width="216" height="146" rx="8" fill="#091a36" stroke="#1e4080" stroke-width="1.5"/>
+          <!-- Scale arcs and tick marks inserted by JS -->
+          <g id="h-scale"></g>
+          <!-- Water fill (tilts with heel) -->
+          <g id="h-water">
+            <clipPath id="hclip">
+              <rect x="-108" y="-73" width="216" height="146" rx="8"/>
+            </clipPath>
+            <rect id="h-water-rect" x="-200" y="10" width="400" height="80"
+                  fill="#1e3a5f" opacity="0.45" clip-path="url(#hclip)"/>
+          </g>
+          <!-- Boat hull cross-section (rotates) -->
+          <g id="h-hull">
+            <!-- Hull -->
+            <polygon points="0,-52 -46,14 -32,26 0,32 32,26 46,14"
+                     fill="#1a3a5a" stroke="#4a9eff" stroke-width="1.5"/>
+            <!-- Deck line -->
+            <line x1="-46" y1="14" x2="46" y2="14" stroke="#5ab4e8" stroke-width="1"/>
+            <!-- Keel -->
+            <polygon points="-6,32 6,32 4,56 -4,56" fill="#2a5a8f"/>
+            <!-- Mast -->
+            <line x1="0" y1="-52" x2="0" y2="-66" stroke="#7ab4d8" stroke-width="2"/>
+          </g>
+          <!-- Center reference line -->
+          <line x1="0" y1="-70" x2="0" y2="70" stroke="#1e3060" stroke-width="1" stroke-dasharray="4,6"/>
+          <!-- Horizon reference -->
+          <line x1="-108" y1="14" x2="108" y2="14" stroke="#4a9eff" stroke-width="0.5" opacity="0.25"/>
+          <!-- Roll value -->
+          <text id="h-num" y="62" text-anchor="middle" font-size="13" font-weight="bold" fill="#e0e8f0">0.0°</text>
+        </svg>
+        <div class="instr-legend">Roll / Heel &nbsp; <span style="color:#f59e0b">■</span> &gt;20°</div>
+      </div>
+
+    </div>
+  </div>
+
   <div class="card">
     <h2>Sailing Performance</h2>
     <div class="stat-grid">
@@ -330,10 +414,120 @@ function updateStatus() {
         bleStatusText.style.color = '#8899aa';
       }
     }
+    // Live instruments
+    updateCompass(
+      d.hdtValid  ? Number(d.heading) : 0,
+      d.cogValid  ? Number(d.cog)     : 0,
+      d.sailingValid ? Number(d.leeway) : 0,
+      d.sailingValid || false,
+      d.hdtValid  || false,
+      d.cogValid  || false
+    );
+    updateHeel(d.rollValid ? Number(d.roll) : 0, d.rollValid || false);
+
   }).catch(function(e) { console.error('Status fetch error:', e); });
 }
 setInterval(updateStatus, 2000);
 updateStatus();
+
+// ── Instrument initialisation ─────────────────────────────────────────────────
+
+function initCompass() {
+  var ticks = document.getElementById('c-ticks');
+  var lbls  = document.getElementById('c-labels');
+  if (!ticks) return;
+  var cardinals = {0:'N',45:'NE',90:'E',135:'SE',180:'S',225:'SW',270:'W',315:'NW'};
+  var mainCard  = {0:1, 90:1, 180:1, 270:1};
+  var tickHtml = '', lblHtml = '';
+  for (var i = 0; i < 360; i += 5) {
+    var rad = (i - 90) * Math.PI / 180;
+    var isMain = i % 90 === 0, isTen = i % 10 === 0;
+    var r1 = 112, r2 = r1 - (isMain ? 12 : isTen ? 8 : 5);
+    var sw = isMain ? 2 : isTen ? 1.2 : 0.7;
+    var col = isMain ? '#5ab4e8' : '#2a4a7f';
+    var x1 = r1*Math.cos(rad), y1 = r1*Math.sin(rad);
+    var x2 = r2*Math.cos(rad), y2 = r2*Math.sin(rad);
+    tickHtml += '<line x1="'+x1.toFixed(1)+'" y1="'+y1.toFixed(1)+'" x2="'+x2.toFixed(1)+'" y2="'+y2.toFixed(1)+'" stroke="'+col+'" stroke-width="'+sw+'"/>';
+  }
+  Object.keys(cardinals).forEach(function(deg) {
+    var rad = (deg - 90) * Math.PI / 180;
+    var r = 94, isMain = mainCard[parseInt(deg)];
+    var x = r*Math.cos(rad), y = r*Math.sin(rad);
+    lblHtml += '<text x="'+x.toFixed(1)+'" y="'+y.toFixed(1)+'" dy="4" text-anchor="middle"'+
+               ' fill="'+(isMain?'#c8daf0':'#5a7a9a')+'" font-size="'+(isMain?10:8)+'"'+
+               ' font-weight="'+(isMain?'bold':'normal')+'">'+cardinals[deg]+'</text>';
+  });
+  ticks.innerHTML = tickHtml;
+  lbls.innerHTML  = lblHtml;
+}
+
+function initHeelScale() {
+  var scale = document.getElementById('h-scale');
+  if (!scale) return;
+  var html = '';
+  for (var deg = -45; deg <= 45; deg += 15) {
+    var rad = deg * Math.PI / 180;
+    var x = 100 * Math.sin(rad), y = -100 * Math.cos(rad) + 14;
+    var tickX2 = 92 * Math.sin(rad), tickY2 = -92 * Math.cos(rad) + 14;
+    var col = Math.abs(deg) >= 30 ? '#f59e0b' : '#2a4a7f';
+    html += '<line x1="'+x.toFixed(1)+'" y1="'+y.toFixed(1)+'" x2="'+tickX2.toFixed(1)+'" y2="'+tickY2.toFixed(1)+'" stroke="'+col+'" stroke-width="1.5"/>';
+    if (deg !== 0) {
+      var lx = 80*Math.sin(rad), ly = -80*Math.cos(rad)+14;
+      html += '<text x="'+lx.toFixed(1)+'" y="'+ly.toFixed(1)+'" dy="3" text-anchor="middle" fill="'+col+'" font-size="8">'+Math.abs(deg)+'</text>';
+    }
+  }
+  scale.innerHTML = html;
+}
+
+function updateCompass(hdg, cogDeg, leeway, sailValid, hdtV, cogV) {
+  var hdgPtr = document.getElementById('c-hdg');
+  var cogPtr = document.getElementById('c-cog');
+  var arc    = document.getElementById('c-arc');
+  var hdgNum = document.getElementById('c-hdg-num');
+  var cogNum = document.getElementById('c-cog-num');
+  if (!hdgPtr) return;
+
+  if (hdtV) {
+    hdgPtr.setAttribute('transform', 'rotate('+hdg.toFixed(1)+')');
+    hdgNum.textContent = Math.round(hdg)+'°';
+  }
+  if (cogV) {
+    cogPtr.setAttribute('transform', 'rotate('+cogDeg.toFixed(1)+')');
+    cogNum.textContent = Math.round(cogDeg)+'°';
+  }
+
+  // Leeway arc between heading and COG
+  if (hdtV && cogV && sailValid) {
+    var r = 68;
+    var sRad = (hdg  - 90) * Math.PI / 180;
+    var eRad = (cogDeg - 90) * Math.PI / 180;
+    var sx = r*Math.cos(sRad), sy = r*Math.sin(sRad);
+    var ex = r*Math.cos(eRad), ey = r*Math.sin(eRad);
+    var large = Math.abs(leeway) > 180 ? 1 : 0;
+    var sweep = leeway > 0 ? 1 : 0;
+    arc.setAttribute('d','M '+sx.toFixed(1)+' '+sy.toFixed(1)+
+                        ' A '+r+' '+r+' 0 '+large+' '+sweep+' '+ex.toFixed(1)+' '+ey.toFixed(1));
+    arc.setAttribute('stroke', Math.abs(leeway) > 5 ? '#f59e0b' : '#4ade80');
+  } else {
+    arc.setAttribute('d','');
+  }
+}
+
+function updateHeel(roll, valid) {
+  var hull   = document.getElementById('h-hull');
+  var water  = document.getElementById('h-water-rect');
+  var num    = document.getElementById('h-num');
+  if (!hull) return;
+  var r = valid ? roll : 0;
+  hull.setAttribute('transform',  'rotate('+r+',0,14)');
+  water.setAttribute('transform', 'rotate('+r+',0,14)');
+  num.textContent = (valid ? r.toFixed(1) : '--') + '°';
+  num.setAttribute('fill', Math.abs(r)>30 ? '#e85a5a' : Math.abs(r)>20 ? '#f59e0b' : '#e0e8f0');
+}
+
+// Initialise on load
+initCompass();
+initHeelScale();
 
 const SOURCE_LABELS = ['Source 1 (Primary)', 'Source 2 (Failover)', 'Source 3 (Failover)'];
 
