@@ -1,0 +1,16 @@
+FILE(GLOB_RECURSE app_sources ${CMAKE_SOURCE_DIR}/src/*.cpp)
+
+idf_component_register(
+    SRCS ${app_sources}
+    INCLUDE_DIRS "."
+    REQUIRES
+        mdns
+        esp_wifi
+        esp_http_server
+        app_update
+        esp_netif
+        nvs_flash
+        driver
+        bt
+        lwip
+)

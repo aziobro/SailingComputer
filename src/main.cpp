@@ -1,74 +1,124 @@
-#include <Arduino.h>
-#include <WiFi.h>
-#include <WiFiClient.h>
-#include <WiFiServer.h>
-#include <WebServer.h>
-#include <ESPmDNS.h>
-#include <Update.h>
 #include <math.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_system.h"
+#include "esp_ota_ops.h"
+#include "esp_http_server.h"
+#include "nvs_flash.h"
+#include "mdns.h"
+#include "driver/uart.h"
+#include "driver/gpio.h"
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
+#include "lwip/err.h"
 #include "config.h"
 #include "webui.h"
 #include "um982.h"
 #include "ble_nmea.h"
 
-// Set to true to echo raw Serial1 bytes to debug console (helps verify UM982 is talking)
-#define DEBUG_NMEA_RAW false
+// ── Utility macros ────────────────────────────────────────────────────────────
+
+static const char *TAG = "SailComp";
+
+#ifndef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
+
+#define DEG_TO_RAD (M_PI / 180.0f)
+#define RAD_TO_DEG (180.0f / M_PI)
+
+static inline float fclamp(float v, float lo, float hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// millis() equivalent — microseconds since boot divided by 1000
+static inline uint32_t millis(void) {
+    return (uint32_t)(esp_timer_get_time() / 1000ULL);
+}
+
+// ── UART port assignments ─────────────────────────────────────────────────────
+// UART2 is used for NMEA because GPIO16/17 are UART2's NATIVE pins on ESP32 —
+// no GPIO matrix remapping needed, which avoids a silent RX failure in IDF 5.x.
+// UART1's default pins (GPIO9/10) are the SPI flash bus, so it must be remapped.
+// Same UART numbers as Arduino Serial1/Serial2 — both GPIO-matrix remapped.
+#define UART_NMEA  UART_NUM_1   // UM982 COM1 — NMEA in  (GPIO16=RX, GPIO17=TX)
+#define UART_RTCM  UART_NUM_2   // UM982 COM2 — RTCM out (GPIO19=RX, GPIO18=TX)
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
 ConfigManager cfgMgr;
 
-// NMEA
-static char   nmeaLine[256];
-static int    nmeaIdx = 0;
-static int    fixQuality = 0;
-static int    satCount = 0;
-static float  latitude = 0, longitude = 0, heading = 0, sog = 0, cog = 0;
-static float  hdop = 0, altitude = 0;
-static float  roll = 0;          // labeled "Roll" — pitch of athwartships baseline = boat heel
-static float  cogFiltered = 0;   // smoothed COG using circular EMA; frozen below cogMinSog
-static bool   cogInitialized = false; // true once cogFiltered has been seeded
-static bool   hdtValid = false;
-static bool   rollValid = false;
+static char  nmeaLine[256];
+static int   nmeaIdx    = 0;
+static int   fixQuality = 0;
+static int   satCount   = 0;
+static float latitude   = 0, longitude = 0, heading = 0, sog = 0, cog = 0;
+static float hdop = 0, altitude = 0;
+static float roll = 0;          // heel: pitch of athwartships baseline
+static float cogFiltered    = 0;
+static bool  cogInitialized = false;
+static bool  hdtValid       = false;
+static bool  rollValid      = false;
 
-// ── Derived sailing metrics ───────────────────────────────────────────────────
-// All require both a valid heading and a valid (moving) COG.
-//
-// leewayAngle   — degrees between heading and COG, normalised to ±180°
-//                 positive = slipping to starboard, negative = slipping to port
-//                 Combines true leeway (keel, heel, sail trim) + tidal current.
-//
-// lateralDrift  — sideways component of SOG (knots): SOG × sin(leeway)
-//                 Positive = drifting starboard, negative = drifting port.
-//
-// driveSpeed    — forward component of SOG along heading axis (knots): SOG × cos(leeway)
-//                 Approximates speed through water when current is small.
-static float  leewayAngle   = 0;
-static float  lateralDrift  = 0;
-static float  driveSpeed    = 0;
-static bool   sailingMetricsValid = false;
+static float leewayAngle        = 0;
+static float lateralDrift       = 0;
+static float driveSpeed         = 0;
+static bool  sailingMetricsValid = false;
+
+// Diagnostic counters
+static uint32_t nmeaBytesRx  = 0;  // raw bytes received from UART1 — 0 means UART broken
+static uint32_t nmeaLinesRx  = 0;  // complete NMEA sentences parsed
+
+// WiFi
+static bool staConnected = false;
+static SemaphoreHandle_t wifiMutex = NULL;
+
+// NMEA TCP server
+#define MAX_NMEA_CLIENTS 4
+static int nmeaSrvFd = -1;
+static int nmeaClientFds[MAX_NMEA_CLIENTS];
+static SemaphoreHandle_t nmeaClientMtx = NULL;
+
+// NTRIP
+static int      ntripSock        = -1;
+static bool     ntripConnected   = false;
+static uint32_t ntripLastAttempt = 0;
+static uint32_t ntripBytesIn     = 0;
+static uint32_t ntripConnectTime = 0;
+static uint32_t ntripSessionBytes = 0;
+static int      ntripActiveIdx   = 0;
+static int      ntripFailCount   = 0;
+static bool     ntripAnyEnabled  = false;
+
+// HTTP server handle
+static httpd_handle_t webServer = NULL;
+
+// ── Sailing metrics ───────────────────────────────────────────────────────────
 
 static void updateSailingMetrics() {
-    // Need valid heading AND moving COG
     if (!hdtValid || !cogInitialized || sog < cfgMgr.cfg.cogMinSog) {
         sailingMetricsValid = false;
         return;
     }
-
-    // Leeway = angle between where the bow points and where the boat goes.
-    // Normalise to ±180° so +10° means "slipping 10° to starboard".
     float diff = cogFiltered - heading;
     while (diff >  180.0f) diff -= 360.0f;
     while (diff < -180.0f) diff += 360.0f;
     leewayAngle  = diff;
-
-    float radians    = leewayAngle * DEG_TO_RAD;
-    lateralDrift     = sog * sinf(radians);   // knots sideways (+ = stbd)
-    driveSpeed       = sog * cosf(radians);   // knots forward along heading
+    float rad    = leewayAngle * DEG_TO_RAD;
+    lateralDrift = sog * sinf(rad);
+    driveSpeed   = sog * cosf(rad);
     sailingMetricsValid = true;
 }
 
-// Apply the user-configured heading offset (loaded from NVS, default 90°)
 static float applyHeadingOffset(float h) {
     h += cfgMgr.cfg.headingOffset;
     while (h >= 360.0f) h -= 360.0f;
@@ -76,101 +126,118 @@ static float applyHeadingOffset(float h) {
     return h;
 }
 
-// TCP NMEA server
-static WiFiServer nmeaServer(NMEA_TCP_PORT);
-#define MAX_NMEA_CLIENTS 4
-static WiFiClient nmeaClients[MAX_NMEA_CLIENTS];
-
-// NTRIP
-static WiFiClient ntripClient;
-static bool       ntripConnected   = false;
-static uint32_t   ntripLastAttempt = 0;
-static uint32_t   ntripBytesIn     = 0;
-static uint32_t   ntripConnectTime = 0;   // millis() when connection was established
-static uint32_t   ntripSessionBytes = 0;  // bytes received in current session
-static int        ntripActiveIdx   = 0;   // which source we're currently using
-static int        ntripFailCount   = 0;   // consecutive failures on active source
-static bool       ntripAnyEnabled  = false; // cached: at least one source is configured
-
-// Web server
-static WebServer webServer(80);
-
-// WiFi
-static bool staConnected = false;
-
-// FreeRTOS task handles
-static TaskHandle_t ntripTaskHandle = nullptr;
-
 // ── Base64 ────────────────────────────────────────────────────────────────────
 
 static const char b64chars[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-static String base64Encode(const String& in) {
-    String out;
-    int i = 0;
+// Encode src (len bytes) into dst (must be >= len*4/3 + 4 bytes).
+static void base64Encode(const char *src, size_t len, char *dst) {
+    size_t i = 0, j = 0;
     uint8_t buf3[3], buf4[4];
-    int len = in.length();
-    const char* s = in.c_str();
-    while (len--) {
-        buf3[i++] = (uint8_t)*s++;
+    size_t rem = len;
+    while (rem--) {
+        buf3[i++] = (uint8_t)*src++;
         if (i == 3) {
             buf4[0] = (buf3[0] & 0xfc) >> 2;
-            buf4[1] = ((buf3[0] & 0x03) << 4) + ((buf3[1] & 0xf0) >> 4);
-            buf4[2] = ((buf3[1] & 0x0f) << 2) + ((buf3[2] & 0xc0) >> 6);
+            buf4[1] = ((buf3[0] & 0x03) << 4) | ((buf3[1] & 0xf0) >> 4);
+            buf4[2] = ((buf3[1] & 0x0f) << 2) | ((buf3[2] & 0xc0) >> 6);
             buf4[3] = buf3[2] & 0x3f;
-            for (int k = 0; k < 4; k++) out += b64chars[buf4[k]];
+            for (int k = 0; k < 4; k++) dst[j++] = b64chars[buf4[k]];
             i = 0;
         }
     }
     if (i) {
-        for (int j = i; j < 3; j++) buf3[j] = 0;
+        for (size_t k = i; k < 3; k++) buf3[k] = 0;
         buf4[0] = (buf3[0] & 0xfc) >> 2;
-        buf4[1] = ((buf3[0] & 0x03) << 4) + ((buf3[1] & 0xf0) >> 4);
-        buf4[2] = ((buf3[1] & 0x0f) << 2) + ((buf3[2] & 0xc0) >> 6);
-        for (int k = 0; k < i + 1; k++) out += b64chars[buf4[k]];
-        while (i++ < 3) out += '=';
+        buf4[1] = ((buf3[0] & 0x03) << 4) | ((buf3[1] & 0xf0) >> 4);
+        buf4[2] = ((buf3[1] & 0x0f) << 2) | ((buf3[2] & 0xc0) >> 6);
+        for (size_t k = 0; k < i + 1; k++) dst[j++] = b64chars[buf4[k]];
+        while (i++ < 3) dst[j++] = '=';
     }
-    return out;
+    dst[j] = '\0';
+}
+
+// ── URL decode / form parsing ─────────────────────────────────────────────────
+
+static int hexVal(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return 0;
+}
+
+static void urlDecode(char *dst, const char *src, size_t dst_size) {
+    size_t i = 0;
+    while (*src && i < dst_size - 1) {
+        if (*src == '+') {
+            dst[i++] = ' '; src++;
+        } else if (*src == '%' && src[1] && src[2]) {
+            dst[i++] = (char)((hexVal(src[1]) << 4) | hexVal(src[2]));
+            src += 3;
+        } else {
+            dst[i++] = *src++;
+        }
+    }
+    dst[i] = '\0';
+}
+
+// Find key in "k1=v1&k2=v2" body, URL-decode value into val.
+// Returns true if key found.
+static bool formGet(const char *body, const char *key,
+                    char *val, size_t val_size) {
+    char search[68];
+    snprintf(search, sizeof(search), "%s=", key);
+    const char *p = body;
+    while ((p = strstr(p, search)) != NULL) {
+        if (p == body || *(p - 1) == '&') break;   // ensure full key match
+        p++;
+    }
+    if (!p) { if (val_size) val[0] = '\0'; return false; }
+    p += strlen(search);
+    const char *end = strchr(p, '&');
+    size_t raw_len  = end ? (size_t)(end - p) : strlen(p);
+    char raw[512];
+    if (raw_len >= sizeof(raw)) raw_len = sizeof(raw) - 1;
+    memcpy(raw, p, raw_len); raw[raw_len] = '\0';
+    urlDecode(val, raw, val_size);
+    return true;
 }
 
 // ── NMEA helpers ──────────────────────────────────────────────────────────────
 
-// Convert NMEA DDMM.MMMMM to decimal degrees
 static float nmeaToDeg(float val) {
-    int deg = (int)(val / 100);
+    int   deg = (int)(val / 100);
     float min = val - deg * 100.0f;
     return deg + min / 60.0f;
 }
 
-static void parseGGA(const char* s) {
-    char buf[256];
-    strlcpy(buf, s, sizeof(buf));
-    char* tok = strtok(buf, ",");
+static void parseGGA(const char *s) {
+    char buf[256]; strlcpy(buf, s, sizeof(buf));
+    char *tok = strtok(buf, ",");
     int field = 0;
     char latHemi = 'N', lonHemi = 'E';
     while (tok) {
         field++;
         switch (field) {
-            case 3: latitude   = nmeaToDeg(atof(tok)); break;
-            case 4: latHemi    = tok[0]; break;
-            case 5: longitude  = nmeaToDeg(atof(tok)); break;
-            case 6: lonHemi    = tok[0]; break;
-            case 7: fixQuality = atoi(tok); break;
-            case 8: satCount   = atoi(tok); break;
-            case 9: hdop       = atof(tok); break;
-            case 10: altitude  = atof(tok); break;
+            case 3:  latitude   = nmeaToDeg(atof(tok)); break;
+            case 4:  latHemi    = tok[0]; break;
+            case 5:  longitude  = nmeaToDeg(atof(tok)); break;
+            case 6:  lonHemi    = tok[0]; break;
+            case 7:  fixQuality = atoi(tok); break;
+            case 8:  satCount   = atoi(tok); break;
+            case 9:  hdop       = atof(tok); break;
+            case 10: altitude   = atof(tok); break;
         }
-        tok = strtok(nullptr, ",");
+        tok = strtok(NULL, ",");
     }
     if (latHemi == 'S') latitude  = -latitude;
     if (lonHemi == 'W') longitude = -longitude;
 }
 
-static void parseHDT(const char* s) {
-    char buf[256];
-    strlcpy(buf, s, sizeof(buf));
-    char* tok = strtok(buf, ",");
+static void parseHDT(const char *s) {
+    char buf[256]; strlcpy(buf, s, sizeof(buf));
+    char *tok = strtok(buf, ",");
     int field = 0;
     while (tok) {
         field++;
@@ -179,413 +246,450 @@ static void parseHDT(const char* s) {
             hdtValid = true;
             updateSailingMetrics();
         }
-        tok = strtok(nullptr, ",");
+        tok = strtok(NULL, ",");
     }
 }
 
-// Apply speed-weighted circular EMA to COG.
-// Uses sin/cos averaging to correctly handle the 359°→0° wrap.
-// Below COG_MIN_SOG_KTS the filter is frozen — GPS position noise at low speed
-// causes wild COG swings that are meaningless for navigation.
 static void updateCOG(float rawCog, float speedKts) {
-    if (speedKts < cfgMgr.cfg.cogMinSog) return; // frozen — speed below configured threshold
-
+    if (speedKts < cfgMgr.cfg.cogMinSog) return;
     if (!cogInitialized) {
-        cogFiltered    = rawCog;
-        cogInitialized = true;
-        return;
+        cogFiltered = rawCog; cogInitialized = true; return;
     }
-
-    // Alpha scales linearly from COG_ALPHA_MIN at minimum speed to
-    // COG_ALPHA_MAX at COG_FAST_SOG_KTS and above.
     float minSog = cfgMgr.cfg.cogMinSog;
     float t      = (speedKts - minSog) / (COG_FAST_SOG_KTS - minSog);
-    float alpha = COG_ALPHA_MIN + constrain(t, 0.0f, 1.0f) * (COG_ALPHA_MAX - COG_ALPHA_MIN);
-
-    // Circular EMA — blend sin/cos components then recover the angle.
-    float rawRad  = rawCog    * DEG_TO_RAD;
+    float alpha  = COG_ALPHA_MIN + fclamp(t, 0.0f, 1.0f) * (COG_ALPHA_MAX - COG_ALPHA_MIN);
+    float rawRad  = rawCog      * DEG_TO_RAD;
     float filtRad = cogFiltered * DEG_TO_RAD;
-    float sinBlend = alpha * sinf(rawRad)  + (1.0f - alpha) * sinf(filtRad);
-    float cosBlend = alpha * cosf(rawRad)  + (1.0f - alpha) * cosf(filtRad);
-    cogFiltered = atan2f(sinBlend, cosBlend) * RAD_TO_DEG;
+    float sinB    = alpha * sinf(rawRad)  + (1.0f - alpha) * sinf(filtRad);
+    float cosB    = alpha * cosf(rawRad)  + (1.0f - alpha) * cosf(filtRad);
+    cogFiltered   = atan2f(sinB, cosB) * RAD_TO_DEG;
     if (cogFiltered < 0.0f) cogFiltered += 360.0f;
 }
 
-static void parseVTG(const char* s) {
-    char buf[256];
-    strlcpy(buf, s, sizeof(buf));
-    char* tok = strtok(buf, ",");
-    int field = 0;
-    float rawCog = cog; // keep previous value if field is empty
+static void parseVTG(const char *s) {
+    char buf[256]; strlcpy(buf, s, sizeof(buf));
+    char *tok = strtok(buf, ",");
+    int field = 0; float rawCog = cog;
     while (tok) {
         field++;
-        if (field == 2) rawCog = atof(tok);  // true course
-        if (field == 6) sog    = atof(tok);  // speed in knots
-        tok = strtok(nullptr, ",");
+        if (field == 2) rawCog = atof(tok);
+        if (field == 6) sog    = atof(tok);
+        tok = strtok(NULL, ",");
     }
     cog = rawCog;
     updateCOG(rawCog, sog);
     updateSailingMetrics();
 }
 
-// Parse Unicore #HEADINGA message for heading + pitch
-// Format: #HEADINGA,...;<sol_status>,<pos_type>,<baseline>,<heading>,<pitch>,...*checksum
-static void parseHEADINGA(const char* line) {
-    // Find the data section after the semicolon
-    const char* data = strchr(line, ';');
+static void parseHEADINGA(const char *line) {
+    const char *data = strchr(line, ';');
     if (!data) return;
-    data++; // skip ';'
-
-    char buf[256];
-    strlcpy(buf, data, sizeof(buf));
-    // Strip trailing checksum (*xx)
-    char* star = strchr(buf, '*');
-    if (star) *star = '\0';
-
-    char* tok = strtok(buf, ",");
+    data++;
+    char buf[256]; strlcpy(buf, data, sizeof(buf));
+    char *star = strchr(buf, '*'); if (star) *star = '\0';
+    char *tok = strtok(buf, ",");
     int field = 0;
     while (tok) {
         field++;
         switch (field) {
-            case 1: // sol_status — must be SOL_COMPUTED
+            case 1:
                 if (strncmp(tok, "SOL_COMPUTED", 12) != 0) { rollValid = false; return; }
                 break;
-            case 4: // heading — apply antenna mounting offset
+            case 4:
                 heading  = applyHeadingOffset(atof(tok));
                 hdtValid = true;
                 break;
-            case 5: // "pitch" of athwartships baseline = boat roll/heel
+            case 5:
                 roll      = atof(tok);
                 rollValid = true;
                 break;
         }
-        tok = strtok(nullptr, ",");
+        tok = strtok(NULL, ",");
     }
 }
 
-static void processNmeaLine(const char* line) {
+static void processNmeaLine(const char *line) {
     if      (strncmp(line, "$GNGGA",    6) == 0 || strncmp(line, "$GPGGA",    6) == 0) parseGGA(line);
     else if (strncmp(line, "$GNHDT",    6) == 0 || strncmp(line, "$GPHDT",    6) == 0) parseHDT(line);
     else if (strncmp(line, "$GNVTG",    6) == 0 || strncmp(line, "$GPVTG",    6) == 0) parseVTG(line);
     else if (strncmp(line, "#HEADINGA", 9) == 0)                                        parseHEADINGA(line);
 }
 
-// ── NMEA TCP broadcast ────────────────────────────────────────────────────────
+// ── NMEA checksum ─────────────────────────────────────────────────────────────
 
-static void broadcastNmea(const char* line) {
-    for (int i = 0; i < MAX_NMEA_CLIENTS; i++) {
-        if (nmeaClients[i] && nmeaClients[i].connected()) {
-            nmeaClients[i].print(line);
-            nmeaClients[i].print("\r\n");
-        }
-    }
-}
-
-// Calculate NMEA checksum (XOR of all bytes between $ and *)
-static uint8_t nmeaChecksum(const char* s) {
+static uint8_t nmeaChecksum(const char *s) {
     uint8_t cs = 0;
     if (*s == '$') s++;
     while (*s && *s != '*') cs ^= (uint8_t)*s++;
     return cs;
 }
 
-// Build a corrected $GPHDT sentence using the already-offset heading value
+// ── NMEA TCP broadcast ────────────────────────────────────────────────────────
+
+static void broadcastNmea(const char *line) {
+    xSemaphoreTake(nmeaClientMtx, portMAX_DELAY);
+    for (int i = 0; i < MAX_NMEA_CLIENTS; i++) {
+        if (nmeaClientFds[i] < 0) continue;
+        if (send(nmeaClientFds[i], line,   strlen(line), MSG_DONTWAIT) < 0 ||
+            send(nmeaClientFds[i], "\r\n", 2,            MSG_DONTWAIT) < 0) {
+            close(nmeaClientFds[i]);
+            nmeaClientFds[i] = -1;
+            ESP_LOGI(TAG, "[NMEA] Client %d gone", i);
+        }
+    }
+    xSemaphoreGive(nmeaClientMtx);
+}
+
 static void broadcastHDT() {
     if (!hdtValid) return;
-    char body[32];
-    snprintf(body, sizeof(body), "GPHDT,%.4f,T", heading);
-    char sentence[48];
-    snprintf(sentence, sizeof(sentence), "$%s*%02X", body, nmeaChecksum(body));
+    char body[32], sentence[48];
+    snprintf(body,     sizeof(body),     "GPHDT,%.4f,T", heading);
+    snprintf(sentence, sizeof(sentence), "$%s*%02X",     body, nmeaChecksum(body));
     broadcastNmea(sentence);
 }
 
 static void acceptNmeaClients() {
-    WiFiClient c = nmeaServer.accept();
-    if (!c) return;
+    struct sockaddr_in client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(nmeaSrvFd, &rfds);
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };  // non-blocking poll
+    if (select(nmeaSrvFd + 1, &rfds, NULL, NULL, &tv) <= 0) return;
+    int fd = accept(nmeaSrvFd, (struct sockaddr *)&client_addr, &addr_len);
+    if (fd < 0) return;
+    xSemaphoreTake(nmeaClientMtx, portMAX_DELAY);
+    bool placed = false;
     for (int i = 0; i < MAX_NMEA_CLIENTS; i++) {
-        if (!nmeaClients[i] || !nmeaClients[i].connected()) {
-            nmeaClients[i] = c;
-            Serial.printf("[NMEA] Client %d: %s\n", i, c.remoteIP().toString().c_str());
-            return;
+        if (nmeaClientFds[i] < 0) {
+            nmeaClientFds[i] = fd;
+            placed = true;
+            ESP_LOGI(TAG, "[NMEA] Client %d connected: " IPSTR,
+                     i, IP2STR((ip4_addr_t *)&client_addr.sin_addr));
+            break;
         }
     }
-    c.stop();
+    xSemaphoreGive(nmeaClientMtx);
+    if (!placed) close(fd);
 }
 
 // ── NTRIP ─────────────────────────────────────────────────────────────────────
 
-// Recompute ntripAnyEnabled — call after config load or save.
 static void ntripUpdateEnabled() {
     ntripAnyEnabled = false;
     ntripActiveIdx  = 0;
     for (int i = 0; i < NTRIP_SOURCES; i++) {
         if (cfgMgr.cfg.ntrip[i].enabled && strlen(cfgMgr.cfg.ntrip[i].host) > 0) {
-            if (!ntripAnyEnabled)
-                ntripActiveIdx = i;  // start on the first enabled source
+            if (!ntripAnyEnabled) ntripActiveIdx = i;
             ntripAnyEnabled = true;
         }
     }
-    if (!ntripAnyEnabled) {
-        Serial.println("[NTRIP] No sources configured — set up NTRIP in the Configuration tab");
-    } else {
-        int count = 0;
-        for (int i = 0; i < NTRIP_SOURCES; i++)
-            if (cfgMgr.cfg.ntrip[i].enabled && strlen(cfgMgr.cfg.ntrip[i].host) > 0) count++;
-        Serial.printf("[NTRIP] %d source(s) enabled — starting on source %d\n",
-                      count, ntripActiveIdx);
-    }
+    if (!ntripAnyEnabled)
+        ESP_LOGI(TAG, "[NTRIP] No sources configured");
 }
 
-// Find the next enabled source starting after idx (wraps around)
 static int ntripNextSource(int idx) {
     for (int i = 1; i <= NTRIP_SOURCES; i++) {
         int next = (idx + i) % NTRIP_SOURCES;
         if (cfgMgr.cfg.ntrip[next].enabled && strlen(cfgMgr.cfg.ntrip[next].host) > 0)
             return next;
     }
-    return -1; // none available
+    return -1;
 }
 
 static void ntripDisconnect() {
-    if (ntripClient.connected()) ntripClient.stop();
+    if (ntripSock >= 0) { close(ntripSock); ntripSock = -1; }
     ntripConnected = false;
 }
 
-// Build a GGA sentence from current position and send it to the NTRIP caster.
-// Casters need this to provide the right corrections for the rover location.
 static void ntripSendGGA() {
-    if (fixQuality == 0) return;  // no position yet — don't send empty GGA
-
-    float lat = fabsf(latitude);
-    float lon = fabsf(longitude);
+    if (fixQuality == 0 || ntripSock < 0) return;
+    float lat = fabsf(latitude),  lon = fabsf(longitude);
     int   latDeg = (int)lat;  float latMin = (lat - latDeg) * 60.0f;
     int   lonDeg = (int)lon;  float lonMin = (lon - lonDeg) * 60.0f;
-
     char body[96];
     snprintf(body, sizeof(body),
              "GPGGA,000000.00,%02d%08.5f,%c,%03d%08.5f,%c,%d,%02d,%.1f,%.1f,M,0.0,M,,",
              latDeg, latMin, latitude  >= 0 ? 'N' : 'S',
              lonDeg, lonMin, longitude >= 0 ? 'E' : 'W',
              fixQuality, satCount, hdop, altitude);
-
     char sentence[110];
     snprintf(sentence, sizeof(sentence), "$%s*%02X\r\n", body, nmeaChecksum(body));
-    ntripClient.print(sentence);
-    Serial.printf("[NTRIP%d] Sent GGA to caster\n", ntripActiveIdx);
+    send(ntripSock, sentence, strlen(sentence), MSG_DONTWAIT);
+}
+
+// Read one line from socket into buf (strips \r). Returns char count or -1 on error.
+static int sockReadLine(int sock, char *buf, size_t len) {
+    size_t i = 0;
+    while (i < len - 1) {
+        char c;
+        int r = recv(sock, &c, 1, 0);
+        if (r <= 0) return -1;
+        if (c == '\n') break;
+        if (c != '\r') buf[i++] = c;
+    }
+    buf[i] = '\0';
+    return (int)i;
 }
 
 static bool ntripConnect(int idx) {
-    NtripSource& src = cfgMgr.cfg.ntrip[idx];
+    NtripSource &src = cfgMgr.cfg.ntrip[idx];
     if (!src.enabled || strlen(src.host) == 0) return false;
 
-    IPAddress ntripIP;
-    if (!WiFi.hostByName(src.host, ntripIP)) {
-        Serial.printf("[NTRIP%d] DNS failed for '%s'\n", idx, src.host);
+    struct addrinfo hints = {};
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%d", src.port);
+
+    if (getaddrinfo(src.host, port_str, &hints, &res) != 0 || !res) {
+        ESP_LOGE(TAG, "[NTRIP%d] DNS failed for '%s'", idx, src.host);
         return false;
     }
-    Serial.printf("[NTRIP%d] Connecting to %s (%s):%d/%s\n",
-                  idx, src.host, ntripIP.toString().c_str(), src.port, src.mount);
 
-    if (!ntripClient.connect(ntripIP, src.port)) {
-        Serial.printf("[NTRIP%d] TCP connect failed\n", idx);
-        return false;
+    int sock = socket(res->ai_family, res->ai_socktype, 0);
+    if (sock < 0) { freeaddrinfo(res); return false; }
+
+    // 5-second connect timeout
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    ESP_LOGI(TAG, "[NTRIP%d] Connecting to %s:%d/%s", idx, src.host, src.port, src.mount);
+    if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
+        ESP_LOGE(TAG, "[NTRIP%d] TCP connect failed", idx);
+        close(sock); freeaddrinfo(res); return false;
     }
+    freeaddrinfo(res);
 
-    // HTTP/1.1 with keep-alive — NTRIP is a persistent stream so we must NOT
-    // send Connection:close which tells the server to close after one response.
-    String req = "GET /";
-    req += src.mount;
-    req += " HTTP/1.1\r\nHost: ";
-    req += src.host;
-    req += "\r\nNtrip-Version: Ntrip/2.0\r\n";
-    req += "User-Agent: NTRIP SailingComputer/1.0\r\n";
-    req += "Accept: rtk/rtcm\r\n";
+    // Build HTTP request
+    char req[768] = "";
+    snprintf(req, sizeof(req),
+             "GET /%s HTTP/1.1\r\n"
+             "Host: %s\r\n"
+             "Ntrip-Version: Ntrip/2.0\r\n"
+             "User-Agent: NTRIP SailingComputer/1.0\r\n"
+             "Accept: rtk/rtcm\r\n",
+             src.mount, src.host);
+
     if (strlen(src.user) > 0) {
-        req += "Authorization: Basic ";
-        req += base64Encode(String(src.user) + ":" + String(src.pass));
-        req += "\r\n";
+        char creds[192], b64[260];
+        snprintf(creds, sizeof(creds), "%s:%s", src.user, src.pass);
+        base64Encode(creds, strlen(creds), b64);
+        strlcat(req, "Authorization: Basic ", sizeof(req));
+        strlcat(req, b64, sizeof(req));
+        strlcat(req, "\r\n", sizeof(req));
     }
-    req += "\r\n";
-    ntripClient.print(req);
+    strlcat(req, "\r\n", sizeof(req));
+    send(sock, req, strlen(req), 0);
 
-    // Wait for the HTTP response and drain all headers
-    uint32_t t = millis();
+    // Read HTTP response headers
     bool got200 = false;
-    while (ntripClient.connected() && millis() - t < 5000) {
-        if (!ntripClient.available()) continue;
-        String line = ntripClient.readStringUntil('\n');
-        Serial.printf("[NTRIP%d] < %s\n", idx, line.c_str());
-        if (!got200 && line.indexOf("200") >= 0) {
-            got200 = true;
-            // Drain remaining HTTP headers (blank line marks end of headers)
-            uint32_t t2 = millis();
-            while (ntripClient.connected() && millis() - t2 < 2000) {
-                if (!ntripClient.available()) continue;
-                String hdr = ntripClient.readStringUntil('\n');
-                if (hdr.length() <= 2) break;  // blank line = end of headers
-            }
-            ntripConnected    = true;
-            ntripFailCount    = 0;
-            ntripConnectTime  = millis();
-            ntripSessionBytes = 0;
-            Serial.printf("[NTRIP%d] Connected OK\n", idx);
-            // Send GGA immediately so strict casters don't time out
-            ntripSendGGA();
-            return true;
-        }
-        if (line.indexOf("401") >= 0) {
-            Serial.printf("[NTRIP%d] Auth failed\n", idx);
-            ntripClient.stop();
-            return false;
-        }
+    char line[256];
+    for (int tries = 0; tries < 30; tries++) {
+        int n = sockReadLine(sock, line, sizeof(line));
+        if (n < 0) break;
+        ESP_LOGI(TAG, "[NTRIP%d] < %s", idx, line);
+        if (!got200 && strstr(line, "200")) got200 = true;
+        if (got200 && n <= 0) break;   // blank line = end of headers
     }
-    ntripClient.stop();
-    Serial.printf("[NTRIP%d] No valid response\n", idx);
-    return false;
+
+    if (!got200) {
+        ESP_LOGE(TAG, "[NTRIP%d] No 200 response", idx);
+        close(sock); return false;
+    }
+
+    ntripSock         = sock;
+    ntripConnected    = true;
+    ntripFailCount    = 0;
+    ntripConnectTime  = millis();
+    ntripSessionBytes = 0;
+    ESP_LOGI(TAG, "[NTRIP%d] Connected OK", idx);
+    ntripSendGGA();
+    return true;
 }
 
 static void ntripLoop() {
-    if (WiFi.status() != WL_CONNECTED) return;
+    if (!staConnected)    return;
     if (!ntripAnyEnabled) return;
 
     if (!ntripConnected) {
-        // If the active source is disabled or has no host, skip to the next
-        // enabled source immediately — don't burn a reconnect timeout on it.
-        NtripSource& active = cfgMgr.cfg.ntrip[ntripActiveIdx];
+        NtripSource &active = cfgMgr.cfg.ntrip[ntripActiveIdx];
         if (!active.enabled || strlen(active.host) == 0) {
             int next = ntripNextSource(ntripActiveIdx);
-            if (next >= 0) {
-                Serial.printf("[NTRIP] Source %d disabled — switching to source %d\n",
-                              ntripActiveIdx, next);
-                ntripActiveIdx = next;
-                ntripFailCount = 0;
-                ntripLastAttempt = 0;  // attempt immediately
-            }
+            if (next >= 0) { ntripActiveIdx = next; ntripFailCount = 0; ntripLastAttempt = 0; }
             return;
         }
+        if (millis() - ntripLastAttempt < NTRIP_RECONNECT_MS) return;
+        ntripLastAttempt = millis();
 
-        uint32_t now = millis();
-        if (now - ntripLastAttempt < NTRIP_RECONNECT_MS) return;
-        ntripLastAttempt = now;
-
-        // After NTRIP_FAILOVER_COUNT consecutive connection failures, try next source
         if (ntripFailCount >= NTRIP_FAILOVER_COUNT) {
             int next = ntripNextSource(ntripActiveIdx);
             if (next >= 0 && next != ntripActiveIdx) {
-                Serial.printf("[NTRIP] Failing over from source %d to %d\n",
-                              ntripActiveIdx, next);
+                ESP_LOGI(TAG, "[NTRIP] Failing over %d→%d", ntripActiveIdx, next);
                 ntripActiveIdx = next;
             }
             ntripFailCount = 0;
         }
-
-        if (!ntripConnect(ntripActiveIdx)) {
-            ntripFailCount++;
-        }
+        if (!ntripConnect(ntripActiveIdx)) ntripFailCount++;
         return;
     }
 
-    if (!ntripClient.connected()) {
-        uint32_t sessionSecs = (millis() - ntripConnectTime) / 1000;
-
-        // Read any final bytes the server sent — may be a status/error message
-        String serverMsg = "";
-        while (ntripClient.available()) {
-            char c = (char)ntripClient.read();
-            if (c >= 0x20 && c < 0x7f) serverMsg += c;
-        }
-
-        if (serverMsg.length() > 0)
-            Serial.printf("[NTRIP%d] Server message: %s\n", ntripActiveIdx, serverMsg.c_str());
-
-        Serial.printf("[NTRIP%d] Disconnected after %us / %u bytes\n",
-                      ntripActiveIdx, sessionSecs, ntripSessionBytes);
-
-        ntripDisconnect();
-
-        // If we received data this session it was a server-initiated close (e.g. session
-        // time limit). Reconnect immediately — don't wait the full reconnect interval.
-        // Only apply the backoff timer to outright connection failures (0 bytes received).
-        if (ntripSessionBytes > 0) {
-            Serial.printf("[NTRIP%d] Server closed session — reconnecting immediately\n",
-                          ntripActiveIdx);
-            ntripLastAttempt = 0;   // reconnect on next loop iteration
-            // Don't increment failCount — this was a clean close, not a failure
-        } else {
-            ntripFailCount++;       // genuine failure — count toward failover
-        }
-        return;
-    }
-
-    // Send GGA position to caster every 3 seconds — required by NTRIP protocol.
-    // Sent immediately on connect and periodically thereafter.
-    static uint32_t lastGgaTx = 0;
-    if (millis() - lastGgaTx > 3000) {
-        ntripSendGGA();
-        lastGgaTx = millis();
-    }
-
-    int avail = ntripClient.available();
-    if (avail > 0) {
-        uint8_t buf[256];
-        int n = ntripClient.read(buf, min(avail, (int)sizeof(buf)));
-        if (n > 0) {
-            Serial2.write(buf, n);
-            ntripBytesIn    += n;
-            ntripSessionBytes += n;
-            static uint32_t lastRtcmLog = 0;
-            if (millis() - lastRtcmLog > 5000) {
-                Serial.printf("[NTRIP%d] RTCM flowing — total %u bytes\n",
-                              ntripActiveIdx, ntripBytesIn);
-                lastRtcmLog = millis();
+    // Check for server-side close
+    {
+        fd_set rfds; FD_ZERO(&rfds); FD_SET(ntripSock, &rfds);
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
+        if (select(ntripSock + 1, &rfds, NULL, NULL, &tv) > 0) {
+            uint8_t probe;
+            int r = recv(ntripSock, &probe, 1, MSG_PEEK);
+            if (r == 0) {
+                // Server closed connection
+                uint32_t sessSecs = (millis() - ntripConnectTime) / 1000;
+                ESP_LOGI(TAG, "[NTRIP%d] Server closed after %us / %u bytes",
+                         ntripActiveIdx, sessSecs, ntripSessionBytes);
+                ntripDisconnect();
+                if (ntripSessionBytes > 0) {
+                    ntripLastAttempt = 0;   // immediate reconnect
+                } else {
+                    ntripFailCount++;
+                }
+                return;
             }
+        }
+    }
+
+    // Send GGA every 3 seconds
+    static uint32_t lastGgaTx = 0;
+    if (millis() - lastGgaTx > 3000) { ntripSendGGA(); lastGgaTx = millis(); }
+
+    // Read RTCM and forward to UM982 COM2
+    uint8_t buf[256];
+    int n = recv(ntripSock, buf, sizeof(buf), MSG_DONTWAIT);
+    if (n > 0) {
+        uart_write_bytes(UART_RTCM, (const char *)buf, n);
+        ntripBytesIn      += n;
+        ntripSessionBytes += n;
+        static uint32_t lastRtcmLog = 0;
+        if (millis() - lastRtcmLog > 5000) {
+            ESP_LOGI(TAG, "[NTRIP%d] RTCM flowing — total %u bytes", ntripActiveIdx, ntripBytesIn);
+            lastRtcmLog = millis();
         }
     }
 }
 
-// ── NTRIP FreeRTOS task ───────────────────────────────────────────────────────
-//
-// Runs on Core 0 alongside the WiFi stack so ntripConnect() blocking calls
-// (DNS + TCP + HTTP handshake, up to 7 seconds) never stall the NMEA reader
-// on Core 1. Serial2 and ntripClient are only touched by this task.
-
-static void ntripTask(void* /*param*/) {
+static void ntripTask(void *param) {
     for (;;) {
         ntripLoop();
-        vTaskDelay(pdMS_TO_TICKS(10));  // yield 10ms — avoids starving WiFi stack
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
 // ── WiFi ──────────────────────────────────────────────────────────────────────
 
+static void wifi_event_handler(void *arg, esp_event_base_t base,
+                                int32_t id, void *data) {
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        staConnected = false;
+        ESP_LOGI(TAG, "[WiFi] Lost connection — reconnecting");
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        staConnected = true;
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
+        ESP_LOGI(TAG, "[WiFi] Connected: " IPSTR, IP2STR(&e->ip_info.ip));
+        ntripLastAttempt = millis();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED) {
+        ESP_LOGI(TAG, "[WiFi] AP client connected");
+    }
+}
+
 static void startAP() {
-    Config& cfg = cfgMgr.cfg;
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(cfg.apSSID, cfg.apPassword);
-    Serial.printf("[WiFi] AP: %s  IP: %s\n", cfg.apSSID,
-                  WiFi.softAPIP().toString().c_str());
+    Config &cfg = cfgMgr.cfg;
+    esp_netif_create_default_wifi_ap();
+    wifi_config_t wcfg = {};
+    strlcpy((char *)wcfg.ap.ssid,     cfg.apSSID,     sizeof(wcfg.ap.ssid));
+    strlcpy((char *)wcfg.ap.password, cfg.apPassword, sizeof(wcfg.ap.password));
+    wcfg.ap.ssid_len       = strlen(cfg.apSSID);
+    wcfg.ap.max_connection = 4;
+    wcfg.ap.authmode       = strlen(cfg.apPassword) >= 8 ?
+                             WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    esp_wifi_set_mode(WIFI_MODE_AP);
+    esp_wifi_set_config(WIFI_IF_AP, &wcfg);
+    esp_wifi_start();
+    ESP_LOGI(TAG, "[WiFi] AP: %s", cfg.apSSID);
 }
 
 static void startSTA() {
-    Config& cfg = cfgMgr.cfg;
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(cfg.wifiSSID, cfg.wifiPassword);
-    Serial.printf("[WiFi] Connecting to %s...\n", cfg.wifiSSID);
+    Config &cfg = cfgMgr.cfg;
+    esp_netif_create_default_wifi_sta();
+    wifi_config_t wcfg = {};
+    strlcpy((char *)wcfg.sta.ssid,     cfg.wifiSSID,     sizeof(wcfg.sta.ssid));
+    strlcpy((char *)wcfg.sta.password, cfg.wifiPassword, sizeof(wcfg.sta.password));
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wcfg);
+    esp_wifi_start();
+    esp_wifi_connect();
+    ESP_LOGI(TAG, "[WiFi] Connecting to %s...", cfg.wifiSSID);
 }
 
-// ── Web handlers ──────────────────────────────────────────────────────────────
+// ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-static void handleRoot() {
-    webServer.send(200, "text/html", getWebUI());
+// Read full POST body into caller-supplied buf. Returns bytes read or -1.
+static int readBody(httpd_req_t *req, char *buf, size_t buf_size) {
+    int total = 0, remaining = req->content_len;
+    while (remaining > 0) {
+        int to_read = MIN(remaining, (int)(buf_size - 1 - total));
+        if (to_read <= 0) break;
+        int r = httpd_req_recv(req, buf + total, to_read);
+        if (r <= 0) return -1;
+        total += r; remaining -= r;
+    }
+    buf[total] = '\0';
+    return total;
 }
 
-static void handleStatus() {
-    static const char* fixLabels[] = {
+// Get current STA IP as string (or "" if disconnected)
+static void getStaIP(char *out, size_t len) {
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif) {
+        esp_netif_ip_info_t info;
+        if (esp_netif_get_ip_info(netif, &info) == ESP_OK) {
+            snprintf(out, len, IPSTR, IP2STR(&info.ip));
+            return;
+        }
+    }
+    strlcpy(out, "0.0.0.0", len);
+}
+
+static void getApIP(char *out, size_t len) {
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (netif) {
+        esp_netif_ip_info_t info;
+        if (esp_netif_get_ip_info(netif, &info) == ESP_OK) {
+            snprintf(out, len, IPSTR, IP2STR(&info.ip));
+            return;
+        }
+    }
+    strlcpy(out, "192.168.4.1", len);
+}
+
+// ── HTTP handlers ─────────────────────────────────────────────────────────────
+
+static esp_err_t handleRoot(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, getWebUI(), HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleStatus(httpd_req_t *req) {
+    static const char *fixLabels[] = {
         "No Fix","GPS","DGPS","PPS","RTK Fixed","RTK Float",
         "Dead Reck","Manual","Sim","WAAS"
     };
-    // Use a stack buffer — avoids repeated heap allocs from String +=
-    char json[512];
+    char staIP[20], apIP[20];
+    getStaIP(staIP, sizeof(staIP));
+    getApIP(apIP,   sizeof(apIP));
+
+    char json[1024];
     snprintf(json, sizeof(json),
         "{"
         "\"fix\":%d,"
@@ -612,6 +716,8 @@ static void handleStatus() {
         "\"ntripConnected\":%s,"
         "\"ntripActiveIdx\":%d,"
         "\"ntripBytesIn\":%u,"
+        "\"nmeaBytesRx\":%u,"
+        "\"nmeaLinesRx\":%u,"
         "\"wifiMode\":\"%s\","
         "\"ip\":\"%s\","
         "\"apIP\":\"%s\""
@@ -620,292 +726,293 @@ static void handleStatus() {
         fixQuality <= 9 ? fixLabels[fixQuality] : "Unknown",
         latitude, longitude,
         heading,
-        hdtValid      ? "true" : "false",
+        hdtValid             ? "true" : "false",
         sog, cogFiltered,
         (cogInitialized && sog >= cfgMgr.cfg.cogMinSog) ? "true" : "false",
         cfgMgr.cfg.cogMinSog,
         satCount, hdop, altitude, roll,
-        rollValid             ? "true" : "false",
+        rollValid            ? "true" : "false",
         leewayAngle, lateralDrift, driveSpeed,
-        sailingMetricsValid   ? "true" : "false",
-        bleEnabled            ? "true" : "false",
-        bleConnected  ? "true" : "false",
-        ntripConnected ? "true" : "false",
+        sailingMetricsValid  ? "true" : "false",
+        bleEnabled           ? "true" : "false",
+        bleConnected         ? "true" : "false",
+        ntripConnected       ? "true" : "false",
         ntripActiveIdx, ntripBytesIn,
+        nmeaBytesRx, nmeaLinesRx,
         cfgMgr.cfg.apMode ? "AP" : "Station",
-        WiFi.localIP().toString().c_str(),
-        WiFi.softAPIP().toString().c_str()
+        staIP, apIP
     );
-    webServer.send(200, "application/json", json);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
 }
 
-static void handleGetConfig() {
-    Config& cfg = cfgMgr.cfg;
-    String json = "{";
-    json += "\"apMode\":"     + String(cfg.apMode ? "true" : "false") + ",";
-    json += "\"wifiSSID\":\"" + String(cfg.wifiSSID) + "\",";
-    json += "\"ntrip\":[";
+static esp_err_t handleGetConfig(httpd_req_t *req) {
+    Config &cfg = cfgMgr.cfg;
+    // Build JSON manually — avoids pulling in cJSON for a one-time response
+    char json[1024];
+    int  off = 0;
+    off += snprintf(json + off, sizeof(json) - off,
+        "{\"apMode\":%s,\"wifiSSID\":\"%s\",\"ntrip\":[",
+        cfg.apMode ? "true" : "false", cfg.wifiSSID);
     for (int i = 0; i < NTRIP_SOURCES; i++) {
-        if (i) json += ",";
-        json += "{";
-        json += "\"enabled\":"  + String(cfg.ntrip[i].enabled ? "true" : "false") + ",";
-        json += "\"host\":\""   + String(cfg.ntrip[i].host)  + "\",";
-        json += "\"port\":"     + String(cfg.ntrip[i].port)  + ",";
-        json += "\"mount\":\"" + String(cfg.ntrip[i].mount) + "\",";
-        json += "\"user\":\""   + String(cfg.ntrip[i].user)  + "\"";
-        json += "}";
+        if (i) { json[off++] = ','; json[off] = '\0'; }
+        off += snprintf(json + off, sizeof(json) - off,
+            "{\"enabled\":%s,\"host\":\"%s\",\"port\":%d,"
+            "\"mount\":\"%s\",\"user\":\"%s\"}",
+            cfg.ntrip[i].enabled ? "true" : "false",
+            cfg.ntrip[i].host, cfg.ntrip[i].port,
+            cfg.ntrip[i].mount, cfg.ntrip[i].user);
     }
-    json += "],";
-    json += "\"headingOffset\":" + String(cfg.headingOffset, 1) + ",";
-    json += "\"cogMinSog\":"     + String(cfg.cogMinSog, 2) + ",";
-    json += "\"bleNmea\":"       + String(cfg.bleNmea ? "true" : "false") + ",";
-    json += "\"apSSID\":\"" + String(cfg.apSSID) + "\"";
-    json += "}";
-    webServer.send(200, "application/json", json);
+    off += snprintf(json + off, sizeof(json) - off,
+        "],\"headingOffset\":%.1f,\"cogMinSog\":%.2f,"
+        "\"bleNmea\":%s,\"apSSID\":\"%s\"}",
+        cfg.headingOffset, cfg.cogMinSog,
+        cfg.bleNmea ? "true" : "false",
+        cfg.apSSID);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
 }
 
-static void handleSaveConfig() {
-    Config& cfg = cfgMgr.cfg;
-    if (webServer.hasArg("apMode"))   cfg.apMode = webServer.arg("apMode") == "true";
-    if (webServer.hasArg("wifiSSID")) strlcpy(cfg.wifiSSID, webServer.arg("wifiSSID").c_str(), sizeof(cfg.wifiSSID));
-    if (webServer.hasArg("wifiPassword")) { String v = webServer.arg("wifiPassword"); if (v.length() > 0 && v != "(unchanged)") strlcpy(cfg.wifiPassword, v.c_str(), sizeof(cfg.wifiPassword)); }
+static esp_err_t handleSaveConfig(httpd_req_t *req) {
+    char body[2048] = "";
+    if (readBody(req, body, sizeof(body)) < 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "[Config] Body (%d bytes): %.200s...", (int)strlen(body), body);
 
-    char key[16];
+    Config &cfg = cfgMgr.cfg;
+    char val[192];
+
+    if (formGet(body, "apMode", val, sizeof(val)))
+        cfg.apMode = (strcmp(val, "true") == 0);
+    if (formGet(body, "wifiSSID", val, sizeof(val)))
+        strlcpy(cfg.wifiSSID, val, sizeof(cfg.wifiSSID));
+    if (formGet(body, "wifiPassword", val, sizeof(val)) && strlen(val) > 0 &&
+        strcmp(val, "(unchanged)") != 0)
+        strlcpy(cfg.wifiPassword, val, sizeof(cfg.wifiPassword));
+
+    char key[20];
     for (int i = 0; i < NTRIP_SOURCES; i++) {
         snprintf(key, sizeof(key), "n%denabled", i);
-        cfg.ntrip[i].enabled = webServer.hasArg(key) &&
-                               (webServer.arg(key) == "true" || webServer.arg(key) == "on");
+        cfg.ntrip[i].enabled = (formGet(body, key, val, sizeof(val)) &&
+                                strcmp(val, "true") == 0);
 
         snprintf(key, sizeof(key), "n%dhost", i);
-        if (webServer.hasArg(key)) { String v = webServer.arg(key); if (v.length() > 0) strlcpy(cfg.ntrip[i].host, v.c_str(), sizeof(cfg.ntrip[i].host)); }
+        if (formGet(body, key, val, sizeof(val)) && strlen(val) > 0)
+            strlcpy(cfg.ntrip[i].host, val, sizeof(cfg.ntrip[i].host));
 
         snprintf(key, sizeof(key), "n%dport", i);
-        if (webServer.hasArg(key)) cfg.ntrip[i].port = (uint16_t)webServer.arg(key).toInt();
+        if (formGet(body, key, val, sizeof(val)))
+            cfg.ntrip[i].port = (uint16_t)atoi(val);
 
         snprintf(key, sizeof(key), "n%dmount", i);
-        if (webServer.hasArg(key)) { String v = webServer.arg(key); if (v.length() > 0) strlcpy(cfg.ntrip[i].mount, v.c_str(), sizeof(cfg.ntrip[i].mount)); }
+        if (formGet(body, key, val, sizeof(val)) && strlen(val) > 0)
+            strlcpy(cfg.ntrip[i].mount, val, sizeof(cfg.ntrip[i].mount));
 
         snprintf(key, sizeof(key), "n%duser", i);
-        if (webServer.hasArg(key)) { String v = webServer.arg(key); if (v.length() > 0) strlcpy(cfg.ntrip[i].user, v.c_str(), sizeof(cfg.ntrip[i].user)); }
+        {
+            bool ok = formGet(body, key, val, sizeof(val));
+            ESP_LOGI(TAG, "[Config] %s: found=%d decoded='%s'", key, ok, ok ? val : "");
+            if (ok && strlen(val) > 0)
+                strlcpy(cfg.ntrip[i].user, val, sizeof(cfg.ntrip[i].user));
+        }
 
         snprintf(key, sizeof(key), "n%dpass", i);
-        if (webServer.hasArg(key)) { String v = webServer.arg(key); if (v.length() > 0 && v != "(unchanged)") strlcpy(cfg.ntrip[i].pass, v.c_str(), sizeof(cfg.ntrip[i].pass)); }
-
-        Serial.printf("[Config] NTRIP%d: enabled:%d host:'%s' port:%d mount:'%s'\n",
-                      i, cfg.ntrip[i].enabled, cfg.ntrip[i].host, cfg.ntrip[i].port, cfg.ntrip[i].mount);
+        {
+            bool ok = formGet(body, key, val, sizeof(val));
+            if (ok && strlen(val) > 0 && strcmp(val, "(unchanged)") != 0)
+                strlcpy(cfg.ntrip[i].pass, val, sizeof(cfg.ntrip[i].pass));
+        }
     }
 
-    if (webServer.hasArg("headingOffset")) cfg.headingOffset = webServer.arg("headingOffset").toFloat();
-    if (webServer.hasArg("cogMinSog"))  cfg.cogMinSog = webServer.arg("cogMinSog").toFloat();
-    if (webServer.hasArg("bleNmea")) {
-        String v = webServer.arg("bleNmea");
-        cfg.bleNmea = (v == "true" || v == "on" || v == "1");
-    } else {
+    if (formGet(body, "headingOffset", val, sizeof(val))) cfg.headingOffset = atof(val);
+    if (formGet(body, "cogMinSog",     val, sizeof(val))) cfg.cogMinSog     = atof(val);
+    if (formGet(body, "bleNmea",       val, sizeof(val)))
+        cfg.bleNmea = (strcmp(val, "true") == 0 || strcmp(val, "on") == 0);
+    else
         cfg.bleNmea = false;
-    }
-    if (webServer.hasArg("apSSID"))    strlcpy(cfg.apSSID, webServer.arg("apSSID").c_str(), sizeof(cfg.apSSID));
-    if (webServer.hasArg("apPassword")) { String v = webServer.arg("apPassword"); if (v.length() > 0 && v != "(unchanged)") strlcpy(cfg.apPassword, v.c_str(), sizeof(cfg.apPassword)); }
+    if (formGet(body, "apSSID",    val, sizeof(val)) && strlen(val) > 0)
+        strlcpy(cfg.apSSID, val, sizeof(cfg.apSSID));
+    if (formGet(body, "apPassword", val, sizeof(val)) && strlen(val) > 0 &&
+        strcmp(val, "(unchanged)") != 0)
+        strlcpy(cfg.apPassword, val, sizeof(cfg.apPassword));
+
     cfgMgr.save();
     ntripUpdateEnabled();
     ntripDisconnect();
-    ntripActiveIdx = 0;
-    ntripFailCount = 0;
-    webServer.send(200, "application/json", "{\"ok\":true}");
-    delay(300);
-    ESP.restart();
+    ntripActiveIdx = 0; ntripFailCount = 0;
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    esp_restart();
+    return ESP_OK;
 }
 
-static void handleUM982Reset() {
-    webServer.send(200, "application/json", "{\"ok\":true}");
-    Serial.println("[Web] UM982 factory reset requested");
-    delay(100);
-    um982FactoryReset(Serial1);
+static esp_err_t handleRestart(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    esp_restart();
+    return ESP_OK;
 }
 
-static void handleBleToggle() {
-    if (webServer.hasArg("bleNmea")) {
-        String v = webServer.arg("bleNmea");
-        cfgMgr.cfg.bleNmea = (v == "true" || v == "on" || v == "1");
-        cfgMgr.save();
-        Serial.printf("[BLE] %s — restarting\n", cfgMgr.cfg.bleNmea ? "enabled" : "disabled");
-    }
-    webServer.send(200, "application/json", "{\"ok\":true}");
-    delay(300);
-    ESP.restart();
+static esp_err_t handleUM982Reset(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    ESP_LOGI(TAG, "[Web] UM982 factory reset requested");
+    vTaskDelay(pdMS_TO_TICKS(100));
+    um982FactoryReset(UART_NMEA);
+    return ESP_OK;
 }
 
-static void handleRestart() {
-    webServer.send(200, "application/json", "{\"ok\":true}");
-    delay(300);
-    ESP.restart();
+static esp_err_t handleBleToggle(httpd_req_t *req) {
+    char body[64] = ""; char val[16];
+    readBody(req, body, sizeof(body));
+    if (formGet(body, "bleNmea", val, sizeof(val)))
+        cfgMgr.cfg.bleNmea = (strcmp(val, "true") == 0 || strcmp(val, "on") == 0);
+    cfgMgr.save();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    esp_restart();
+    return ESP_OK;
 }
 
 // ── OTA firmware update ────────────────────────────────────────────────────────
+// Frontend sends raw binary (application/octet-stream), no multipart wrapper.
 
-static bool otaError = false;
+static const char OTA_SUCCESS_HTML[] =
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>OTA OK</title>"
+    "<style>body{font-family:system-ui;background:#0a1628;color:#e0e8f0;"
+    "display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}"
+    ".box{background:#0d1f3c;border:1px solid #1e3a5f;border-radius:8px;"
+    "padding:2rem;max-width:400px;text-align:center;}"
+    "h2{color:#4ade80;}.note{color:#8899aa;font-size:0.85rem;}</style>"
+    "<script>setTimeout(()=>location.href='/',9000)</script></head>"
+    "<body><div class='box'><h2>&#10003; Update Successful</h2>"
+    "<p>Firmware flashed. Device is restarting&hellip;</p>"
+    "<p class='note'>Redirecting in 9 seconds.</p>"
+    "</div></body></html>";
 
-// Receives the binary upload chunk by chunk and writes it to flash.
-static void handleOTAUpload() {
-    HTTPUpload& upload = webServer.upload();
+static const char OTA_FAIL_HTML[] =
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>OTA Failed</title>"
+    "<style>body{font-family:system-ui;background:#0a1628;color:#e0e8f0;"
+    "display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}"
+    ".box{background:#0d1f3c;border:1px solid #1e3a5f;border-radius:8px;"
+    "padding:2rem;max-width:400px;text-align:center;}"
+    "h2{color:#ff6b6b;} a{color:#4a9eff;}</style></head>"
+    "<body><div class='box'><h2>&#10007; Update Failed</h2>"
+    "<p>Flash error — check firmware.bin and retry.</p>"
+    "<p><a href='/'>Back to dashboard</a></p>"
+    "</div></body></html>";
 
-    if (upload.status == UPLOAD_FILE_START) {
-        otaError = false;
-        Serial.printf("[OTA] Receiving: %s (%u bytes)\n",
-                      upload.filename.c_str(), upload.totalSize);
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-            otaError = true;
-            Serial.printf("[OTA] begin() failed: %s\n", Update.errorString());
-        }
-
-    } else if (upload.status == UPLOAD_FILE_WRITE) {
-        if (!otaError) {
-            if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-                otaError = true;
-                Serial.printf("[OTA] write() failed: %s\n", Update.errorString());
-            }
-        }
-
-    } else if (upload.status == UPLOAD_FILE_END) {
-        if (!otaError) {
-            if (!Update.end(true)) {
-                otaError = true;
-                Serial.printf("[OTA] end() failed: %s\n", Update.errorString());
-            } else {
-                Serial.printf("[OTA] Flash complete — %u bytes written\n", upload.totalSize);
-            }
-        }
+static esp_err_t handleOTA(httpd_req_t *req) {
+    const esp_partition_t *update_part = esp_ota_get_next_update_partition(NULL);
+    if (!update_part) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No OTA partition");
+        return ESP_FAIL;
     }
-}
 
-// Called after upload completes — sends result page then reboots on success.
-static void handleOTAComplete() {
-    if (otaError) {
-        webServer.send(500, "text/html",
-            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-            "<title>OTA Failed</title>"
-            "<style>body{font-family:system-ui;background:#0a1628;color:#e0e8f0;"
-            "display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}"
-            ".box{background:#0d1f3c;border:1px solid #1e3a5f;border-radius:8px;padding:2rem;max-width:400px;text-align:center;}"
-            "h2{color:#ff6b6b;} a{color:#4a9eff;}</style></head>"
-            "<body><div class='box'><h2>&#10007; Update Failed</h2>"
-            "<p>" + String(Update.errorString()) + "</p>"
-            "<p><a href='/'>Back to dashboard</a></p>"
-            "</div></body></html>");
+    esp_ota_handle_t ota_handle = 0;
+    if (esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+        return ESP_FAIL;
+    }
+
+    char    buf[1024];
+    int     remaining = req->content_len;
+    bool    ok        = true;
+
+    while (remaining > 0 && ok) {
+        int to_read = MIN(remaining, (int)sizeof(buf));
+        int received = httpd_req_recv(req, buf, to_read);
+        if (received <= 0) { ok = false; break; }
+        if (esp_ota_write(ota_handle, buf, received) != ESP_OK) { ok = false; break; }
+        remaining -= received;
+    }
+
+    if (ok) ok = (esp_ota_end(ota_handle) == ESP_OK);
+    if (ok) ok = (esp_ota_set_boot_partition(update_part) == ESP_OK);
+
+    if (ok) {
+        ESP_LOGI(TAG, "[OTA] Flash complete — restarting");
+        httpd_resp_set_type(req, "text/html");
+        httpd_resp_send(req, OTA_SUCCESS_HTML, HTTPD_RESP_USE_STRLEN);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
     } else {
-        webServer.send(200, "text/html",
-            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-            "<title>OTA Success</title>"
-            "<style>body{font-family:system-ui;background:#0a1628;color:#e0e8f0;"
-            "display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}"
-            ".box{background:#0d1f3c;border:1px solid #1e3a5f;border-radius:8px;padding:2rem;max-width:400px;text-align:center;}"
-            "h2{color:#4ade80;} .note{color:#8899aa;font-size:0.85rem;}"
-            "</style>"
-            "<script>setTimeout(()=>location.href='/',9000)</script>"
-            "</head><body><div class='box'>"
-            "<h2>&#10003; Update Successful</h2>"
-            "<p>Firmware flashed. Device is restarting&hellip;</p>"
-            "<p class='note'>Redirecting to dashboard in 9 seconds.</p>"
-            "</div></body></html>");
-        delay(500);
-        ESP.restart();
+        esp_ota_abort(ota_handle);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "text/html");
+        httpd_resp_send(req, OTA_FAIL_HTML, HTTPD_RESP_USE_STRLEN);
     }
+    return ESP_OK;
 }
 
-// ── Setup ─────────────────────────────────────────────────────────────────────
+// ── Web server setup ──────────────────────────────────────────────────────────
 
-void setup() {
-    Serial.begin(115200);
-    Serial.println("\n[Boot] SailingComputer starting...");
+static void startWebServer() {
+    httpd_config_t cfg      = HTTPD_DEFAULT_CONFIG();
+    cfg.max_open_sockets    = 7;
+    cfg.stack_size          = 8192;
 
-    cfgMgr.load();
-    ntripUpdateEnabled();
-
-    // Increase RX buffer before begin() — default 256 bytes overflows during
-    // ntripConnect() blocking calls (~350 bytes/sec from UM982 at 1 Hz).
-    Serial1.setRxBufferSize(2048);
-    Serial1.begin(NMEA_BAUD, SERIAL_8N1, SERIAL1_RX, SERIAL1_TX);
-    Serial2.begin(RTCM_BAUD, SERIAL_8N1, SERIAL2_RX, SERIAL2_TX);
-    Serial.println("[Boot] UART initialized");
-
-    um982Init(Serial1);
-
-    if (cfgMgr.cfg.bleNmea)
-        bleNmeaInit("SailingComputer");
-
-    Config& cfg = cfgMgr.cfg;
-
-    if (cfg.apMode || strlen(cfg.wifiSSID) == 0) {
-        cfg.apMode = true;
-        startAP();
-    } else {
-        startSTA();
-        Serial.print("[WiFi] Waiting");
-        uint32_t wifiStart = millis();
-        while (WiFi.status() != WL_CONNECTED &&
-               millis() - wifiStart < WIFI_CONNECT_TIMEOUT_MS) {
-            delay(500);
-            Serial.print(".");
-        }
-        Serial.println();
-        if (WiFi.status() == WL_CONNECTED) {
-            staConnected = true;
-            Serial.printf("[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str());
-            ntripLastAttempt = millis(); // delay first NTRIP attempt by NTRIP_RECONNECT_MS
-        } else {
-            Serial.println("[WiFi] STA failed, falling back to AP");
-            cfg.apMode = true;
-            startAP();
-        }
+    if (httpd_start(&webServer, &cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "[Web] Failed to start HTTP server");
+        return;
     }
 
-    if (MDNS.begin("sailingcomputer"))
-        Serial.println("[mDNS] sailingcomputer.local");
+    auto reg = [](httpd_handle_t srv, const char *uri,
+                  httpd_method_t method, esp_err_t (*fn)(httpd_req_t *)) {
+        httpd_uri_t u = { .uri = uri, .method = method, .handler = fn, .user_ctx = NULL };
+        httpd_register_uri_handler(srv, &u);
+    };
 
-    nmeaServer.begin();
-    Serial.printf("[NMEA] TCP server port %d\n", NMEA_TCP_PORT);
+    reg(webServer, "/",            HTTP_GET,  handleRoot);
+    reg(webServer, "/status",      HTTP_GET,  handleStatus);
+    reg(webServer, "/config",      HTTP_GET,  handleGetConfig);
+    reg(webServer, "/config/save", HTTP_POST, handleSaveConfig);
+    reg(webServer, "/restart",     HTTP_POST, handleRestart);
+    reg(webServer, "/um982reset",  HTTP_POST, handleUM982Reset);
+    reg(webServer, "/update",      HTTP_POST, handleOTA);
+    reg(webServer, "/ble/toggle",  HTTP_POST, handleBleToggle);
 
-    webServer.on("/",            HTTP_GET,  handleRoot);
-    webServer.on("/status",      HTTP_GET,  handleStatus);
-    webServer.on("/config",      HTTP_GET,  handleGetConfig);
-    webServer.on("/config/save", HTTP_POST, handleSaveConfig);
-    webServer.on("/restart",     HTTP_POST, handleRestart);
-    webServer.on("/um982reset",  HTTP_POST, handleUM982Reset);
-    webServer.on("/update",      HTTP_POST, handleOTAComplete, handleOTAUpload);
-    webServer.on("/ble/toggle",  HTTP_POST, handleBleToggle);
-    webServer.begin();
-    Serial.println("[Web] HTTP server started");
-
-    // Launch NTRIP on Core 0 (WiFi stack core) with 8KB stack — TCP/DNS
-    // operations need headroom. Priority 2 yields to the WiFi stack (priority 23).
-    xTaskCreatePinnedToCore(
-        ntripTask, "ntrip", 8192, nullptr, 2, &ntripTaskHandle, 0);
-    Serial.println("[NTRIP] Task started on Core 0");
-    Serial.println("[Boot] Ready");
+    ESP_LOGI(TAG, "[Web] HTTP server started");
 }
 
-// ── Loop ──────────────────────────────────────────────────────────────────────
+// ── NMEA reader task (Core 1) ─────────────────────────────────────────────────
 
-void loop() {
-    webServer.handleClient();
-    acceptNmeaClients();
+static void nmeaTask(void *param) {
+    uint8_t byte;
+    for (;;) {
+        // Accept any new TCP clients
+        if (nmeaSrvFd >= 0) acceptNmeaClients();
 
-    // Read NMEA from UM982 COM1
-    while (Serial1.available()) {
-        char c = (char)Serial1.read();
-        if (DEBUG_NMEA_RAW && (c >= 0x20 || c == '\n' || c == '\r')) Serial.write(c);
+        // Read one byte from UART1; timeout 10ms to keep accept loop alive
+        int r = uart_read_bytes(UART_NMEA, &byte, 1, pdMS_TO_TICKS(10));
+        if (r <= 0) continue;
+        nmeaBytesRx++;
+
+        char c = (char)byte;
         if (c == '\n') {
             nmeaLine[nmeaIdx] = '\0';
             if (nmeaIdx > 5) {
+                nmeaLinesRx++;
                 processNmeaLine(nmeaLine);
-                // Only broadcast standard $ NMEA sentences — skip proprietary # Unicore messages
                 if (nmeaLine[0] == '$') {
-                    // Replace raw $GPHDT with a corrected-heading sentence
                     if (strncmp(nmeaLine, "$GPHDT", 6) == 0 ||
                         strncmp(nmeaLine, "$GNHDT", 6) == 0) {
-                        broadcastHDT();          // TCP clients
-                        if (bleEnabled) {        // BLE clients
+                        broadcastHDT();
+                        if (bleEnabled) {
                             char body[32], sentence[48];
                             snprintf(body,     sizeof(body),     "GPHDT,%.4f,T", heading);
                             snprintf(sentence, sizeof(sentence), "$%s*%02X", body, nmeaChecksum(body));
@@ -913,7 +1020,7 @@ void loop() {
                         }
                     } else {
                         broadcastNmea(nmeaLine);
-                        bleNmeaSend(nmeaLine);   // BLE (no-op if not connected)
+                        bleNmeaSend(nmeaLine);
                     }
                 }
             }
@@ -922,21 +1029,117 @@ void loop() {
             nmeaLine[nmeaIdx++] = c;
         }
     }
+}
 
-    // Monitor STA reconnection — rate-limited to once per second to avoid
-    // hammering the WiFi stack with status queries every loop iteration.
-    if (!cfgMgr.cfg.apMode) {
-        static uint32_t lastWifiCheck = 0;
-        if (millis() - lastWifiCheck > 1000) {
-            lastWifiCheck = millis();
-            bool connected = (WiFi.status() == WL_CONNECTED);
-            if (!connected && staConnected) {
-                staConnected = false;
-                Serial.println("[WiFi] Lost connection");
-            } else if (connected && !staConnected) {
-                staConnected = true;
-                Serial.printf("[WiFi] Reconnected: %s\n", WiFi.localIP().toString().c_str());
-            }
+// ── app_main ──────────────────────────────────────────────────────────────────
+
+extern "C" void app_main(void) {
+    ESP_LOGI(TAG, "\n[Boot] SailingComputer starting...");
+
+    // NVS must be initialised before any NVS operations or WiFi
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+
+    cfgMgr.load();
+    ntripUpdateEnabled();
+
+    // ── UART setup — exact sequence from Arduino ESP32 core ─────────────────
+    // Order: param_config → set_pin → driver_install (matches Arduino internals).
+    // No explicit gpio_set_direction — uart_set_pin handles it.
+    // No loopback test — uart_set_loop_back bypasses GPIO16 and proved nothing.
+    uart_config_t uc = {};
+    uc.baud_rate           = NMEA_BAUD;
+    uc.data_bits           = UART_DATA_8_BITS;
+    uc.parity              = UART_PARITY_DISABLE;
+    uc.stop_bits           = UART_STOP_BITS_1;
+    uc.flow_ctrl           = UART_HW_FLOWCTRL_DISABLE;
+    uc.rx_flow_ctrl_thresh = 122;             // Arduino default
+    uc.source_clk          = UART_SCLK_DEFAULT;
+
+    uart_param_config(UART_NMEA, &uc);
+    uart_set_pin(UART_NMEA, SERIAL1_TX, SERIAL1_RX,
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(UART_NMEA, 2048, 0, 0, NULL, 0);
+
+    uc.baud_rate = RTCM_BAUD;
+    uart_param_config(UART_RTCM, &uc);
+    uart_set_pin(UART_RTCM, SERIAL2_TX, SERIAL2_RX,
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(UART_RTCM, 256, 1024, 0, NULL, 0);
+    ESP_LOGI(TAG, "[Boot] UART initialized");
+
+    um982Init(UART_NMEA);
+
+    // ── WiFi ────────────────────────────────────────────────────────────────
+    esp_netif_init();
+    esp_event_loop_create_default();
+
+    wifi_init_config_t wifi_init = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&wifi_init);
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
+
+    Config &cfg = cfgMgr.cfg;
+    if (cfg.apMode || strlen(cfg.wifiSSID) == 0) {
+        cfg.apMode = true;
+        startAP();
+    } else {
+        startSTA();
+        // Wait up to WIFI_CONNECT_TIMEOUT_MS for connection
+        uint32_t t0 = millis();
+        while (!staConnected && (millis() - t0) < WIFI_CONNECT_TIMEOUT_MS)
+            vTaskDelay(pdMS_TO_TICKS(200));
+        if (!staConnected) {
+            ESP_LOGW(TAG, "[WiFi] STA failed — falling back to AP");
+            cfg.apMode = true;
+            esp_wifi_stop();
+            startAP();
         }
     }
+
+    // ── mDNS ────────────────────────────────────────────────────────────────
+    mdns_init();
+    mdns_hostname_set("sailingcomputer");
+    mdns_instance_name_set("SailingComputer");
+    mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+    ESP_LOGI(TAG, "[mDNS] sailingcomputer.local");
+
+    // ── NMEA TCP server ──────────────────────────────────────────────────────
+    nmeaClientMtx = xSemaphoreCreateMutex();
+    for (int i = 0; i < MAX_NMEA_CLIENTS; i++) nmeaClientFds[i] = -1;
+
+    nmeaSrvFd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(nmeaSrvFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct sockaddr_in saddr = {};
+    saddr.sin_family      = AF_INET;
+    saddr.sin_port        = htons(NMEA_TCP_PORT);
+    saddr.sin_addr.s_addr = INADDR_ANY;
+    bind(nmeaSrvFd,  (struct sockaddr *)&saddr, sizeof(saddr));
+    listen(nmeaSrvFd, MAX_NMEA_CLIENTS);
+    ESP_LOGI(TAG, "[NMEA] TCP server port %d", NMEA_TCP_PORT);
+
+    // ── HTTP server ──────────────────────────────────────────────────────────
+    startWebServer();
+
+    // ── BLE ─────────────────────────────────────────────────────────────────
+    if (cfg.bleNmea)
+        bleNmeaInit("SailingComputer");
+
+    // ── Tasks ────────────────────────────────────────────────────────────────
+    // NTRIP on Core 0 (WiFi stack core) — DNS/TCP calls block here, not on Core 1
+    xTaskCreatePinnedToCore(ntripTask, "ntrip", 8192, NULL, 2, NULL, 0);
+    ESP_LOGI(TAG, "[NTRIP] Task started on Core 0");
+
+    // NMEA reader + TCP broadcast on Core 1
+    xTaskCreatePinnedToCore(nmeaTask, "nmea", 4096, NULL, 5, NULL, 1);
+    ESP_LOGI(TAG, "[NMEA] Reader task started on Core 1");
+
+    ESP_LOGI(TAG, "[Boot] Ready");
 }
