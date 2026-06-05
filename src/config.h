@@ -121,7 +121,7 @@ public:
                 snprintf(key, sizeof(key), "n%duser",    i); len = sizeof(cfg.ntrip[i].user);  nvs_get_str(h, key, cfg.ntrip[i].user,  &len);
                 snprintf(key, sizeof(key), "n%dpass",    i); len = sizeof(cfg.ntrip[i].pass);  nvs_get_str(h, key, cfg.ntrip[i].pass,  &len);
                 snprintf(key, sizeof(key), "n%denabled", i); b = 0; nvs_get_u8(h, key, &b); cfg.ntrip[i].enabled = b;
-                ESP_LOGI(CFG_TAG, "Load NTRIP%d: en=%d host='%s' port=%d mount='%s' user='%s'",
+                ESP_LOGD(CFG_TAG, "Load NTRIP%d: en=%d host='%s' port=%d mount='%s' user='%s'",
                          i, cfg.ntrip[i].enabled, cfg.ntrip[i].host, cfg.ntrip[i].port,
                          cfg.ntrip[i].mount, cfg.ntrip[i].user);
             }
@@ -158,7 +158,7 @@ public:
             snprintf(key, sizeof(key), "n%duser",    i); nvs_set_str(h, key, cfg.ntrip[i].user);
             snprintf(key, sizeof(key), "n%dpass",    i); nvs_set_str(h, key, cfg.ntrip[i].pass);
             snprintf(key, sizeof(key), "n%denabled", i); nvs_set_u8 (h, key, cfg.ntrip[i].enabled ? 1 : 0);
-            ESP_LOGI(CFG_TAG, "Save NTRIP%d: en=%d host='%s' port=%d mount='%s' user='%s'",
+            ESP_LOGD(CFG_TAG, "Save NTRIP%d: en=%d host='%s' port=%d mount='%s' user='%s'",
                      i, cfg.ntrip[i].enabled, cfg.ntrip[i].host, cfg.ntrip[i].port,
                      cfg.ntrip[i].mount, cfg.ntrip[i].user);
         }

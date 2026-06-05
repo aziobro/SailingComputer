@@ -27,18 +27,19 @@
 #define BLE_TAG "BLE"
 
 // ── UUID definitions (128-bit, little-endian byte order) ─────────────────────
-// NUS Service  6E400001-B5B3-F393-E0A9-E50E24DCCA9E
+// NUS Service  6E400001-B5A3-F393-E0A9-E50E24DCCA9E
+// NOTE: SW Maps iOS uses B5A3 (not the often-cited B5B3) — keep as A3.
 static const ble_uuid128_t nus_svc_uuid = BLE_UUID128_INIT(
     0x9e,0xca,0xdc,0x24,0x0e,0xe5,0xa9,0xe0,
-    0x93,0xf3,0xb3,0xb5,0x01,0x00,0x40,0x6e);
-// NUS TX char  6E400003
+    0x93,0xf3,0xa3,0xb5,0x01,0x00,0x40,0x6e);
+// NUS TX char  6E400003-B5A3-F393-E0A9-E50E24DCCA9E
 static const ble_uuid128_t nus_tx_uuid = BLE_UUID128_INIT(
     0x9e,0xca,0xdc,0x24,0x0e,0xe5,0xa9,0xe0,
-    0x93,0xf3,0xb3,0xb5,0x03,0x00,0x40,0x6e);
-// NUS RX char  6E400002
+    0x93,0xf3,0xa3,0xb5,0x03,0x00,0x40,0x6e);
+// NUS RX char  6E400002-B5A3-F393-E0A9-E50E24DCCA9E
 static const ble_uuid128_t nus_rx_uuid = BLE_UUID128_INIT(
     0x9e,0xca,0xdc,0x24,0x0e,0xe5,0xa9,0xe0,
-    0x93,0xf3,0xb3,0xb5,0x02,0x00,0x40,0x6e);
+    0x93,0xf3,0xa3,0xb5,0x02,0x00,0x40,0x6e);
 
 // HM-10 Service  0000FFE0-0000-1000-8000-00805F9B34FB
 static const ble_uuid128_t hm10_svc_uuid = BLE_UUID128_INIT(
@@ -108,20 +109,29 @@ static const struct ble_gatt_svc_def ble_gatt_svcs[] = {
 
 // ── Advertising ───────────────────────────────────────────────────────────────
 static void ble_start_adv(void) {
-    // Main advertising packet: NUS service UUID (GPS apps filter on this)
+    // Put service UUIDs in the primary packet; iOS filtered scans may not
+    // match UUIDs that appear only in the scan response.
+    static const ble_uuid16_t hm10_svc_uuid16 = BLE_UUID16_INIT(0xFFE0);
     struct ble_hs_adv_fields fields = {};
-    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    fields.uuids128             = &nus_svc_uuid;
-    fields.num_uuids128         = 1;
+    fields.flags               = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.uuids16             = &hm10_svc_uuid16;
+    fields.num_uuids16         = 1;
+    fields.uuids16_is_complete = 1;
+    fields.uuids128            = &nus_svc_uuid;
+    fields.num_uuids128        = 1;
     fields.uuids128_is_complete = 1;
-    ble_gap_adv_set_fields(&fields);
+    int rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0)
+        ESP_LOGE(BLE_TAG, "adv_set_fields failed rc=%d", rc);
 
-    // Scan response: device name (sent on active scan request)
+    // Scan response: device name.
     struct ble_hs_adv_fields rsp = {};
-    rsp.name             = (const uint8_t *)ble_dev_name;
-    rsp.name_len         = strlen(ble_dev_name);
-    rsp.name_is_complete = 1;
-    ble_gap_adv_rsp_set_fields(&rsp);
+    rsp.name               = (const uint8_t *)ble_dev_name;
+    rsp.name_len           = strlen(ble_dev_name);
+    rsp.name_is_complete   = 1;
+    rc = ble_gap_adv_rsp_set_fields(&rsp);
+    if (rc != 0)
+        ESP_LOGE(BLE_TAG, "adv_rsp_set_fields failed rc=%d", rc);
 
     struct ble_gap_adv_params params = {};
     params.conn_mode = BLE_GAP_CONN_MODE_UND;
@@ -145,8 +155,18 @@ static int ble_gap_cb(struct ble_gap_event *event, void *arg) {
         case BLE_GAP_EVENT_DISCONNECT:
             bleConnected    = false;
             ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-            ESP_LOGI(BLE_TAG, "Client disconnected — restarting advertising");
+            ESP_LOGI(BLE_TAG, "Client disconnected reason=%d — restarting advertising",
+                     event->disconnect.reason);
             ble_start_adv();
+            break;
+        case BLE_GAP_EVENT_SUBSCRIBE:
+            ESP_LOGI(BLE_TAG, "Subscribe event: handle=%d cur_notify=%d",
+                     event->subscribe.attr_handle,
+                     event->subscribe.cur_notify);
+            break;
+        case BLE_GAP_EVENT_MTU:
+            ESP_LOGI(BLE_TAG, "MTU negotiated: conn=%d mtu=%d",
+                     event->mtu.conn_handle, event->mtu.value);
             break;
         default:
             break;
