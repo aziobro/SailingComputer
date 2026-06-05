@@ -39,6 +39,12 @@ static void um982ConfigureNMEA(uart_port_t port) {
     um982Cmd(port, "LOG COM1 HEADINGA ONTIME 1");
     um982Cmd(port, "LOG COM1 GPVTG ONTIME 1");
     um982Cmd(port, "LOG COM1 GNRMC ONTIME 1");
+}
+
+static void um982ConfigureRTK(uart_port_t port) {
+    // Ensure COM2 baud matches RTCM stream from ESP32
+    um982Cmd(port, "CONFIG COM2 115200");
+    um982FlushRx(port, 200);
     um982Cmd(port, "SAVECONFIG");
 }
 
@@ -46,6 +52,7 @@ void um982Init(uart_port_t port) {
     vTaskDelay(pdMS_TO_TICKS(500));
     um982FlushRx(port, 300);
     um982ConfigureNMEA(port);
+    um982ConfigureRTK(port);
     ESP_LOGI(UM982_TAG, "Init complete");
 }
 
@@ -59,5 +66,6 @@ void um982FactoryReset(uart_port_t port) {
     vTaskDelay(pdMS_TO_TICKS(5000));
     um982FlushRx(port, 500);
     um982ConfigureNMEA(port);
+    um982ConfigureRTK(port);
     ESP_LOGI(UM982_TAG, "Factory reset complete");
 }

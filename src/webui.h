@@ -346,13 +346,16 @@ function formatBytes(b) {
 
 function updateStatus() {
   fetch('/status').then(function(r) { return r.json(); }).then(function(d) {
-    var fixColors = {0:'err',1:'warn',2:'warn',4:'rtk',5:'warn'};
+    var fixColors = {0:'err',1:'warn',2:'ok',4:'rtk',5:'ok'};
     var el = document.getElementById('s-fix');
     el.textContent = d.fixLabel || '--';
     el.className = 'stat-value ' + (fixColors[d.fix] || 'err');
     setText('s-sats', d.sats != null ? d.sats : '--');
-    setText('s-lat',  d.lat  != null ? Number(d.lat).toFixed(6)  : '--');
-    setText('s-lon',  d.lon  != null ? Number(d.lon).toFixed(6)  : '--');
+    // Decimal places scale with fix quality:
+    // RTK Fixed(4)/Float(5) → 7 dp (~1 cm), DGPS(2) → 6 dp (~11 cm), GPS(1) → 5 dp (~1 m)
+    var coordDp = (d.fix === 4 || d.fix === 5) ? 7 : (d.fix === 2 ? 6 : 5);
+    setText('s-lat', d.lat != null ? Number(d.lat).toFixed(coordDp) + '°' : '--');
+    setText('s-lon', d.lon != null ? Number(d.lon).toFixed(coordDp) + '°' : '--');
     setText('s-hdt',   d.hdtValid   ? Number(d.heading).toFixed(1) + '\u00b0' : '--\u00b0');
     setText('s-roll',  d.rollValid  ? Number(d.roll).toFixed(1)    + '\u00b0' : '--\u00b0');
     var hdtEl = document.getElementById('s-hdtsrc');

@@ -526,7 +526,7 @@ static void ntripLoop() {
         if (ntripFailCount >= NTRIP_FAILOVER_COUNT) {
             int next = ntripNextSource(ntripActiveIdx);
             if (next >= 0 && next != ntripActiveIdx) {
-                ESP_LOGI(TAG, "[NTRIP] Failing over %d→%d", ntripActiveIdx, next);
+                ESP_LOGI(TAG, "[NTRIP] Failing over Source%d→Source%d", ntripActiveIdx+1, next+1);
                 ntripActiveIdx = next;
             }
             ntripFailCount = 0;
@@ -566,12 +566,27 @@ static void ntripLoop() {
     uint8_t buf[256];
     int n = recv(ntripSock, buf, sizeof(buf), MSG_DONTWAIT);
     if (n > 0) {
-        uart_write_bytes(UART_RTCM, (const char *)buf, n);
+        // Log first packet of each session — RTCM3 must start with 0xD3.
+        // If first byte is printable ASCII it's an HTML error page, not corrections.
+        if (ntripSessionBytes == 0 && n >= 4) {
+            ESP_LOGI(TAG, "[NTRIP%d] First bytes: %02X %02X %02X %02X ('%c%c%c%c') — %s",
+                     ntripActiveIdx,
+                     buf[0], buf[1], buf[2], buf[3],
+                     (buf[0]>=0x20&&buf[0]<0x7f)?buf[0]:'.',
+                     (buf[1]>=0x20&&buf[1]<0x7f)?buf[1]:'.',
+                     (buf[2]>=0x20&&buf[2]<0x7f)?buf[2]:'.',
+                     (buf[3]>=0x20&&buf[3]<0x7f)?buf[3]:'.',
+                     buf[0]==0xD3 ? "RTCM3 OK" : "NOT RTCM3 - possible auth error");
+        }
+        int written = uart_write_bytes(UART_RTCM, (const char *)buf, n);
         ntripBytesIn      += n;
         ntripSessionBytes += n;
         static uint32_t lastRtcmLog = 0;
+        static uint32_t rtcmWriteErrors = 0;
+        if (written != n) rtcmWriteErrors++;
         if (millis() - lastRtcmLog > 5000) {
-            ESP_LOGI(TAG, "[NTRIP%d] RTCM flowing — total %u bytes", ntripActiveIdx, ntripBytesIn);
+            ESP_LOGI(TAG, "[NTRIP%d] RTCM flowing — total %u bytes, UART errs %u",
+                     ntripActiveIdx+1, ntripBytesIn, rtcmWriteErrors);
             lastRtcmLog = millis();
         }
     }
@@ -737,7 +752,7 @@ static esp_err_t handleStatus(httpd_req_t *req) {
         bleEnabled           ? "true" : "false",
         bleConnected         ? "true" : "false",
         ntripConnected       ? "true" : "false",
-        ntripActiveIdx, ntripBytesIn,
+        ntripActiveIdx+1, ntripBytesIn,
         nmeaBytesRx, nmeaLinesRx,
         cfgMgr.cfg.apMode ? "AP" : "Station",
         staIP, apIP
