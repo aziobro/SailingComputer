@@ -57,6 +57,7 @@ static uint16_t ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static bool     bleConnected    = false;
 static bool     bleEnabled      = false;
 static char     ble_dev_name[64] = "SailingComputer";
+static uint32_t bleDropCount    = 0;
 
 // ── Forward declarations ──────────────────────────────────────────────────────
 static int  ble_gap_cb(struct ble_gap_event *event, void *arg);
@@ -213,16 +214,18 @@ static void bleNmeaSend(const char *sentence) {
     if (!bleEnabled || !bleConnected) return;
     if (ble_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
 
-    char    buf[128];
+    char    buf[256];
     int     len = snprintf(buf, sizeof(buf), "%s\r\n", sentence);
-    if (len <= 0 || len >= (int)sizeof(buf)) return;
+    if (len <= 0 || len >= (int)sizeof(buf)) { bleDropCount++; return; }
 
     if (nus_tx_handle) {
         struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, len);
-        if (om) ble_gatts_notify_custom(ble_conn_handle, nus_tx_handle, om);
+        if (!om || ble_gatts_notify_custom(ble_conn_handle, nus_tx_handle, om) != 0)
+            bleDropCount++;
     }
     if (hm10_chr_handle) {
         struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, len);
-        if (om) ble_gatts_notify_custom(ble_conn_handle, hm10_chr_handle, om);
+        if (!om || ble_gatts_notify_custom(ble_conn_handle, hm10_chr_handle, om) != 0)
+            bleDropCount++;
     }
 }

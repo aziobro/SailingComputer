@@ -2,8 +2,11 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <stdarg.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -61,8 +64,10 @@ static inline uint32_t millis(void) {
 
 ConfigManager cfgMgr;
 
-static char  nmeaLine[256];
-static int   nmeaIdx    = 0;
+struct NmeaMessage {
+    char line[256];
+};
+
 static int   fixQuality = 0;
 static int   satCount   = 0;
 static float latitude   = 0, longitude = 0, heading = 0, sog = 0, cog = 0;
@@ -79,18 +84,25 @@ static float driveSpeed         = 0;
 static bool  sailingMetricsValid = false;
 
 // Diagnostic counters
-static uint32_t nmeaBytesRx  = 0;  // raw bytes received from UART1 — 0 means UART broken
-static uint32_t nmeaLinesRx  = 0;  // complete NMEA sentences parsed
+static uint32_t nmeaBytesRx       = 0;  // raw bytes received from UART1 — 0 means UART broken
+static uint32_t nmeaLinesRx       = 0;  // complete NMEA sentences parsed
+static uint32_t nmeaOverflowDrops = 0;
+static uint32_t nmeaParseDrops    = 0;
+static uint32_t nmeaOutputDrops   = 0;
+static uint32_t nmeaTcpDrops      = 0;
 
 // WiFi
 static bool staConnected = false;
-static SemaphoreHandle_t wifiMutex = NULL;
 
 // NMEA TCP server
 #define MAX_NMEA_CLIENTS 4
 static int nmeaSrvFd = -1;
 static int nmeaClientFds[MAX_NMEA_CLIENTS];
 static SemaphoreHandle_t nmeaClientMtx = NULL;
+static QueueHandle_t nmeaParseQueue = NULL;
+static QueueHandle_t nmeaOutputQueue = NULL;
+static SemaphoreHandle_t telemetryMtx = NULL;
+static SemaphoreHandle_t uartNmeaMtx = NULL;
 
 // NTRIP
 static int      ntripSock        = -1;
@@ -184,6 +196,50 @@ static void urlDecode(char *dst, const char *src, size_t dst_size) {
         }
     }
     dst[i] = '\0';
+}
+
+static bool appendFmt(char *dst, size_t dst_size, size_t *off,
+                      const char *fmt, ...) {
+    if (*off >= dst_size) return false;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(dst + *off, dst_size - *off, fmt, ap);
+    va_end(ap);
+    if (n < 0) return false;
+    if ((size_t)n >= dst_size - *off) {
+        *off = dst_size - 1;
+        dst[*off] = '\0';
+        return false;
+    }
+    *off += (size_t)n;
+    return true;
+}
+
+static bool appendJsonString(char *dst, size_t dst_size, size_t *off,
+                             const char *s) {
+    if (!appendFmt(dst, dst_size, off, "\"")) return false;
+    while (*s) {
+        unsigned char c = (unsigned char)*s++;
+        switch (c) {
+            case '\\': if (!appendFmt(dst, dst_size, off, "\\\\")) return false; break;
+            case '"':  if (!appendFmt(dst, dst_size, off, "\\\"")) return false; break;
+            case '\b': if (!appendFmt(dst, dst_size, off, "\\b")) return false; break;
+            case '\f': if (!appendFmt(dst, dst_size, off, "\\f")) return false; break;
+            case '\n': if (!appendFmt(dst, dst_size, off, "\\n")) return false; break;
+            case '\r': if (!appendFmt(dst, dst_size, off, "\\r")) return false; break;
+            case '\t': if (!appendFmt(dst, dst_size, off, "\\t")) return false; break;
+            default:
+                if (c < 0x20) {
+                    if (!appendFmt(dst, dst_size, off, "\\u%04x", c)) return false;
+                } else {
+                    if (*off + 1 >= dst_size) return false;
+                    dst[(*off)++] = (char)c;
+                    dst[*off] = '\0';
+                }
+                break;
+        }
+    }
+    return appendFmt(dst, dst_size, off, "\"");
 }
 
 // Find key in "k1=v1&k2=v2" body, URL-decode value into val.
@@ -328,28 +384,34 @@ static uint8_t nmeaChecksum(const char *s) {
     return cs;
 }
 
+static void enqueueNmeaOutput(const char *line) {
+    if (!nmeaOutputQueue) return;
+    NmeaMessage msg = {};
+    strlcpy(msg.line, line, sizeof(msg.line));
+    if (xQueueSend(nmeaOutputQueue, &msg, 0) != pdTRUE) {
+        nmeaOutputDrops++;
+    }
+}
+
 // ── NMEA TCP broadcast ────────────────────────────────────────────────────────
 
 static void broadcastNmea(const char *line) {
     xSemaphoreTake(nmeaClientMtx, portMAX_DELAY);
     for (int i = 0; i < MAX_NMEA_CLIENTS; i++) {
         if (nmeaClientFds[i] < 0) continue;
-        if (send(nmeaClientFds[i], line,   strlen(line), MSG_DONTWAIT) < 0 ||
-            send(nmeaClientFds[i], "\r\n", 2,            MSG_DONTWAIT) < 0) {
+        int rc = send(nmeaClientFds[i], line, strlen(line), MSG_DONTWAIT);
+        if (rc >= 0) rc = send(nmeaClientFds[i], "\r\n", 2, MSG_DONTWAIT);
+        if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            nmeaTcpDrops++;
+            continue;
+        }
+        if (rc < 0) {
             close(nmeaClientFds[i]);
             nmeaClientFds[i] = -1;
             ESP_LOGI(TAG, "[NMEA] Client %d gone", i);
         }
     }
     xSemaphoreGive(nmeaClientMtx);
-}
-
-static void broadcastHDT() {
-    if (!hdtValid) return;
-    char body[32], sentence[48];
-    snprintf(body,     sizeof(body),     "GPHDT,%.4f,T", heading);
-    snprintf(sentence, sizeof(sentence), "$%s*%02X",     body, nmeaChecksum(body));
-    broadcastNmea(sentence);
 }
 
 static void acceptNmeaClients() {
@@ -407,19 +469,35 @@ static void ntripDisconnect() {
 }
 
 static void ntripSendGGA() {
-    if (fixQuality == 0 || ntripSock < 0) return;
-    float lat = fabsf(latitude),  lon = fabsf(longitude);
+    int q, sats;
+    float latRaw, lonRaw, hdopCopy, altCopy;
+    if (telemetryMtx) xSemaphoreTake(telemetryMtx, portMAX_DELAY);
+    q = fixQuality;
+    sats = satCount;
+    latRaw = latitude;
+    lonRaw = longitude;
+    hdopCopy = hdop;
+    altCopy = altitude;
+    if (telemetryMtx) xSemaphoreGive(telemetryMtx);
+
+    if (q == 0 || ntripSock < 0) return;
+    float lat = fabsf(latRaw),  lon = fabsf(lonRaw);
     int   latDeg = (int)lat;  float latMin = (lat - latDeg) * 60.0f;
     int   lonDeg = (int)lon;  float lonMin = (lon - lonDeg) * 60.0f;
     char body[96];
     snprintf(body, sizeof(body),
              "GPGGA,000000.00,%02d%08.5f,%c,%03d%08.5f,%c,%d,%02d,%.1f,%.1f,M,0.0,M,,",
-             latDeg, latMin, latitude  >= 0 ? 'N' : 'S',
-             lonDeg, lonMin, longitude >= 0 ? 'E' : 'W',
-             fixQuality, satCount, hdop, altitude);
+             latDeg, latMin, latRaw >= 0 ? 'N' : 'S',
+             lonDeg, lonMin, lonRaw >= 0 ? 'E' : 'W',
+             q, sats, hdopCopy, altCopy);
     char sentence[110];
     snprintf(sentence, sizeof(sentence), "$%s*%02X\r\n", body, nmeaChecksum(body));
-    send(ntripSock, sentence, strlen(sentence), MSG_DONTWAIT);
+    if (send(ntripSock, sentence, strlen(sentence), MSG_DONTWAIT) < 0 &&
+        errno != EAGAIN && errno != EWOULDBLOCK) {
+        ESP_LOGE(TAG, "[NTRIP%d] GGA send error %d", ntripActiveIdx, errno);
+        ntripDisconnect();
+        ntripFailCount++;
+    }
 }
 
 // Read one line from socket into buf (strips \r). Returns char count or -1 on error.
@@ -455,9 +533,9 @@ static bool ntripConnect(int idx) {
     int sock = socket(res->ai_family, res->ai_socktype, 0);
     if (sock < 0) { freeaddrinfo(res); return false; }
 
-    // 5-second connect timeout
     struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     ESP_LOGI(TAG, "[NTRIP%d] Connecting to %s:%d/%s", idx, src.host, src.port, src.mount);
     if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
@@ -485,7 +563,10 @@ static bool ntripConnect(int idx) {
         strlcat(req, "\r\n", sizeof(req));
     }
     strlcat(req, "\r\n", sizeof(req));
-    send(sock, req, strlen(req), 0);
+    if (send(sock, req, strlen(req), 0) < 0) {
+        ESP_LOGE(TAG, "[NTRIP%d] Request send failed", idx);
+        close(sock); return false;
+    }
 
     // Read HTTP response headers
     bool got200 = false;
@@ -514,7 +595,10 @@ static bool ntripConnect(int idx) {
 }
 
 static void ntripLoop() {
-    if (!staConnected)    return;
+    if (!staConnected) {
+        if (ntripConnected) ntripDisconnect();
+        return;
+    }
     if (!ntripAnyEnabled) return;
 
     if (!ntripConnected) {
@@ -558,6 +642,11 @@ static void ntripLoop() {
                     ntripFailCount++;
                 }
                 return;
+            } else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                ESP_LOGE(TAG, "[NTRIP%d] Socket error %d", ntripActiveIdx, errno);
+                ntripDisconnect();
+                ntripFailCount++;
+                return;
             }
         }
     }
@@ -570,9 +659,18 @@ static void ntripLoop() {
     uint8_t buf[256];
     int n = recv(ntripSock, buf, sizeof(buf), MSG_DONTWAIT);
     if (n > 0) {
-        uart_write_bytes(UART_RTCM, (const char *)buf, n);
+        int written = uart_write_bytes(UART_RTCM, (const char *)buf, n);
+        if (written < n)
+            ESP_LOGW(TAG, "[NTRIP%d] RTCM UART short write %d/%d", ntripActiveIdx, written, n);
         ntripBytesIn      += n;
         ntripSessionBytes += n;
+    } else if (n == 0) {
+        ntripDisconnect();
+        ntripFailCount++;
+    } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        ESP_LOGE(TAG, "[NTRIP%d] RTCM recv error %d", ntripActiveIdx, errno);
+        ntripDisconnect();
+        ntripFailCount++;
     }
 }
 
@@ -632,8 +730,14 @@ static void startSTA() {
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-// Read full POST body into caller-supplied buf. Returns bytes read or -1.
+// Read full POST body into caller-supplied buf. Returns bytes read, -1 on I/O
+// error, or -2 if the caller's fixed buffer is too small.
 static int readBody(httpd_req_t *req, char *buf, size_t buf_size) {
+    if (buf_size == 0) return -1;
+    if (req->content_len >= (int)buf_size) {
+        buf[0] = '\0';
+        return -2;
+    }
     int total = 0, remaining = req->content_len;
     while (remaining > 0) {
         int to_read = MIN(remaining, (int)(buf_size - 1 - total));
@@ -692,6 +796,7 @@ static esp_err_t handleStatus(httpd_req_t *req) {
     getApIP(apIP,   sizeof(apIP));
 
     char json[1024];
+    if (telemetryMtx) xSemaphoreTake(telemetryMtx, portMAX_DELAY);
     snprintf(json, sizeof(json),
         "{"
         "\"fix\":%d,"
@@ -720,12 +825,17 @@ static esp_err_t handleStatus(httpd_req_t *req) {
         "\"ntripBytesIn\":%u,"
         "\"nmeaBytesRx\":%u,"
         "\"nmeaLinesRx\":%u,"
+        "\"nmeaOverflowDrops\":%u,"
+        "\"nmeaParseDrops\":%u,"
+        "\"nmeaOutputDrops\":%u,"
+        "\"nmeaTcpDrops\":%u,"
+        "\"bleDrops\":%u,"
         "\"wifiMode\":\"%s\","
         "\"ip\":\"%s\","
         "\"apIP\":\"%s\""
         "}",
         fixQuality,
-        fixQuality <= 9 ? fixLabels[fixQuality] : "Unknown",
+        (fixQuality >= 0 && fixQuality <= 9) ? fixLabels[fixQuality] : "Unknown",
         latitude, longitude,
         heading,
         hdtValid             ? "true" : "false",
@@ -741,9 +851,12 @@ static esp_err_t handleStatus(httpd_req_t *req) {
         ntripConnected       ? "true" : "false",
         ntripActiveIdx+1, ntripBytesIn,
         nmeaBytesRx, nmeaLinesRx,
+        nmeaOverflowDrops, nmeaParseDrops, nmeaOutputDrops, nmeaTcpDrops,
+        bleDropCount,
         cfgMgr.cfg.apMode ? "AP" : "Station",
         staIP, apIP
     );
+    if (telemetryMtx) xSemaphoreGive(telemetryMtx);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
@@ -753,27 +866,34 @@ static esp_err_t handleStatus(httpd_req_t *req) {
 static esp_err_t handleGetConfig(httpd_req_t *req) {
     if (!checkAuth(req)) return ESP_OK;
     Config &cfg = cfgMgr.cfg;
-    // Build JSON manually — avoids pulling in cJSON for a one-time response
-    char json[1024];
-    int  off = 0;
-    off += snprintf(json + off, sizeof(json) - off,
-        "{\"apMode\":%s,\"wifiSSID\":\"%s\",\"ntrip\":[",
-        cfg.apMode ? "true" : "false", cfg.wifiSSID);
+    char json[2048] = "";
+    size_t off = 0;
+    bool ok = appendFmt(json, sizeof(json), &off,
+        "{\"apMode\":%s,\"wifiSSID\":", cfg.apMode ? "true" : "false");
+    ok = ok && appendJsonString(json, sizeof(json), &off, cfg.wifiSSID);
+    ok = ok && appendFmt(json, sizeof(json), &off, ",\"ntrip\":[");
     for (int i = 0; i < NTRIP_SOURCES; i++) {
-        if (i) { json[off++] = ','; json[off] = '\0'; }
-        off += snprintf(json + off, sizeof(json) - off,
-            "{\"enabled\":%s,\"host\":\"%s\",\"port\":%d,"
-            "\"mount\":\"%s\",\"user\":\"%s\"}",
-            cfg.ntrip[i].enabled ? "true" : "false",
-            cfg.ntrip[i].host, cfg.ntrip[i].port,
-            cfg.ntrip[i].mount, cfg.ntrip[i].user);
+        if (i) ok = ok && appendFmt(json, sizeof(json), &off, ",");
+        ok = ok && appendFmt(json, sizeof(json), &off,
+            "{\"enabled\":%s,\"host\":",
+            cfg.ntrip[i].enabled ? "true" : "false");
+        ok = ok && appendJsonString(json, sizeof(json), &off, cfg.ntrip[i].host);
+        ok = ok && appendFmt(json, sizeof(json), &off, ",\"port\":%d,\"mount\":", cfg.ntrip[i].port);
+        ok = ok && appendJsonString(json, sizeof(json), &off, cfg.ntrip[i].mount);
+        ok = ok && appendFmt(json, sizeof(json), &off, ",\"user\":");
+        ok = ok && appendJsonString(json, sizeof(json), &off, cfg.ntrip[i].user);
+        ok = ok && appendFmt(json, sizeof(json), &off, "}");
     }
-    off += snprintf(json + off, sizeof(json) - off,
-        "],\"headingOffset\":%.1f,\"cogMinSog\":%.2f,"
-        "\"bleNmea\":%s,\"apSSID\":\"%s\"}",
+    ok = ok && appendFmt(json, sizeof(json), &off,
+        "],\"headingOffset\":%.1f,\"cogMinSog\":%.2f,\"bleNmea\":%s,\"apSSID\":",
         cfg.headingOffset, cfg.cogMinSog,
-        cfg.bleNmea ? "true" : "false",
-        cfg.apSSID);
+        cfg.bleNmea ? "true" : "false");
+    ok = ok && appendJsonString(json, sizeof(json), &off, cfg.apSSID);
+    ok = ok && appendFmt(json, sizeof(json), &off, "}");
+    if (!ok) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Config JSON too large");
+        return ESP_FAIL;
+    }
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
@@ -783,7 +903,13 @@ static esp_err_t handleGetConfig(httpd_req_t *req) {
 static esp_err_t handleSaveConfig(httpd_req_t *req) {
     if (!checkAuth(req)) return ESP_OK;
     char body[2048] = "";
-    if (readBody(req, body, sizeof(body)) < 0) {
+    int bodyLen = readBody(req, body, sizeof(body));
+    if (bodyLen == -2) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_sendstr(req, "Config form too large");
+        return ESP_FAIL;
+    }
+    if (bodyLen < 0) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
@@ -849,7 +975,6 @@ static esp_err_t handleSaveConfig(httpd_req_t *req) {
 
     cfgMgr.save();
     ntripUpdateEnabled();
-    ntripDisconnect();
     ntripActiveIdx = 0; ntripFailCount = 0;
 
     httpd_resp_set_type(req, "application/json");
@@ -884,13 +1009,24 @@ static esp_err_t handleUM982Reset(httpd_req_t *req) {
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
     ESP_LOGI(TAG, "[Web] UM982 factory reset requested");
     vTaskDelay(pdMS_TO_TICKS(100));
+    if (uartNmeaMtx) xSemaphoreTake(uartNmeaMtx, portMAX_DELAY);
     um982FactoryReset(UART_NMEA);
+    if (uartNmeaMtx) xSemaphoreGive(uartNmeaMtx);
     return ESP_OK;
 }
 
 static esp_err_t handleBleToggle(httpd_req_t *req) {
     char body[64] = ""; char val[16];
-    readBody(req, body, sizeof(body));
+    int bodyLen = readBody(req, body, sizeof(body));
+    if (bodyLen == -2) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_sendstr(req, "BLE form too large");
+        return ESP_FAIL;
+    }
+    if (bodyLen < 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
     if (formGet(body, "bleNmea", val, sizeof(val)))
         cfgMgr.cfg.bleNmea = (strcmp(val, "true") == 0 || strcmp(val, "on") == 0);
     cfgMgr.save();
@@ -1078,44 +1214,89 @@ static void startWebServer() {
     }
 }
 
-// ── NMEA reader task (Core 1) ─────────────────────────────────────────────────
+// ── NMEA tasks ────────────────────────────────────────────────────────────────
 
-static void nmeaTask(void *param) {
-    uint8_t byte;
+static void nmeaRxTask(void *param) {
+    uint8_t buf[128];
+    NmeaMessage msg = {};
+    size_t idx = 0;
+    bool overflow = false;
+
     for (;;) {
-        // Accept any new TCP clients
-        if (nmeaSrvFd >= 0) acceptNmeaClients();
-
-        // Read one byte from UART1; timeout 10ms to keep accept loop alive
-        int r = uart_read_bytes(UART_NMEA, &byte, 1, pdMS_TO_TICKS(10));
+        if (uartNmeaMtx && xSemaphoreTake(uartNmeaMtx, pdMS_TO_TICKS(20)) != pdTRUE) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        int r = uart_read_bytes(UART_NMEA, buf, sizeof(buf), pdMS_TO_TICKS(10));
+        if (uartNmeaMtx) xSemaphoreGive(uartNmeaMtx);
         if (r <= 0) continue;
-        nmeaBytesRx++;
 
-        char c = (char)byte;
-        if (c == '\n') {
-            nmeaLine[nmeaIdx] = '\0';
-            if (nmeaIdx > 5) {
-                nmeaLinesRx++;
-                processNmeaLine(nmeaLine);
-                if (nmeaLine[0] == '$') {
-                    if (strncmp(nmeaLine, "$GPHDT", 6) == 0 ||
-                        strncmp(nmeaLine, "$GNHDT", 6) == 0) {
-                        broadcastHDT();
-                        if (bleEnabled) {
-                            char body[32], sentence[48];
-                            snprintf(body,     sizeof(body),     "GPHDT,%.4f,T", heading);
-                            snprintf(sentence, sizeof(sentence), "$%s*%02X", body, nmeaChecksum(body));
-                            bleNmeaSend(sentence);
-                        }
-                    } else {
-                        broadcastNmea(nmeaLine);
-                        bleNmeaSend(nmeaLine);
+        nmeaBytesRx += (uint32_t)r;
+        for (int i = 0; i < r; i++) {
+            char c = (char)buf[i];
+            if (c == '\n') {
+                if (overflow) {
+                    nmeaOverflowDrops++;
+                } else {
+                    msg.line[idx] = '\0';
+                    if (idx > 5) {
+                        if (xQueueSend(nmeaParseQueue, &msg, 0) != pdTRUE)
+                            nmeaParseDrops++;
                     }
                 }
+                idx = 0;
+                overflow = false;
+                msg = {};
+            } else if (c != '\r') {
+                if (!overflow && idx < sizeof(msg.line) - 1) {
+                    msg.line[idx++] = c;
+                } else {
+                    overflow = true;
+                }
             }
-            nmeaIdx = 0;
-        } else if (c != '\r' && nmeaIdx < (int)sizeof(nmeaLine) - 1) {
-            nmeaLine[nmeaIdx++] = c;
+        }
+    }
+}
+
+static void nmeaParseTask(void *param) {
+    NmeaMessage msg;
+    for (;;) {
+        if (xQueueReceive(nmeaParseQueue, &msg, portMAX_DELAY) != pdTRUE) continue;
+
+        bool emitHdt = false;
+        bool hdtOk = false;
+        float hdtHeading = 0.0f;
+
+        if (telemetryMtx) xSemaphoreTake(telemetryMtx, portMAX_DELAY);
+        nmeaLinesRx++;
+        processNmeaLine(msg.line);
+        if (strncmp(msg.line, "$GPHDT", 6) == 0 || strncmp(msg.line, "$GNHDT", 6) == 0) {
+            emitHdt = true;
+            hdtOk = hdtValid;
+            hdtHeading = heading;
+        }
+        if (telemetryMtx) xSemaphoreGive(telemetryMtx);
+
+        if (msg.line[0] == '$') {
+            if (emitHdt && hdtOk) {
+                char body[32], sentence[48];
+                snprintf(body, sizeof(body), "GPHDT,%.4f,T", hdtHeading);
+                snprintf(sentence, sizeof(sentence), "$%s*%02X", body, nmeaChecksum(body));
+                enqueueNmeaOutput(sentence);
+            } else if (!emitHdt) {
+                enqueueNmeaOutput(msg.line);
+            }
+        }
+    }
+}
+
+static void nmeaOutputTask(void *param) {
+    NmeaMessage msg;
+    for (;;) {
+        if (nmeaSrvFd >= 0) acceptNmeaClients();
+        if (xQueueReceive(nmeaOutputQueue, &msg, pdMS_TO_TICKS(20)) == pdTRUE) {
+            broadcastNmea(msg.line);
+            bleNmeaSend(msg.line);
         }
     }
 }
@@ -1134,6 +1315,8 @@ extern "C" void app_main(void) {
     }
 
     cfgMgr.load();
+    telemetryMtx = xSemaphoreCreateMutex();
+    uartNmeaMtx  = xSemaphoreCreateMutex();
     ntripUpdateEnabled();
 
     // ── UART setup — exact sequence from Arduino ESP32 core ─────────────────
@@ -1201,6 +1384,12 @@ extern "C" void app_main(void) {
 
     // ── NMEA TCP server ──────────────────────────────────────────────────────
     nmeaClientMtx = xSemaphoreCreateMutex();
+    nmeaParseQueue  = xQueueCreate(32, sizeof(NmeaMessage));
+    nmeaOutputQueue = xQueueCreate(32, sizeof(NmeaMessage));
+    if (!telemetryMtx || !uartNmeaMtx || !nmeaClientMtx || !nmeaParseQueue || !nmeaOutputQueue) {
+        ESP_LOGE(TAG, "[Boot] Failed to allocate synchronization primitives");
+        return;
+    }
     for (int i = 0; i < MAX_NMEA_CLIENTS; i++) nmeaClientFds[i] = -1;
 
     nmeaSrvFd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1226,9 +1415,10 @@ extern "C" void app_main(void) {
     xTaskCreatePinnedToCore(ntripTask, "ntrip", 8192, NULL, 2, NULL, 0);
     ESP_LOGI(TAG, "[NTRIP] Task started on Core 0");
 
-    // NMEA reader + TCP broadcast on Core 1
-    xTaskCreatePinnedToCore(nmeaTask, "nmea", 4096, NULL, 5, NULL, 1);
-    ESP_LOGI(TAG, "[NMEA] Reader task started on Core 1");
+    xTaskCreatePinnedToCore(nmeaRxTask, "nmea_rx", 4096, NULL, 6, NULL, 1);
+    xTaskCreatePinnedToCore(nmeaParseTask, "nmea_parse", 4096, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(nmeaOutputTask, "nmea_out", 4096, NULL, 3, NULL, 0);
+    ESP_LOGI(TAG, "[NMEA] RX/parse/output tasks started");
 
     ESP_LOGI(TAG, "[Boot] Ready");
 }
