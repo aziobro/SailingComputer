@@ -24,7 +24,11 @@ static void um982Cmd(uart_port_t port, const char *cmd) {
 
 static void um982FlushRx(uart_port_t port, uint32_t ms) {
     vTaskDelay(pdMS_TO_TICKS(ms));
-    uart_flush_input(port);
+    // Drain by reading rather than uart_flush_input() — flush resets the hardware
+    // FIFO and temporarily masks the RX interrupt; on IDF 5.3.x / chip rev 3.1
+    // the interrupt sometimes isn't re-enabled, permanently killing RX.
+    uint8_t dummy[64];
+    while (uart_read_bytes(port, dummy, sizeof(dummy), pdMS_TO_TICKS(5)) > 0) {}
 }
 
 static void um982ConfigureNMEA(uart_port_t port) {

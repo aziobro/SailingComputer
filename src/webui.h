@@ -210,6 +210,7 @@ inline const char* getWebUI() {
       <div class="stat"><div class="stat-label">NTRIP</div><div class="stat-value" id="s-ntrip">--</div></div>
       <div class="stat"><div class="stat-label">NTRIP Source</div><div class="stat-value" id="s-ntrip-src" style="font-size:0.85rem">--</div></div>
       <div class="stat"><div class="stat-label">RTCM Bytes</div><div class="stat-value" id="s-rtcm">0</div></div>
+      <div class="stat"><div class="stat-label">NMEA Bytes</div><div class="stat-value" id="s-nmea-bytes">0</div><div style="font-size:0.7rem;color:#8899aa;margin-top:2px" id="s-nmea-lines">-- sentences</div></div>
       <div class="stat" id="s-ble-tile" style="display:none"><div class="stat-label">Bluetooth GPS</div><div class="stat-value" id="s-ble">--</div></div>
     </div>
   </div>
@@ -437,6 +438,11 @@ function updateStatus() {
     var ip = d.wifiMode === 'AP' ? d.apIP : d.ip;
     setText('s-ip', ip || '--');
     setText('s-rtcm', formatBytes(d.ntripBytesIn || 0));
+    setText('s-nmea-bytes', formatBytes(d.nmeaBytesRx || 0));
+    var nmeaLines = d.nmeaLinesRx || 0;
+    var nmea = document.getElementById('s-nmea-bytes');
+    nmea.style.color = nmeaLines > 0 ? '#4ade80' : '#f87171';
+    setText('s-nmea-lines', nmeaLines + ' sentences');
     setText('sysIP', ip || '--');
     setText('deviceIP', ip || '--');
     var ntrip = document.getElementById('s-ntrip');

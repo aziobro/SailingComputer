@@ -16,6 +16,7 @@
 #include "nvs_flash.h"
 #include "mdns.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "lwip/err.h"
@@ -45,8 +46,12 @@ static inline uint32_t millis(void) {
 }
 
 // ── UART port assignments ─────────────────────────────────────────────────────
-#define UART_NMEA  UART_NUM_1   // UM982 COM1 — NMEA sentences in
-#define UART_RTCM  UART_NUM_2   // UM982 COM2 — RTCM corrections out
+// UART2 is used for NMEA because GPIO16/17 are UART2's NATIVE pins on ESP32 —
+// no GPIO matrix remapping needed, which avoids a silent RX failure in IDF 5.x.
+// UART1's default pins (GPIO9/10) are the SPI flash bus, so it must be remapped.
+// Same UART numbers as Arduino Serial1/Serial2 — both GPIO-matrix remapped.
+#define UART_NMEA  UART_NUM_1   // UM982 COM1 — NMEA in  (GPIO16=RX, GPIO17=TX)
+#define UART_RTCM  UART_NUM_2   // UM982 COM2 — RTCM out (GPIO19=RX, GPIO18=TX)
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -68,6 +73,10 @@ static float leewayAngle        = 0;
 static float lateralDrift       = 0;
 static float driveSpeed         = 0;
 static bool  sailingMetricsValid = false;
+
+// Diagnostic counters
+static uint32_t nmeaBytesRx  = 0;  // raw bytes received from UART1 — 0 means UART broken
+static uint32_t nmeaLinesRx  = 0;  // complete NMEA sentences parsed
 
 // WiFi
 static bool staConnected = false;
@@ -680,7 +689,7 @@ static esp_err_t handleStatus(httpd_req_t *req) {
     getStaIP(staIP, sizeof(staIP));
     getApIP(apIP,   sizeof(apIP));
 
-    char json[600];
+    char json[1024];
     snprintf(json, sizeof(json),
         "{"
         "\"fix\":%d,"
@@ -707,6 +716,8 @@ static esp_err_t handleStatus(httpd_req_t *req) {
         "\"ntripConnected\":%s,"
         "\"ntripActiveIdx\":%d,"
         "\"ntripBytesIn\":%u,"
+        "\"nmeaBytesRx\":%u,"
+        "\"nmeaLinesRx\":%u,"
         "\"wifiMode\":\"%s\","
         "\"ip\":\"%s\","
         "\"apIP\":\"%s\""
@@ -727,6 +738,7 @@ static esp_err_t handleStatus(httpd_req_t *req) {
         bleConnected         ? "true" : "false",
         ntripConnected       ? "true" : "false",
         ntripActiveIdx, ntripBytesIn,
+        nmeaBytesRx, nmeaLinesRx,
         cfgMgr.cfg.apMode ? "AP" : "Station",
         staIP, apIP
     );
@@ -771,6 +783,7 @@ static esp_err_t handleSaveConfig(httpd_req_t *req) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
+    ESP_LOGI(TAG, "[Config] Body (%d bytes): %.200s...", (int)strlen(body), body);
 
     Config &cfg = cfgMgr.cfg;
     char val[192];
@@ -802,13 +815,19 @@ static esp_err_t handleSaveConfig(httpd_req_t *req) {
             strlcpy(cfg.ntrip[i].mount, val, sizeof(cfg.ntrip[i].mount));
 
         snprintf(key, sizeof(key), "n%duser", i);
-        if (formGet(body, key, val, sizeof(val)) && strlen(val) > 0)
-            strlcpy(cfg.ntrip[i].user, val, sizeof(cfg.ntrip[i].user));
+        {
+            bool ok = formGet(body, key, val, sizeof(val));
+            ESP_LOGI(TAG, "[Config] %s: found=%d decoded='%s'", key, ok, ok ? val : "");
+            if (ok && strlen(val) > 0)
+                strlcpy(cfg.ntrip[i].user, val, sizeof(cfg.ntrip[i].user));
+        }
 
         snprintf(key, sizeof(key), "n%dpass", i);
-        if (formGet(body, key, val, sizeof(val)) && strlen(val) > 0 &&
-            strcmp(val, "(unchanged)") != 0)
-            strlcpy(cfg.ntrip[i].pass, val, sizeof(cfg.ntrip[i].pass));
+        {
+            bool ok = formGet(body, key, val, sizeof(val));
+            if (ok && strlen(val) > 0 && strcmp(val, "(unchanged)") != 0)
+                strlcpy(cfg.ntrip[i].pass, val, sizeof(cfg.ntrip[i].pass));
+        }
     }
 
     if (formGet(body, "headingOffset", val, sizeof(val))) cfg.headingOffset = atof(val);
@@ -981,11 +1000,13 @@ static void nmeaTask(void *param) {
         // Read one byte from UART1; timeout 10ms to keep accept loop alive
         int r = uart_read_bytes(UART_NMEA, &byte, 1, pdMS_TO_TICKS(10));
         if (r <= 0) continue;
+        nmeaBytesRx++;
 
         char c = (char)byte;
         if (c == '\n') {
             nmeaLine[nmeaIdx] = '\0';
             if (nmeaIdx > 5) {
+                nmeaLinesRx++;
                 processNmeaLine(nmeaLine);
                 if (nmeaLine[0] == '$') {
                     if (strncmp(nmeaLine, "$GPHDT", 6) == 0 ||
@@ -1026,14 +1047,18 @@ extern "C" void app_main(void) {
     cfgMgr.load();
     ntripUpdateEnabled();
 
-    // ── UART setup ──────────────────────────────────────────────────────────
+    // ── UART setup — exact sequence from Arduino ESP32 core ─────────────────
+    // Order: param_config → set_pin → driver_install (matches Arduino internals).
+    // No explicit gpio_set_direction — uart_set_pin handles it.
+    // No loopback test — uart_set_loop_back bypasses GPIO16 and proved nothing.
     uart_config_t uc = {};
-    uc.baud_rate  = NMEA_BAUD;
-    uc.data_bits  = UART_DATA_8_BITS;
-    uc.parity     = UART_PARITY_DISABLE;
-    uc.stop_bits  = UART_STOP_BITS_1;
-    uc.flow_ctrl  = UART_HW_FLOWCTRL_DISABLE;
-    uc.source_clk = UART_SCLK_DEFAULT;
+    uc.baud_rate           = NMEA_BAUD;
+    uc.data_bits           = UART_DATA_8_BITS;
+    uc.parity              = UART_PARITY_DISABLE;
+    uc.stop_bits           = UART_STOP_BITS_1;
+    uc.flow_ctrl           = UART_HW_FLOWCTRL_DISABLE;
+    uc.rx_flow_ctrl_thresh = 122;             // Arduino default
+    uc.source_clk          = UART_SCLK_DEFAULT;
 
     uart_param_config(UART_NMEA, &uc);
     uart_set_pin(UART_NMEA, SERIAL1_TX, SERIAL1_RX,

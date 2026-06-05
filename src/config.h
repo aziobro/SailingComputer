@@ -97,9 +97,13 @@ public:
         len = sizeof(legacyHost);
         nvs_get_str(h, "ntripHost", legacyHost, &len);
 
+        // Check if "n0host" exists with a non-empty value.
+        // Pass NULL buf so IDF returns the required size without a copy —
+        // avoids the ESP_ERR_NVS_INVALID_LENGTH false-negative that a small
+        // fixed buffer would cause for any host longer than 3 chars.
         char n0key[16]; snprintf(n0key, sizeof(n0key), "n%dhost", 0);
-        char n0tmp[4] = ""; size_t n0len = sizeof(n0tmp);
-        bool hasN0 = (nvs_get_str(h, n0key, n0tmp, &n0len) == ESP_OK && strlen(n0tmp) > 0);
+        size_t n0len = 0;
+        bool hasN0 = (nvs_get_str(h, n0key, NULL, &n0len) == ESP_OK && n0len > 1);
 
         if (strlen(legacyHost) > 0 && !hasN0) {
             strlcpy(cfg.ntrip[0].host, legacyHost, sizeof(cfg.ntrip[0].host));
@@ -117,6 +121,9 @@ public:
                 snprintf(key, sizeof(key), "n%duser",    i); len = sizeof(cfg.ntrip[i].user);  nvs_get_str(h, key, cfg.ntrip[i].user,  &len);
                 snprintf(key, sizeof(key), "n%dpass",    i); len = sizeof(cfg.ntrip[i].pass);  nvs_get_str(h, key, cfg.ntrip[i].pass,  &len);
                 snprintf(key, sizeof(key), "n%denabled", i); b = 0; nvs_get_u8(h, key, &b); cfg.ntrip[i].enabled = b;
+                ESP_LOGI(CFG_TAG, "Load NTRIP%d: en=%d host='%s' port=%d mount='%s' user='%s'",
+                         i, cfg.ntrip[i].enabled, cfg.ntrip[i].host, cfg.ntrip[i].port,
+                         cfg.ntrip[i].mount, cfg.ntrip[i].user);
             }
         }
 
@@ -151,6 +158,9 @@ public:
             snprintf(key, sizeof(key), "n%duser",    i); nvs_set_str(h, key, cfg.ntrip[i].user);
             snprintf(key, sizeof(key), "n%dpass",    i); nvs_set_str(h, key, cfg.ntrip[i].pass);
             snprintf(key, sizeof(key), "n%denabled", i); nvs_set_u8 (h, key, cfg.ntrip[i].enabled ? 1 : 0);
+            ESP_LOGI(CFG_TAG, "Save NTRIP%d: en=%d host='%s' port=%d mount='%s' user='%s'",
+                     i, cfg.ntrip[i].enabled, cfg.ntrip[i].host, cfg.ntrip[i].port,
+                     cfg.ntrip[i].mount, cfg.ntrip[i].user);
         }
 
         nvs_set_u32(h, "hdgOffset", f2u(cfg.headingOffset));
