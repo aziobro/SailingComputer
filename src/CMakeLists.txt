@@ -7,10 +7,12 @@ idf_component_register(
         mdns
         esp_wifi
         esp_http_server
+        esp_https_server
         app_update
         esp_netif
         nvs_flash
         driver
         bt
         lwip
+        mbedtls
 )

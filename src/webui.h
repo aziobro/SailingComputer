@@ -18,6 +18,8 @@ inline const char* getWebUI() {
   nav button { flex: 1; padding: 10px; background: none; border: none; color: #7a9ab8;
                cursor: pointer; font-size: 0.9rem; transition: all 0.2s; }
   nav button.active, nav button:hover { color: #5ab4e8; border-bottom: 2px solid #5ab4e8; }
+  nav button.logout { flex: 0; padding: 10px 14px; color: #c05050; font-size: 0.8rem; }
+  nav button.logout:hover { color: #e06060; border-bottom: 2px solid #e06060; }
   .page { display: none; padding: 20px; max-width: 700px; margin: 0 auto; }
   .page.active { display: block; }
 
@@ -70,6 +72,7 @@ inline const char* getWebUI() {
   <button class="active" onclick="showPage('status',this)">Status</button>
   <button onclick="showPage('config',this)">Configuration</button>
   <button onclick="showPage('system',this)">System</button>
+  <button class="logout" onclick="doLogout()">&#x23FB; Log Out</button>
 </nav>
 
 <!-- STATUS PAGE -->
@@ -218,6 +221,10 @@ inline const char* getWebUI() {
 
 <!-- CONFIG PAGE -->
 <div id="config" class="page">
+  <div id="configAuthWall" style="display:none" class="card">
+    <p style="text-align:center;color:#e85a5a;font-size:1rem;margin:1rem 0">&#128274; Login required</p>
+    <p style="text-align:center;color:#7a9ab8;font-size:0.85rem">Click <strong>Log Out</strong> then reload the page, or <button class="btn" style="display:inline;padding:4px 12px" onclick="retryAuth('config')">Try Again</button></p>
+  </div>
   <form id="configForm">
     <div class="card">
       <h2>WiFi</h2>
@@ -239,6 +246,11 @@ inline const char* getWebUI() {
         <label>Password</label>
         <input type="password" name="wifiPassword" id="wifiPassword" maxlength="63" placeholder="(unchanged)">
       </div>
+      <p class="section-title">Web Admin Password</p>
+      <label>Admin Password (username: admin)</label>
+      <input type="password" name="adminPassword" id="adminPassword" maxlength="63" placeholder="(unchanged — leave blank to keep current)">
+      <label>Confirm Admin Password</label>
+      <input type="password" name="adminPassword2" id="adminPassword2" maxlength="63" placeholder="(unchanged — leave blank to keep current)">
     </div>
     <div class="card">
       <h2>Antenna</h2>
@@ -260,6 +272,11 @@ inline const char* getWebUI() {
 
 <!-- SYSTEM PAGE -->
 <div id="system" class="page">
+  <div id="systemAuthWall" style="display:none" class="card">
+    <p style="text-align:center;color:#e85a5a;font-size:1rem;margin:1rem 0">&#128274; Login required</p>
+    <p style="text-align:center;color:#7a9ab8;font-size:0.85rem">Click <strong>Log Out</strong> then reload the page, or <button class="btn" style="display:inline;padding:4px 12px" onclick="retryAuth('system')">Try Again</button></p>
+  </div>
+  <div id="systemContent">
   <div class="card">
     <h2>System</h2>
     <p style="font-size:0.85rem;color:#7a9ab8;margin-bottom:1rem;">
@@ -291,6 +308,7 @@ inline const char* getWebUI() {
       <code style="background:#0a1628;padding:2px 6px;border-radius:4px">.pio/build/esp32dev/firmware.bin</code>.
       The device will restart automatically after a successful flash.
     </p>
+    <!-- enctype here is ignored — startOTA() uses XHR with Content-Type: application/octet-stream (raw binary) -->
     <form id="otaForm" method="POST" action="/update" enctype="multipart/form-data">
       <input type="file" name="firmware" id="otaFile" accept=".bin" required
         style="display:none" onchange="document.getElementById('otaFileName').textContent=this.files[0].name">
@@ -311,17 +329,46 @@ inline const char* getWebUI() {
       </button>
     </form>
   </div>
+  </div><!-- systemContent -->
 </div>
 
 <div class="toast" id="toast"></div>
 
 <script>
+function showAuthWall(page) {
+  document.getElementById(page + 'AuthWall').style.display = '';
+  var content = document.getElementById(page + 'Content');
+  if (content) content.style.display = 'none';
+  var form = document.getElementById(page + 'Form');
+  if (form) form.style.display = 'none';
+}
+function hideAuthWall(page) {
+  document.getElementById(page + 'AuthWall').style.display = 'none';
+  var content = document.getElementById(page + 'Content');
+  if (content) content.style.display = '';
+  var form = document.getElementById(page + 'Form');
+  if (form) form.style.display = '';
+}
+function retryAuth(page) {
+  // Re-attempt auth by fetching /config — browser will re-prompt for credentials
+  fetch('/config').then(function(r) {
+    if (r.ok) { hideAuthWall(page); if (page === 'config') loadConfig(); }
+    else showAuthWall(page);
+  }).catch(function() { showAuthWall(page); });
+}
+
 function showPage(id, btn) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
   document.getElementById(id).classList.add('active');
   btn.classList.add('active');
   if (id === 'config') loadConfig();
+  if (id === 'system') {
+    fetch('/config').then(function(r) {
+      if (r.ok) hideAuthWall('system');
+      else showAuthWall('system');
+    }).catch(function() { showAuthWall('system'); });
+  }
 }
 
 function toast(msg, ok=true) {
@@ -451,7 +498,7 @@ function updateStatus() {
     var ntrip = document.getElementById('s-ntrip');
     ntrip.textContent = d.ntripConnected ? 'Connected' : 'Off';
     ntrip.className = 'stat-value ' + (d.ntripConnected ? 'ok' : 'err');
-    setText('s-ntrip-src', d.ntripConnected ? 'Source ' + ((d.ntripActiveIdx||0)+1) : '--');
+    setText('s-ntrip-src', d.ntripConnected ? 'Source ' + (d.ntripActiveIdx||0) : '--');
 
     // BLE status tile — only show if BLE is enabled
     var bleTile = document.getElementById('s-ble-tile');
@@ -629,7 +676,12 @@ function buildNtripSources(sources) {
 }
 
 function loadConfig() {
-  fetch('/config').then(r=>r.json()).then(d => {
+  fetch('/config').then(function(r) {
+    if (r.status === 401) { showAuthWall('config'); return null; }
+    hideAuthWall('config');
+    return r.json();
+  }).then(d => {
+    if (!d) return;
     document.getElementById('apMode').checked = d.apMode;
     document.getElementById('wifiSSID').value  = d.wifiSSID || '';
     document.getElementById('headingOffset').value = d.headingOffset != null ? d.headingOffset : 90;
@@ -652,9 +704,15 @@ function toggleAPFields() {
 
 document.getElementById('configForm').addEventListener('submit', function(e) {
   e.preventDefault();
+  const pw1 = document.getElementById('adminPassword').value;
+  const pw2 = document.getElementById('adminPassword2').value;
+  if (pw1 !== pw2) { toast('Passwords do not match', false); return; }
   const fd = new FormData(this);
   const data = {};
   for (const [k, v] of fd.entries()) data[k] = v;
+  // Remove confirm field — only send adminPassword if non-empty
+  delete data['adminPassword2'];
+  if (!pw1) delete data['adminPassword'];
   data.apMode = document.getElementById('apMode').checked ? 'true' : 'false';
   // Ensure unchecked source checkboxes are sent as false
   for (let i = 0; i < 3; i++) {
@@ -681,6 +739,23 @@ function saveBleNmea(cb) {
       else toast('Error saving BLE setting', false);
     }).catch(function() { toast('Error saving BLE setting', false); });
 }
+function doLogout() {
+  // Bust the browser's Basic Auth cache by sending a request with bogus credentials.
+  // The server always returns 401 for /logout, which causes the browser to discard
+  // the cached credentials so the next page visit requires re-entering the password.
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/logout', true, '__logged_out__', '__logged_out__');
+  xhr.onloadend = function() { window.location.href = '/'; };
+  xhr.send();
+}
+
+// Auto-logout when the tab or browser is closed
+window.addEventListener('beforeunload', function() {
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/logout', false, '__logged_out__', '__logged_out__'); // sync so it fires before unload
+  try { xhr.send(); } catch(e) {}
+});
+
 function doRestart() {
   if (!confirm('Restart the device?')) return;
   fetch('/restart', {method:'POST'}).then(() => toast('Restarting...')).catch(()=>{});

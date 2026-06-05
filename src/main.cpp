@@ -13,6 +13,7 @@
 #include "esp_system.h"
 #include "esp_ota_ops.h"
 #include "esp_http_server.h"
+#include "esp_https_server.h"
 #include "nvs_flash.h"
 #include "mdns.h"
 #include "driver/uart.h"
@@ -24,6 +25,9 @@
 #include "webui.h"
 #include "um982.h"
 #include "ble_nmea.h"
+
+#include "certs.h"
+#include "mbedtls/base64.h"
 
 // ── Utility macros ────────────────────────────────────────────────────────────
 
@@ -46,10 +50,10 @@ static inline uint32_t millis(void) {
 }
 
 // ── UART port assignments ─────────────────────────────────────────────────────
-// UART2 is used for NMEA because GPIO16/17 are UART2's NATIVE pins on ESP32 —
-// no GPIO matrix remapping needed, which avoids a silent RX failure in IDF 5.x.
-// UART1's default pins (GPIO9/10) are the SPI flash bus, so it must be remapped.
-// Same UART numbers as Arduino Serial1/Serial2 — both GPIO-matrix remapped.
+// UART1 → UM982 COM1 (NMEA):  GPIO16=RX, GPIO17=TX  @ 115200
+// UART2 → UM982 COM2 (RTCM):  GPIO19=RX, GPIO18=TX  @ 115200
+// Both are remapped via the GPIO matrix (driver-level pin_cfg), not native.
+// UART0 is reserved for USB/debug (Serial0).
 #define UART_NMEA  UART_NUM_1   // UM982 COM1 — NMEA in  (GPIO16=RX, GPIO17=TX)
 #define UART_RTCM  UART_NUM_2   // UM982 COM2 — RTCM out (GPIO19=RX, GPIO18=TX)
 
@@ -667,6 +671,9 @@ static void getApIP(char *out, size_t len) {
     strlcpy(out, "192.168.4.1", len);
 }
 
+// ── Forward declarations ──────────────────────────────────────────────────────
+static bool checkAuth(httpd_req_t *req);
+
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
 
 static esp_err_t handleRoot(httpd_req_t *req) {
@@ -744,6 +751,7 @@ static esp_err_t handleStatus(httpd_req_t *req) {
 }
 
 static esp_err_t handleGetConfig(httpd_req_t *req) {
+    if (!checkAuth(req)) return ESP_OK;
     Config &cfg = cfgMgr.cfg;
     // Build JSON manually — avoids pulling in cJSON for a one-time response
     char json[1024];
@@ -773,6 +781,7 @@ static esp_err_t handleGetConfig(httpd_req_t *req) {
 }
 
 static esp_err_t handleSaveConfig(httpd_req_t *req) {
+    if (!checkAuth(req)) return ESP_OK;
     char body[2048] = "";
     if (readBody(req, body, sizeof(body)) < 0) {
         httpd_resp_send_500(req);
@@ -811,7 +820,7 @@ static esp_err_t handleSaveConfig(httpd_req_t *req) {
         snprintf(key, sizeof(key), "n%duser", i);
         {
             bool ok = formGet(body, key, val, sizeof(val));
-            ESP_LOGI(TAG, "[Config] %s: found=%d decoded='%s'", key, ok, ok ? val : "");
+            ESP_LOGD(TAG, "[Config] %s: found=%d decoded='%s'", key, ok, ok ? val : "");
             if (ok && strlen(val) > 0)
                 strlcpy(cfg.ntrip[i].user, val, sizeof(cfg.ntrip[i].user));
         }
@@ -835,6 +844,8 @@ static esp_err_t handleSaveConfig(httpd_req_t *req) {
     if (formGet(body, "apPassword", val, sizeof(val)) && strlen(val) > 0 &&
         strcmp(val, "(unchanged)") != 0)
         strlcpy(cfg.apPassword, val, sizeof(cfg.apPassword));
+    if (formGet(body, "adminPassword", val, sizeof(val)) && strlen(val) > 0)
+        strlcpy(cfg.adminPassword, val, sizeof(cfg.adminPassword));
 
     cfgMgr.save();
     ntripUpdateEnabled();
@@ -848,7 +859,18 @@ static esp_err_t handleSaveConfig(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// Always returns 401 — used by client-side logout to bust the browser's Basic Auth cache
+static esp_err_t handleLogout(httpd_req_t *req) {
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"SailingComputer\"");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "Logged out");
+    return ESP_OK;
+}
+
 static esp_err_t handleRestart(httpd_req_t *req) {
+    if (!checkAuth(req)) return ESP_OK;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
     vTaskDelay(pdMS_TO_TICKS(300));
@@ -857,6 +879,7 @@ static esp_err_t handleRestart(httpd_req_t *req) {
 }
 
 static esp_err_t handleUM982Reset(httpd_req_t *req) {
+    if (!checkAuth(req)) return ESP_OK;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
     ESP_LOGI(TAG, "[Web] UM982 factory reset requested");
@@ -911,6 +934,7 @@ static const char OTA_FAIL_HTML[] =
     "</div></body></html>";
 
 static esp_err_t handleOTA(httpd_req_t *req) {
+    if (!checkAuth(req)) return ESP_OK;
     const esp_partition_t *update_part = esp_ota_get_next_update_partition(NULL);
     if (!update_part) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No OTA partition");
@@ -953,15 +977,66 @@ static esp_err_t handleOTA(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// ── Basic Auth helper ─────────────────────────────────────────────────────────
+// Returns true if the request carries valid admin credentials.
+// Sends a 401 response and returns false otherwise.
+static bool checkAuth(httpd_req_t *req) {
+    char auth[160] = "";
+    if (httpd_req_get_hdr_value_str(req, "Authorization", auth, sizeof(auth)) == ESP_OK
+        && strncmp(auth, "Basic ", 6) == 0)
+    {
+        unsigned char decoded[96] = {};
+        size_t outlen = 0;
+        if (mbedtls_base64_decode(decoded, sizeof(decoded)-1, &outlen,
+                                  (const unsigned char*)(auth+6), strlen(auth+6)) == 0) {
+            decoded[outlen] = '\0';
+            char expected[96];
+            snprintf(expected, sizeof(expected), "admin:%s", cfgMgr.cfg.adminPassword);
+            if (strcmp((char*)decoded, expected) == 0) return true;
+        }
+    }
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"SailingComputer\"");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "Unauthorized");
+    return false;
+}
+
+// ── HTTP→HTTPS redirect handler ───────────────────────────────────────────────
+static httpd_handle_t httpRedirectServer = NULL;
+
+static esp_err_t handleRedirect(httpd_req_t *req) {
+    char location[128];
+    // Get host header for redirect target
+    char host[64] = "";
+    httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host));
+    // Strip port if present
+    char *colon = strchr(host, ':');
+    if (colon) *colon = '\0';
+    if (strlen(host) == 0) strlcpy(host, "sailingcomputer.local", sizeof(host));
+    snprintf(location, sizeof(location), "https://%s%s", host, req->uri);
+    httpd_resp_set_status(req, "301 Moved Permanently");
+    httpd_resp_set_hdr(req, "Location", location);
+    httpd_resp_sendstr(req, "");
+    return ESP_OK;
+}
+
 // ── Web server setup ──────────────────────────────────────────────────────────
 
 static void startWebServer() {
-    httpd_config_t cfg      = HTTPD_DEFAULT_CONFIG();
-    cfg.max_open_sockets    = 7;
-    cfg.stack_size          = 8192;
+    // ── HTTPS server on port 443 ─────────────────────────────────────────────
+    httpd_ssl_config_t ssl_cfg         = HTTPD_SSL_CONFIG_DEFAULT();
+    ssl_cfg.httpd.max_open_sockets     = 2;  // 2 sessions × ~10KB each; lru_purge evicts idle ones
+    ssl_cfg.httpd.max_uri_handlers     = 12; // default is 8; we register 9 handlers
+    ssl_cfg.httpd.stack_size           = 10240;
+    ssl_cfg.httpd.lru_purge_enable     = true;
+    ssl_cfg.servercert                 = (const uint8_t *)server_cert_pem;
+    ssl_cfg.servercert_len             = sizeof(server_cert_pem);
+    ssl_cfg.prvtkey_pem                = (const uint8_t *)server_key_pem;
+    ssl_cfg.prvtkey_len                = sizeof(server_key_pem);
 
-    if (httpd_start(&webServer, &cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "[Web] Failed to start HTTP server");
+    if (httpd_ssl_start(&webServer, &ssl_cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "[Web] Failed to start HTTPS server");
         return;
     }
 
@@ -971,16 +1046,36 @@ static void startWebServer() {
         httpd_register_uri_handler(srv, &u);
     };
 
-    reg(webServer, "/",            HTTP_GET,  handleRoot);
-    reg(webServer, "/status",      HTTP_GET,  handleStatus);
-    reg(webServer, "/config",      HTTP_GET,  handleGetConfig);
-    reg(webServer, "/config/save", HTTP_POST, handleSaveConfig);
-    reg(webServer, "/restart",     HTTP_POST, handleRestart);
-    reg(webServer, "/um982reset",  HTTP_POST, handleUM982Reset);
-    reg(webServer, "/update",      HTTP_POST, handleOTA);
-    reg(webServer, "/ble/toggle",  HTTP_POST, handleBleToggle);
+    // Auth model: public = /, /status, /logout
+    //             HTTP Basic Auth required = all others (admin:adminPassword)
+    reg(webServer, "/",            HTTP_GET,  handleRoot);        // public — SPA HTML
+    reg(webServer, "/status",      HTTP_GET,  handleStatus);      // public — live GNSS/NTRIP JSON
+    reg(webServer, "/config",      HTTP_GET,  handleGetConfig);   // auth
+    reg(webServer, "/config/save", HTTP_POST, handleSaveConfig);  // auth
+    reg(webServer, "/restart",     HTTP_POST, handleRestart);     // auth
+    reg(webServer, "/um982reset",  HTTP_POST, handleUM982Reset);  // auth
+    reg(webServer, "/update",      HTTP_POST, handleOTA);         // auth — OTA firmware upload
+    reg(webServer, "/ble/toggle",  HTTP_POST, handleBleToggle);   // auth
+    reg(webServer, "/logout",      HTTP_GET,  handleLogout);      // public — always returns 401 to bust browser auth cache
 
-    ESP_LOGI(TAG, "[Web] HTTP server started");
+    ESP_LOGI(TAG, "[Web] HTTPS server started on port 443");
+
+    // ── HTTP redirect server on port 80 ──────────────────────────────────────
+    httpd_config_t http_cfg    = HTTPD_DEFAULT_CONFIG();
+    http_cfg.server_port       = 80;
+    http_cfg.max_open_sockets  = 4;
+    http_cfg.lru_purge_enable  = true;
+    http_cfg.stack_size        = 4096;
+    http_cfg.uri_match_fn      = httpd_uri_match_wildcard;
+
+    if (httpd_start(&httpRedirectServer, &http_cfg) == ESP_OK) {
+        httpd_uri_t redir = {
+            .uri = "/*", .method = HTTP_GET,
+            .handler = handleRedirect, .user_ctx = NULL
+        };
+        httpd_register_uri_handler(httpRedirectServer, &redir);
+        ESP_LOGI(TAG, "[Web] HTTP→HTTPS redirect on port 80");
+    }
 }
 
 // ── NMEA reader task (Core 1) ─────────────────────────────────────────────────

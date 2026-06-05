@@ -7,7 +7,7 @@ CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
 # HTTP server — enough headroom for large headers and concurrent OTA + status
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_HTTPD_MAX_URI_LEN=512
-CONFIG_HTTPD_MAX_OPEN_SOCKETS=8
+CONFIG_HTTPD_MAX_OPEN_SOCKETS=13
 
 # BLE / NimBLE (peripheral-only — we never scan or connect outward)
 CONFIG_BT_ENABLED=y
@@ -16,17 +16,36 @@ CONFIG_BT_CONTROLLER_ENABLED=y
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
 CONFIG_BT_NIMBLE_ROLE_OBSERVER_DISABLE=y
 CONFIG_BT_NIMBLE_ROLE_CENTRAL_DISABLE=y
+# Silence verbose NimBLE GATT/ATT internal logs (att_handle, GATT notify spam)
+CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
+CONFIG_BT_NIMBLE_LOG_LEVEL=1
 
 # mDNS
 CONFIG_MDNS_MAX_SERVICES=5
+
+# HTTPS server
+CONFIG_ESP_HTTPS_SERVER_ENABLE=y
+
+# mbedTLS — 4096-byte TLS records are enough for our small responses and fit easily
+# in heap. 16384 caused SSL_ALLOC_FAILED when Chrome opened 6+ parallel connections.
+# TLS records chunk automatically so large responses (HTML page) still work fine.
+CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=4096
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=n
+
+# lwIP — raise global socket limit above the default of 10.
+# HTTPS server (7) + HTTP redirect server (4) = 11 minimum; add headroom for NTRIP + TCP NMEA.
+CONFIG_LWIP_MAX_SOCKETS=16
 
 # OTA — allow plain HTTP (no TLS required on LAN)
 CONFIG_OTA_ALLOW_HTTP=y
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=n
 
-# Logging — INFO by default
+# Logging — INFO for app, suppress verbose bootloader output
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_DEFAULT_LEVEL=3
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+CONFIG_BOOTLOADER_LOG_LEVEL=2
 
 # Main task stack size
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

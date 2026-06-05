@@ -57,6 +57,7 @@ struct Config {
     bool        bleNmea;
     char        apSSID[64];
     char        apPassword[64];
+    char        adminPassword[64];  // HTTP Basic Auth for config/OTA pages
 };
 
 // Store/load float via its bit pattern — NVS has no native float type.
@@ -73,8 +74,9 @@ public:
         cfg.headingOffset = 90.0f;
         cfg.cogMinSog     = COG_MIN_SOG_DEFAULT;
         for (int i = 0; i < NTRIP_SOURCES; i++) cfg.ntrip[i].port = 2101;
-        strlcpy(cfg.apSSID,     DEFAULT_AP_SSID,     sizeof(cfg.apSSID));
-        strlcpy(cfg.apPassword, DEFAULT_AP_PASSWORD, sizeof(cfg.apPassword));
+        strlcpy(cfg.apSSID,       DEFAULT_AP_SSID,     sizeof(cfg.apSSID));
+        strlcpy(cfg.apPassword,   DEFAULT_AP_PASSWORD, sizeof(cfg.apPassword));
+        strlcpy(cfg.adminPassword, "admin",            sizeof(cfg.adminPassword));
     }
 
     void load() {
@@ -131,10 +133,12 @@ public:
         if (nvs_get_u32(h, "cogMinSog", &u) == ESP_OK) cfg.cogMinSog     = u2f(u);
         b = 0; nvs_get_u8(h, "bleNmea", &b); cfg.bleNmea = b;
 
-        len = sizeof(cfg.apSSID);     nvs_get_str(h, "apSSID", cfg.apSSID,     &len);
-        len = sizeof(cfg.apPassword); nvs_get_str(h, "apPass", cfg.apPassword, &len);
-        if (strlen(cfg.apSSID)     == 0) strlcpy(cfg.apSSID,     DEFAULT_AP_SSID,     sizeof(cfg.apSSID));
-        if (strlen(cfg.apPassword) == 0) strlcpy(cfg.apPassword, DEFAULT_AP_PASSWORD, sizeof(cfg.apPassword));
+        len = sizeof(cfg.apSSID);       nvs_get_str(h, "apSSID",    cfg.apSSID,       &len);
+        len = sizeof(cfg.apPassword);   nvs_get_str(h, "apPass",    cfg.apPassword,   &len);
+        len = sizeof(cfg.adminPassword);nvs_get_str(h, "adminPass", cfg.adminPassword,&len);
+        if (strlen(cfg.apSSID)       == 0) strlcpy(cfg.apSSID,       DEFAULT_AP_SSID,     sizeof(cfg.apSSID));
+        if (strlen(cfg.apPassword)   == 0) strlcpy(cfg.apPassword,   DEFAULT_AP_PASSWORD, sizeof(cfg.apPassword));
+        if (strlen(cfg.adminPassword)== 0) strlcpy(cfg.adminPassword,"admin",             sizeof(cfg.adminPassword));
 
         nvs_close(h);
     }
@@ -168,6 +172,7 @@ public:
         nvs_set_u8 (h, "bleNmea",   cfg.bleNmea ? 1 : 0);
         nvs_set_str(h, "apSSID",    cfg.apSSID);
         nvs_set_str(h, "apPass",    cfg.apPassword);
+        nvs_set_str(h, "adminPass", cfg.adminPassword);
 
         nvs_commit(h);
         nvs_close(h);
