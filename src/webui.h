@@ -212,7 +212,9 @@ inline const char* getWebUI() {
       <div class="stat"><div class="stat-label">IP Address</div><div class="stat-value" id="s-ip" style="font-size:0.9rem">--</div></div>
       <div class="stat"><div class="stat-label">NTRIP</div><div class="stat-value" id="s-ntrip">--</div></div>
       <div class="stat"><div class="stat-label">NTRIP Source</div><div class="stat-value" id="s-ntrip-src" style="font-size:0.85rem">--</div></div>
-      <div class="stat"><div class="stat-label">RTCM Bytes</div><div class="stat-value" id="s-rtcm">0</div></div>
+      <div class="stat"><div class="stat-label">RTCM In / UART</div><div class="stat-value" id="s-rtcm">0</div></div>
+      <div class="stat"><div class="stat-label">RTCM Frames / Type</div><div class="stat-value" id="s-rtcm-frames">0</div></div>
+      <div class="stat"><div class="stat-label">UM982 AUX UART</div><div class="stat-value" id="s-rtcm-uart">--</div></div>
       <div class="stat"><div class="stat-label">NMEA Bytes</div><div class="stat-value" id="s-nmea-bytes">0</div><div style="font-size:0.7rem;color:#8899aa;margin-top:2px" id="s-nmea-lines">-- sentences</div></div>
       <div class="stat" id="s-ble-tile" style="display:none"><div class="stat-label">Bluetooth GPS</div><div class="stat-value" id="s-ble">--</div></div>
     </div>
@@ -487,7 +489,13 @@ function updateStatus() {
     setText('s-wifimode', d.wifiMode || '--');
     var ip = d.wifiMode === 'AP' ? d.apIP : d.ip;
     setText('s-ip', ip || '--');
-    setText('s-rtcm', formatBytes(d.ntripBytesIn || 0));
+    setText('s-rtcm', formatBytes(d.ntripBytesIn || 0) + ' / ' +
+      formatBytes(d.ntripBytesToUart || 0));
+    setText('s-rtcm-frames', (d.rtcmFramesIn || 0) + ' / ' +
+      (d.rtcmLastType || '--'));
+    var rtcmUart = document.getElementById('s-rtcm-uart');
+    rtcmUart.textContent = d.rtcmUartProbeOk ? 'Responding' : 'No response';
+    rtcmUart.className = 'stat-value ' + (d.rtcmUartProbeOk ? 'ok' : 'err');
     setText('s-nmea-bytes', formatBytes(d.nmeaBytesRx || 0));
     var nmeaLines = d.nmeaLinesRx || 0;
     var nmea = document.getElementById('s-nmea-bytes');

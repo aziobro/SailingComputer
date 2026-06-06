@@ -32,20 +32,40 @@ static void um982FlushRx(uart_port_t port, uint32_t ms) {
 }
 
 static void um982ConfigureNMEA(uart_port_t port) {
-    um982Cmd(port, "UNLOGALL COM1");
+    // Configure the physical port receiving these commands. Omitting a COM
+    // argument avoids assuming how a particular UM982 breakout labels TX/RX.
+    um982Cmd(port, "UNLOG");
     um982FlushRx(port, 200);
-    um982Cmd(port, "LOG COM1 GNGGA ONTIME 1");
-    um982Cmd(port, "LOG COM1 GPHDT ONTIME 1");
-    um982Cmd(port, "LOG COM1 HEADINGA ONTIME 1");
-    um982Cmd(port, "LOG COM1 GPVTG ONTIME 1");
-    um982Cmd(port, "LOG COM1 GNRMC ONTIME 1");
+    um982Cmd(port, "GNGGA 1");
+    um982Cmd(port, "GPHDT 1");
+    um982Cmd(port, "HEADINGA 1");
+    um982Cmd(port, "GPVTG 1");
+    um982Cmd(port, "GNRMC 1");
 }
 
 static void um982ConfigureRTK(uart_port_t port) {
-    // Ensure COM2 baud matches RTCM stream from ESP32
-    um982Cmd(port, "CONFIG COM2 115200");
+    // Keep the auxiliary COM1 link at the diagnostic baud rate and force the
+    // receiver into rover mode. Corrections are injected on proven COM2.
+    um982Cmd(port, "CONFIG COM1 115200");
+    um982Cmd(port, "MODE ROVER");
     um982FlushRx(port, 200);
     um982Cmd(port, "SAVECONFIG");
+}
+
+static bool um982ProbePort(uart_port_t port) {
+    uart_write_bytes(port, "VERSION\r\n", 9);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    uint8_t buf[384];
+    int len = uart_read_bytes(port, buf, sizeof(buf) - 1, pdMS_TO_TICKS(200));
+    if (len <= 0) {
+        ESP_LOGW(UM982_TAG, "No response on auxiliary UM982 UART");
+        return false;
+    }
+    buf[len] = '\0';
+    for (int i = 0; i < len; i++)
+        if (buf[i] < 0x20 && buf[i] != '\n' && buf[i] != '\r') buf[i] = '.';
+    ESP_LOGI(UM982_TAG, "Auxiliary UART probe OK: %s", (char *)buf);
+    return true;
 }
 
 void um982Init(uart_port_t port) {

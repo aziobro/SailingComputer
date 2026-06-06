@@ -9,11 +9,15 @@
 #define DEFAULT_AP_SSID     "SailingComputer"
 #define DEFAULT_AP_PASSWORD "sailing123"
 
-// Serial (UART) pins
-#define SERIAL1_RX 16   // UM982 COM1 TX -> ESP32
-#define SERIAL1_TX 17   // ESP32 -> UM982 COM1 RX
-#define SERIAL2_RX 19   // UM982 COM2 TX -> ESP32
-#define SERIAL2_TX 18   // ESP32 -> UM982 COM2 RX (RTCM in)
+// Serial (UART) pins — ESP32-P4
+// UART2 (UART_NUM_2) → UM982 COM2 (NMEA/control + RTCM): GPIO32=RX, GPIO33=TX
+// UART1 (UART_NUM_1) → UM982 COM1 diagnostic link:       GPIO47=RX, GPIO48=TX
+// The COM identities were confirmed from the UM982 HEADINGA port header.
+#define SERIAL1_RX 32   // UM982 COM2 TX  → ESP32 GPIO32 (blue)
+#define SERIAL1_TX 33   // ESP32 GPIO33   → UM982 COM2 RX (green)
+#define SERIAL2_RX 47   // UM982 COM1 TX  → ESP32 GPIO47 (yellow, diagnostic)
+#define SERIAL2_TX 48   // ESP32 GPIO48   → UM982 COM1 RX (orange, diagnostic)
+#define PPS_PIN    27   // UM982 PPS      → ESP32 GPIO27 (white)
 
 #define NMEA_BAUD  115200
 #define RTCM_BAUD  115200

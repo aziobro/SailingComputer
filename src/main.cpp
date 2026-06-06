@@ -31,6 +31,9 @@
 
 #include "certs.h"
 #include "mbedtls/base64.h"
+#include "esp_efuse.h"
+#include "esp_mac.h"
+#include "esp_hosted.h"
 
 // ── Utility macros ────────────────────────────────────────────────────────────
 
@@ -52,13 +55,12 @@ static inline uint32_t millis(void) {
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
 }
 
-// ── UART port assignments ─────────────────────────────────────────────────────
-// UART1 → UM982 COM1 (NMEA):  GPIO16=RX, GPIO17=TX  @ 115200
-// UART2 → UM982 COM2 (RTCM):  GPIO19=RX, GPIO18=TX  @ 115200
-// Both are remapped via the GPIO matrix (driver-level pin_cfg), not native.
-// UART0 is reserved for USB/debug (Serial0).
-#define UART_NMEA  UART_NUM_1   // UM982 COM1 — NMEA in  (GPIO16=RX, GPIO17=TX)
-#define UART_RTCM  UART_NUM_2   // UM982 COM2 — RTCM out (GPIO19=RX, GPIO18=TX)
+// ── UART port assignments — ESP32-P4 ─────────────────────────────────────────
+// UART_NUM_2 → UM982 COM2 (NMEA/control + RTCM): GPIO32=RX, GPIO33=TX @ 115200
+// UART_NUM_1 → UM982 COM1 diagnostic link:       GPIO47=RX, GPIO48=TX @ 115200
+// UART_NUM_0 reserved for USB/debug.
+#define UART_NMEA  UART_NUM_2   // UM982 COM2 — NMEA/control
+#define UART_RTCM  UART_NUM_1   // UM982 COM1 — auxiliary/probe
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -84,7 +86,7 @@ static float driveSpeed         = 0;
 static bool  sailingMetricsValid = false;
 
 // Diagnostic counters
-static uint32_t nmeaBytesRx       = 0;  // raw bytes received from UART1 — 0 means UART broken
+static uint32_t nmeaBytesRx       = 0;  // raw bytes received from UART_NMEA
 static uint32_t nmeaLinesRx       = 0;  // complete NMEA sentences parsed
 static uint32_t nmeaOverflowDrops = 0;
 static uint32_t nmeaParseDrops    = 0;
@@ -111,9 +113,79 @@ static uint32_t ntripLastAttempt = 0;
 static uint32_t ntripBytesIn     = 0;
 static uint32_t ntripConnectTime = 0;
 static uint32_t ntripSessionBytes = 0;
+static uint32_t ntripBytesToUart = 0;
+static uint32_t rtcmFramesIn     = 0;
+static uint16_t rtcmLastType     = 0;
+static bool     rtcmUartProbeOk  = false;
 static int      ntripActiveIdx   = 0;
 static int      ntripFailCount   = 0;
 static bool     ntripAnyEnabled  = false;
+
+// RTCM3 framing: D3, 10-bit payload length, payload, then CRC24Q.
+static uint16_t rtcmPayloadRemaining = 0;
+static uint8_t  rtcmHeader[3] = {};
+static uint8_t  rtcmHeaderPos = 0;
+static uint8_t  rtcmCrcPos = 0;
+static uint32_t rtcmCrcCalc = 0;
+static uint32_t rtcmCrcReceived = 0;
+static uint16_t rtcmCurrentType = 0;
+static uint8_t  rtcmPayloadPos = 0;
+
+static uint32_t rtcmCrc24qByte(uint32_t crc, uint8_t data) {
+    crc ^= (uint32_t)data << 16;
+    for (int bit = 0; bit < 8; bit++) {
+        crc <<= 1;
+        if (crc & 0x1000000) crc ^= 0x1864CFB;
+    }
+    return crc & 0xFFFFFF;
+}
+
+static void countRtcmFrames(const uint8_t *data, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        uint8_t b = data[i];
+        if (rtcmPayloadRemaining > 0) {
+            if (rtcmPayloadPos == 0) {
+                rtcmCurrentType = (uint16_t)b << 4;
+            } else if (rtcmPayloadPos == 1) {
+                rtcmCurrentType |= b >> 4;
+            }
+            rtcmPayloadPos++;
+            rtcmCrcCalc = rtcmCrc24qByte(rtcmCrcCalc, b);
+            if (--rtcmPayloadRemaining == 0) rtcmCrcPos = 1;
+            continue;
+        }
+        if (rtcmCrcPos > 0) {
+            rtcmCrcReceived = (rtcmCrcReceived << 8) | b;
+            if (++rtcmCrcPos == 4) {
+                if (rtcmCrcReceived == rtcmCrcCalc) {
+                    rtcmFramesIn++;
+                    rtcmLastType = rtcmCurrentType;
+                }
+                rtcmCrcPos = 0;
+            }
+            continue;
+        }
+        if (rtcmHeaderPos == 0) {
+            if (b == 0xD3) {
+                rtcmHeader[0] = b;
+                rtcmHeaderPos = 1;
+                rtcmCrcCalc = rtcmCrc24qByte(0, b);
+            }
+            continue;
+        }
+        rtcmHeader[rtcmHeaderPos++] = b;
+        rtcmCrcCalc = rtcmCrc24qByte(rtcmCrcCalc, b);
+        if (rtcmHeaderPos == 3) {
+            rtcmPayloadRemaining =
+                ((uint16_t)(rtcmHeader[1] & 0x03) << 8) | rtcmHeader[2];
+            rtcmHeaderPos = 0;
+            rtcmCrcReceived = 0;
+            rtcmCurrentType = 0;
+            rtcmPayloadPos = 0;
+            rtcmCrcPos = rtcmPayloadRemaining == 0 ? 1 : 0;
+        }
+    }
+}
 
 // HTTP server handle
 static httpd_handle_t webServer = NULL;
@@ -272,41 +344,53 @@ static float nmeaToDeg(float val) {
     return deg + min / 60.0f;
 }
 
+// Split comma-separated NMEA fields in place while preserving empty fields.
+// strtok() cannot be used here because it collapses empty position fields
+// while the receiver has no fix.
+static int splitNmeaFields(char *line, char **fields, int maxFields) {
+    int count = 0;
+    char *p = line;
+    while (count < maxFields) {
+        fields[count++] = p;
+        char *comma = strchr(p, ',');
+        if (!comma) break;
+        *comma = '\0';
+        p = comma + 1;
+    }
+    if (count > 0) {
+        char *star = strchr(fields[count - 1], '*');
+        if (star) *star = '\0';
+    }
+    return count;
+}
+
 static void parseGGA(const char *s) {
     char buf[256]; strlcpy(buf, s, sizeof(buf));
-    char *tok = strtok(buf, ",");
-    int field = 0;
-    char latHemi = 'N', lonHemi = 'E';
-    while (tok) {
-        field++;
-        switch (field) {
-            case 3:  latitude   = nmeaToDeg(atof(tok)); break;
-            case 4:  latHemi    = tok[0]; break;
-            case 5:  longitude  = nmeaToDeg(atof(tok)); break;
-            case 6:  lonHemi    = tok[0]; break;
-            case 7:  fixQuality = atoi(tok); break;
-            case 8:  satCount   = atoi(tok); break;
-            case 9:  hdop       = atof(tok); break;
-            case 10: altitude   = atof(tok); break;
-        }
-        tok = strtok(NULL, ",");
+    char *f[16] = {};
+    int count = splitNmeaFields(buf, f, 16);
+    if (count < 10) return;
+
+    fixQuality = atoi(f[6]);
+    satCount   = atoi(f[7]);
+    hdop       = atof(f[8]);
+    altitude   = atof(f[9]);
+
+    if (f[2][0] && f[4][0]) {
+        latitude  = nmeaToDeg(atof(f[2]));
+        longitude = nmeaToDeg(atof(f[4]));
+        if (f[3][0] == 'S') latitude  = -latitude;
+        if (f[5][0] == 'W') longitude = -longitude;
     }
-    if (latHemi == 'S') latitude  = -latitude;
-    if (lonHemi == 'W') longitude = -longitude;
 }
 
 static void parseHDT(const char *s) {
     char buf[256]; strlcpy(buf, s, sizeof(buf));
-    char *tok = strtok(buf, ",");
-    int field = 0;
-    while (tok) {
-        field++;
-        if (field == 2 && strlen(tok) > 0) {
-            heading  = applyHeadingOffset(atof(tok));
-            hdtValid = true;
-            updateSailingMetrics();
-        }
-        tok = strtok(NULL, ",");
+    char *f[4] = {};
+    int count = splitNmeaFields(buf, f, 4);
+    if (count > 1 && f[1][0]) {
+        heading  = applyHeadingOffset(atof(f[1]));
+        hdtValid = true;
+        updateSailingMetrics();
     }
 }
 
@@ -328,14 +412,10 @@ static void updateCOG(float rawCog, float speedKts) {
 
 static void parseVTG(const char *s) {
     char buf[256]; strlcpy(buf, s, sizeof(buf));
-    char *tok = strtok(buf, ",");
-    int field = 0; float rawCog = cog;
-    while (tok) {
-        field++;
-        if (field == 2) rawCog = atof(tok);
-        if (field == 6) sog    = atof(tok);
-        tok = strtok(NULL, ",");
-    }
+    char *f[12] = {};
+    int count = splitNmeaFields(buf, f, 12);
+    float rawCog = (count > 1 && f[1][0]) ? atof(f[1]) : cog;
+    if (count > 5 && f[5][0]) sog = atof(f[5]);
     cog = rawCog;
     updateCOG(rawCog, sog);
     updateSailingMetrics();
@@ -655,13 +735,19 @@ static void ntripLoop() {
     static uint32_t lastGgaTx = 0;
     if (millis() - lastGgaTx > 3000) { ntripSendGGA(); lastGgaTx = millis(); }
 
-    // Read RTCM and forward to UM982 COM2
+    // Inject corrections on COM2, whose receiver input is already proven by
+    // the successful startup configuration commands. NMEA output is on the
+    // opposite wire of this full-duplex UART and is unaffected.
     uint8_t buf[256];
     int n = recv(ntripSock, buf, sizeof(buf), MSG_DONTWAIT);
     if (n > 0) {
-        int written = uart_write_bytes(UART_RTCM, (const char *)buf, n);
+        countRtcmFrames(buf, n);
+        if (uartNmeaMtx) xSemaphoreTake(uartNmeaMtx, portMAX_DELAY);
+        int written = uart_write_bytes(UART_NMEA, (const char *)buf, n);
+        if (uartNmeaMtx) xSemaphoreGive(uartNmeaMtx);
         if (written < n)
             ESP_LOGW(TAG, "[NTRIP%d] RTCM UART short write %d/%d", ntripActiveIdx, written, n);
+        if (written > 0) ntripBytesToUart += written;
         ntripBytesIn      += n;
         ntripSessionBytes += n;
     } else if (n == 0) {
@@ -699,6 +785,20 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     }
 }
 
+// ESP32-P4 hosted WiFi can't read MAC from C6 coprocessor in ESP-IDF 5.3.2,
+// so derive a locally-administered MAC from the chip's own eFuse ID instead.
+static void setWifiMacFromEfuse(wifi_interface_t iface) {
+    uint8_t base[6] = {};
+    esp_efuse_mac_get_default(base);
+    // Bit 1 of first byte = locally administered, bit 0 = unicast
+    base[0] = (base[0] & 0xFE) | 0x02;
+    if (iface == WIFI_IF_AP) base[5] ^= 0x01;  // differentiate AP from STA
+    esp_err_t err = esp_wifi_set_mac(iface, base);
+    ESP_LOGI(TAG, "[WiFi] MAC set %02x:%02x:%02x:%02x:%02x:%02x (%s)",
+             base[0], base[1], base[2], base[3], base[4], base[5],
+             err == ESP_OK ? "ok" : esp_err_to_name(err));
+}
+
 static void startAP() {
     Config &cfg = cfgMgr.cfg;
     esp_netif_create_default_wifi_ap();
@@ -710,6 +810,7 @@ static void startAP() {
     wcfg.ap.authmode       = strlen(cfg.apPassword) >= 8 ?
                              WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     esp_wifi_set_mode(WIFI_MODE_AP);
+    setWifiMacFromEfuse(WIFI_IF_AP);
     esp_wifi_set_config(WIFI_IF_AP, &wcfg);
     esp_wifi_start();
     ESP_LOGI(TAG, "[WiFi] AP: %s", cfg.apSSID);
@@ -722,6 +823,7 @@ static void startSTA() {
     strlcpy((char *)wcfg.sta.ssid,     cfg.wifiSSID,     sizeof(wcfg.sta.ssid));
     strlcpy((char *)wcfg.sta.password, cfg.wifiPassword, sizeof(wcfg.sta.password));
     esp_wifi_set_mode(WIFI_MODE_STA);
+    setWifiMacFromEfuse(WIFI_IF_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wcfg);
     esp_wifi_start();
     esp_wifi_connect();
@@ -823,6 +925,10 @@ static esp_err_t handleStatus(httpd_req_t *req) {
         "\"ntripConnected\":%s,"
         "\"ntripActiveIdx\":%d,"
         "\"ntripBytesIn\":%u,"
+        "\"ntripBytesToUart\":%u,"
+        "\"rtcmFramesIn\":%u,"
+        "\"rtcmLastType\":%u,"
+        "\"rtcmUartProbeOk\":%s,"
         "\"nmeaBytesRx\":%u,"
         "\"nmeaLinesRx\":%u,"
         "\"nmeaOverflowDrops\":%u,"
@@ -849,7 +955,9 @@ static esp_err_t handleStatus(httpd_req_t *req) {
         bleEnabled           ? "true" : "false",
         bleConnected         ? "true" : "false",
         ntripConnected       ? "true" : "false",
-        ntripActiveIdx+1, ntripBytesIn,
+        ntripActiveIdx+1, ntripBytesIn, ntripBytesToUart,
+        rtcmFramesIn, rtcmLastType,
+        rtcmUartProbeOk ? "true" : "false",
         nmeaBytesRx, nmeaLinesRx,
         nmeaOverflowDrops, nmeaParseDrops, nmeaOutputDrops, nmeaTcpDrops,
         bleDropCount,
@@ -1221,6 +1329,9 @@ static void nmeaRxTask(void *param) {
     NmeaMessage msg = {};
     size_t idx = 0;
     bool overflow = false;
+    uint32_t lastDiag = millis();
+    uint32_t lastDiagBytes = 0;
+    unsigned rawLinesLogged = 0;
 
     for (;;) {
         if (uartNmeaMtx && xSemaphoreTake(uartNmeaMtx, pdMS_TO_TICKS(20)) != pdTRUE) {
@@ -1229,31 +1340,45 @@ static void nmeaRxTask(void *param) {
         }
         int r = uart_read_bytes(UART_NMEA, buf, sizeof(buf), pdMS_TO_TICKS(10));
         if (uartNmeaMtx) xSemaphoreGive(uartNmeaMtx);
-        if (r <= 0) continue;
 
-        nmeaBytesRx += (uint32_t)r;
-        for (int i = 0; i < r; i++) {
-            char c = (char)buf[i];
-            if (c == '\n') {
-                if (overflow) {
-                    nmeaOverflowDrops++;
-                } else {
-                    msg.line[idx] = '\0';
-                    if (idx > 5) {
-                        if (xQueueSend(nmeaParseQueue, &msg, 0) != pdTRUE)
-                            nmeaParseDrops++;
+        if (r > 0) {
+            nmeaBytesRx += (uint32_t)r;
+            for (int i = 0; i < r; i++) {
+                char c = (char)buf[i];
+                if (c == '\n') {
+                    if (overflow) {
+                        nmeaOverflowDrops++;
+                    } else {
+                        msg.line[idx] = '\0';
+                        if (idx > 5) {
+                            if (rawLinesLogged < 8) {
+                                ESP_LOGI(TAG, "[NMEA] RX: %s", msg.line);
+                                rawLinesLogged++;
+                            }
+                            if (xQueueSend(nmeaParseQueue, &msg, 0) != pdTRUE)
+                                nmeaParseDrops++;
+                        }
+                    }
+                    idx = 0;
+                    overflow = false;
+                    msg = {};
+                } else if (c != '\r') {
+                    if (!overflow && idx < sizeof(msg.line) - 1) {
+                        msg.line[idx++] = c;
+                    } else {
+                        overflow = true;
                     }
                 }
-                idx = 0;
-                overflow = false;
-                msg = {};
-            } else if (c != '\r') {
-                if (!overflow && idx < sizeof(msg.line) - 1) {
-                    msg.line[idx++] = c;
-                } else {
-                    overflow = true;
-                }
             }
+        }
+
+        uint32_t now = millis();
+        if (now - lastDiag >= 5000) {
+            uint32_t bytesNow = nmeaBytesRx;
+            ESP_LOGI(TAG, "[NMEA] UART bytes +%u, total %u, lines %u",
+                     bytesNow - lastDiagBytes, bytesNow, nmeaLinesRx);
+            lastDiagBytes = bytesNow;
+            lastDiag = now;
         }
     }
 }
@@ -1319,10 +1444,9 @@ extern "C" void app_main(void) {
     uartNmeaMtx  = xSemaphoreCreateMutex();
     ntripUpdateEnabled();
 
-    // ── UART setup — exact sequence from Arduino ESP32 core ─────────────────
-    // Order: param_config → set_pin → driver_install (matches Arduino internals).
+    // ── UART setup ───────────────────────────────────────────────────────────
+    // Order: param_config → set_pin → driver_install.
     // No explicit gpio_set_direction — uart_set_pin handles it.
-    // No loopback test — uart_set_loop_back bypasses GPIO16 and proved nothing.
     uart_config_t uc = {};
     uc.baud_rate           = NMEA_BAUD;
     uc.data_bits           = UART_DATA_8_BITS;
@@ -1345,36 +1469,52 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "[Boot] UART initialized");
 
     um982Init(UART_NMEA);
+    rtcmUartProbeOk = um982ProbePort(UART_RTCM);
 
     // ── WiFi ────────────────────────────────────────────────────────────────
     esp_netif_init();
     esp_event_loop_create_default();
 
+    esp_err_t hosted_err = (esp_err_t)esp_hosted_init();
+    if (hosted_err == ESP_OK)
+        hosted_err = (esp_err_t)esp_hosted_connect_to_slave();
+    if (hosted_err != ESP_OK) {
+        ESP_LOGE(TAG, "[WiFi] ESP-Hosted transport failed: %s",
+                 esp_err_to_name(hosted_err));
+        return;
+    }
+
     wifi_init_config_t wifi_init = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&wifi_init);
-    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    esp_err_t wifi_err = esp_wifi_init(&wifi_init);
+    if (wifi_err != ESP_OK) {
+        ESP_LOGE(TAG, "[WiFi] ESP-Hosted initialization failed: %s",
+                 esp_err_to_name(wifi_err));
+        return;
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
     esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
 
     Config &cfg = cfgMgr.cfg;
-    if (cfg.apMode || strlen(cfg.wifiSSID) == 0) {
-        cfg.apMode = true;
-        startAP();
-    } else {
-        startSTA();
-        // Wait up to WIFI_CONNECT_TIMEOUT_MS for connection
-        uint32_t t0 = millis();
-        while (!staConnected && (millis() - t0) < WIFI_CONNECT_TIMEOUT_MS)
-            vTaskDelay(pdMS_TO_TICKS(200));
-        if (!staConnected) {
-            ESP_LOGW(TAG, "[WiFi] STA failed — falling back to AP");
+    {
+        if (cfg.apMode || strlen(cfg.wifiSSID) == 0) {
             cfg.apMode = true;
-            esp_wifi_stop();
             startAP();
+        } else {
+            startSTA();
+            uint32_t t0 = millis();
+            while (!staConnected && (millis() - t0) < WIFI_CONNECT_TIMEOUT_MS)
+                vTaskDelay(pdMS_TO_TICKS(200));
+            if (!staConnected) {
+                ESP_LOGW(TAG, "[WiFi] STA failed — falling back to AP");
+                cfg.apMode = true;
+                esp_wifi_stop();
+                startAP();
+            }
         }
     }
-
     // ── mDNS ────────────────────────────────────────────────────────────────
     mdns_init();
     mdns_hostname_set("sailingcomputer");
