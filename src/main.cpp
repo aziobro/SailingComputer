@@ -2173,6 +2173,54 @@ static esp_err_t handleTrackSegStop(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// POST /tracks/segment/export — export loop slice with explicit {t0, t1} unix timestamps
+static esp_err_t handleTrackExportSegment(httpd_req_t *req) {
+    uint64_t sdTotal = 0, sdUsed = 0;
+    if (!storageMgr.mounted || !storageMgr.isSdCard() ||
+        !storageMgr.getInfo(&sdTotal, &sdUsed) ||
+        (sdTotal - sdUsed) < 2ULL * 1024 * 1024) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"SD card full or unavailable\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    char body[64] = {};
+    int blen = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (blen <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"empty body\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    cJSON *j   = cJSON_Parse(body);
+    cJSON *jt0 = j ? cJSON_GetObjectItem(j, "t0") : NULL;
+    cJSON *jt1 = j ? cJSON_GetObjectItem(j, "t1") : NULL;
+    if (!cJSON_IsNumber(jt0) || !cJSON_IsNumber(jt1)) {
+        if (j) cJSON_Delete(j);
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"t0 and t1 required\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    uint32_t t0 = (uint32_t)jt0->valuedouble;
+    uint32_t t1 = (uint32_t)jt1->valuedouble;
+    cJSON_Delete(j);
+    if (t0 >= t1) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"t0 must be before t1\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    bool ok = trackRec.exportSegment(t0, t1);
+    char resp[128];
+    snprintf(resp, sizeof(resp), "{\"ok\":%s,\"file\":\"%s\"}",
+             ok ? "true" : "false",
+             ok ? trackRec.lastFileName() : "");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 // POST /tracks/config — update recording rate and loop duration, persist to NVS
 static esp_err_t handleTrackConfig(httpd_req_t *req) {
     char body[128] = {};
@@ -2275,8 +2323,9 @@ static void startWebServer() {
     reg(webServer, "/tracks/status",     HTTP_GET,  handleTrackStatus);     // public — track state
     reg(webServer, "/tracks/loop/start", HTTP_POST, handleTrackLoopStart);  // public — start loop
     reg(webServer, "/tracks/loop/stop",  HTTP_POST, handleTrackLoopStop);   // public — stop loop
-    reg(webServer, "/tracks/segment/start", HTTP_POST, handleTrackSegStart);// public — mark start
-    reg(webServer, "/tracks/segment/stop",  HTTP_POST, handleTrackSegStop); // public — mark stop + export
+    reg(webServer, "/tracks/segment/start",  HTTP_POST, handleTrackSegStart);    // public — mark start
+    reg(webServer, "/tracks/segment/stop",   HTTP_POST, handleTrackSegStop);     // public — mark stop + export
+    reg(webServer, "/tracks/segment/export", HTTP_POST, handleTrackExportSegment);// public — export with t0/t1
     reg(webServer, "/tracks/config",     HTTP_POST, handleTrackConfig);     // auth — save settings
 
     ESP_LOGI(TAG, "[Web] HTTPS server started on port 443");

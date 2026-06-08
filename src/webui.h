@@ -546,25 +546,35 @@ inline const char* getWebUI() {
       Initializing…
     </div>
 
-    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:1rem">
+    <div style="margin-bottom:1rem">
       <button id="trackLoopBtn" onclick="toggleTrackLoop()" style="min-width:200px">Enable Loop Recording</button>
-      <button id="trackSegBtn"  onclick="toggleTrackSeg()"  style="min-width:150px" disabled>Select Start</button>
     </div>
 
-    <div id="trackFileStatus" style="display:none;padding:.5rem .75rem;border-radius:6px;
-         background:#1a3a1a;color:#4caf82;font-size:.9rem;margin-top:.5rem">
-      ✓ File written: <span id="trackFileName"></span>
+    <!-- Export segment — shown once loop has data -->
+    <div id="trackExportSection" style="display:none">
+      <hr style="border-color:#1a2a3a;margin-bottom:1rem">
+      <div style="font-size:.88rem;color:#8ab0cc;margin-bottom:.75rem;font-weight:600">Export Segment</div>
+      <div style="margin-bottom:.75rem">
+        <div style="display:flex;justify-content:space-between;margin-bottom:.25rem">
+          <label style="font-size:.83rem;color:#aaa">Start</label>
+          <span id="trackT0Label" style="font-size:.8rem;font-family:monospace;color:#4caf82">--</span>
+        </div>
+        <input type="range" id="trackT0" style="width:100%;accent-color:#4caf82" oninput="onTrackT0()">
+      </div>
+      <div style="margin-bottom:.75rem">
+        <div style="display:flex;justify-content:space-between;margin-bottom:.25rem">
+          <label style="font-size:.83rem;color:#aaa">End</label>
+          <span id="trackT1Label" style="font-size:.8rem;font-family:monospace;color:#4caf82">--</span>
+        </div>
+        <input type="range" id="trackT1" style="width:100%;accent-color:#4caf82" oninput="onTrackT1()">
+      </div>
+      <div id="trackExportDur" style="font-size:.8rem;color:#888;margin-bottom:.75rem">Duration: --</div>
+      <button id="trackExportBtn" onclick="exportTrackSegment()">Export GPX</button>
+      <div id="trackFileStatus" style="display:none;padding:.5rem .75rem;border-radius:6px;
+           background:#1a3a1a;color:#4caf82;font-size:.9rem;margin-top:.75rem">
+        ✓ File written: <span id="trackFileName"></span>
+      </div>
     </div>
-
-    <p style="font-size:.78rem;color:#666;margin-top:1rem;line-height:1.5">
-      The loop continuously records to a circular buffer on the SD card.
-      <strong>Select Start</strong> marks a timestamp in the buffer —
-      no separate file is written yet.
-      <strong>Select Stop</strong> extracts that segment from the buffer
-      and writes the GPX file.
-      If power is lost between Start and Stop, the buffer data survives
-      and can be recovered by restarting the loop and re-marking the segment.
-    </p>
   </div>
 
   <div class="card">
@@ -1886,26 +1896,41 @@ function renderTrackPage(d) {
   lb.disabled = !sdOk;
   lb.textContent = d.loopRunning ? 'Disable Loop Recording' : 'Enable Loop Recording';
 
-  // Segment button
-  var sb = document.getElementById('trackSegBtn');
-  sb.disabled = !sdOk || !d.loopRunning || sdLow;
-  if (d.segActive) {
-    var t = new Date(d.segStartTs * 1000);
-    // toISOString() → "2024-01-15T14:23:00.000Z"; drop milliseconds for display
-    var iso = t.toISOString().replace('T',' ').slice(0,19) + 'Z';
-    sb.textContent = '■ Select Stop (started ' + iso + ')';
-    sb.style.background = '#8B1A1A';
-  } else {
-    sb.textContent = 'Select Start';
-    sb.style.background = '';
+  // Export segment sliders — show when buffer has data
+  var firstTs = d.firstTs || 0;
+  var lastTs  = d.lastTs  || 0;
+  var hasData = (d.count > 0) && (firstTs > 0);
+  var exportSec = document.getElementById('trackExportSection');
+  exportSec.style.display = hasData ? '' : 'none';
+
+  if (hasData) {
+    trackSliderMin = firstTs;
+    trackSliderMax = lastTs;
+    var t0el = document.getElementById('trackT0');
+    var t1el = document.getElementById('trackT1');
+    t0el.min = t1el.min = String(firstTs);
+    t0el.max = t1el.max = String(lastTs);
+    t0el.step = t1el.step = '60';
+    if (!trackSliderInit) {
+      // First time data is available — set to full buffer range
+      t0el.value = String(firstTs);
+      t1el.value = String(lastTs);
+      trackSliderInit = true;
+    } else {
+      // If end slider was at the old max, auto-advance to new latest point
+      var prevMax = parseInt(t1el._prevMax || lastTs);
+      if (parseInt(t1el.value) >= prevMax) t1el.value = String(lastTs);
+    }
+    t1el._prevMax = String(lastTs);
+    updateTrackExportLabels();
   }
 
-  // File written status
+  // File written status (last successful export)
   var fw = document.getElementById('trackFileStatus');
   if (d.fileReady && d.lastFile) {
     document.getElementById('trackFileName').textContent = d.lastFile;
     fw.style.display = 'block';
-  } else {
+  } else if (!d.fileReady) {
     fw.style.display = 'none';
   }
 
@@ -1927,14 +1952,63 @@ function toggleTrackLoop() {
     .catch(function() { toast('Request failed', false); });
 }
 
-function toggleTrackSeg() {
-  var active = document.getElementById('trackSegBtn').textContent.indexOf('Stop') >= 0;
-  var url = active ? '/tracks/segment/stop' : '/tracks/segment/start';
-  fetch(url, {method:'POST'}).then(function(r) { return r.json(); }).then(function(d) {
-    if (!d.ok) { toast(d.error || 'Failed', false); return; }
-    if (active && d.file) toast('Track saved: ' + d.file);
-    loadTrackStatus();
-  }).catch(function() { toast('Request failed', false); });
+var trackSliderMin = 0, trackSliderMax = 0, trackSliderInit = false;
+
+function fmtUtcTs(ts) {
+  if (!ts) return '--';
+  return new Date(ts * 1000).toISOString().replace('T',' ').slice(0,19) + 'Z';
+}
+
+function updateTrackExportLabels() {
+  var t0 = parseInt(document.getElementById('trackT0').value) || 0;
+  var t1 = parseInt(document.getElementById('trackT1').value) || 0;
+  document.getElementById('trackT0Label').textContent = fmtUtcTs(t0);
+  document.getElementById('trackT1Label').textContent = fmtUtcTs(t1);
+  var dur = t1 > t0 ? t1 - t0 : 0;
+  var ds = dur < 60   ? dur + 's'
+         : dur < 3600 ? Math.floor(dur/60) + 'm ' + (dur%60) + 's'
+         : Math.floor(dur/3600) + 'h ' + (Math.floor(dur/60)%60) + 'm';
+  document.getElementById('trackExportDur').textContent = 'Duration: ' + (dur > 0 ? ds : '--');
+}
+
+function onTrackT0() {
+  var t0 = parseInt(document.getElementById('trackT0').value);
+  var t1el = document.getElementById('trackT1');
+  if (t0 >= parseInt(t1el.value)) t1el.value = String(Math.min(t0 + 60, trackSliderMax));
+  updateTrackExportLabels();
+}
+
+function onTrackT1() {
+  var t1 = parseInt(document.getElementById('trackT1').value);
+  var t0el = document.getElementById('trackT0');
+  if (t1 <= parseInt(t0el.value)) t0el.value = String(Math.max(t1 - 60, trackSliderMin));
+  updateTrackExportLabels();
+}
+
+function exportTrackSegment() {
+  var t0 = parseInt(document.getElementById('trackT0').value);
+  var t1 = parseInt(document.getElementById('trackT1').value);
+  if (t0 >= t1) { toast('Start must be before end', false); return; }
+  var btn = document.getElementById('trackExportBtn');
+  btn.disabled = true; btn.textContent = 'Exporting…';
+  fetch('/tracks/segment/export', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({t0:t0, t1:t1})
+  }).then(function(r){return r.json();}).then(function(d){
+    btn.disabled = false; btn.textContent = 'Export GPX';
+    if (d.ok) {
+      toast('Track saved: ' + d.file);
+      document.getElementById('trackFileName').textContent = d.file;
+      document.getElementById('trackFileStatus').style.display = 'block';
+      loadTrackStatus();
+    } else {
+      toast(d.error || 'Export failed', false);
+    }
+  }).catch(function(){
+    btn.disabled = false; btn.textContent = 'Export GPX';
+    toast('Request failed', false);
+  });
 }
 
 function toggleTrackSettings() {
