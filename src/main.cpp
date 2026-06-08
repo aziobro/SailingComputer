@@ -1496,23 +1496,6 @@ static esp_err_t handleStorageInfo(httpd_req_t *req) {
 
 // ── File manager HTTP handlers ────────────────────────────────────────────────
 
-// httpd_query_key_value returns the raw percent-encoded string; decode it.
-static void urlDecode(char *dst, const char *src, size_t dstSize) {
-    size_t di = 0;
-    for (size_t i = 0; src[i] && di + 1 < dstSize; i++) {
-        if (src[i] == '%' && src[i+1] && src[i+2]) {
-            char hex[3] = { src[i+1], src[i+2], '\0' };
-            dst[di++] = (char)strtol(hex, nullptr, 16);
-            i += 2;
-        } else if (src[i] == '+') {
-            dst[di++] = ' ';
-        } else {
-            dst[di++] = src[i];
-        }
-    }
-    dst[di] = '\0';
-}
-
 // Read the "path" query parameter and percent-decode it into dst.
 static void queryPath(httpd_req_t *req, char *dst, size_t dstSize) {
     dst[0] = '\0';
