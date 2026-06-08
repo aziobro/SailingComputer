@@ -1883,7 +1883,7 @@ function renderTrackPage(d) {
   // Loop start/stop button
   var lb = document.getElementById('trackLoopBtn');
   lb.disabled = !sdOk;
-  lb.textContent = d.loopRunning ? '&#9632; Stop Loop' : '&#9654; Start Loop';
+  lb.textContent = d.loopRunning ? '■ Stop Loop' : '▶ Start Loop';
 
   // Segment button
   var sb = document.getElementById('trackSegBtn');
@@ -1892,7 +1892,7 @@ function renderTrackPage(d) {
     var t = new Date(d.segStartTs * 1000);
     // toISOString() → "2024-01-15T14:23:00.000Z"; drop milliseconds for display
     var iso = t.toISOString().replace('T',' ').slice(0,19) + 'Z';
-    sb.textContent = '&#9632; Select Stop (started ' + iso + ')';
+    sb.textContent = '■ Select Stop (started ' + iso + ')';
     sb.style.background = '#8B1A1A';
   } else {
     sb.textContent = 'Select Start';
