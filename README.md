@@ -22,6 +22,7 @@ An ESP32-P4-based sailing computer using the **Unicore UM982** dual-antenna GNSS
 - **Race navigation** — bearing, distance, and ETA to next mark; previous/next mark controls
 - **Race stats** — elapsed time, leg splits, and marks-rounded summary on race completion
 - **SD card file manager** — browse, rename, copy, delete files and directories; format SD card
+- **Track recording** — continuous loop buffer on SD card, GPX 1.1 export with heading/heel/SOG/COG extensions, configurable recording interval (1–60 s) and loop duration (1–24 h)
 
 ---
 
@@ -109,7 +110,7 @@ Use the included `flash.sh` script, or update manually:
 
 ## Web Interface
 
-The single-page app has six tabs in the navigation bar.
+The single-page app has seven tabs in the navigation bar.
 
 ### Status (public — no login required)
 
@@ -185,6 +186,18 @@ Displayed after **End Race** or automatic completion at the last mark:
 - **Add mark** — enter name + lat/lon manually, or tap "Use GPS Position" to capture current position
 - **Course list** — view saved courses with mark sequences and rounding directions
 - **GPX import** — upload a `.gpx` file to bulk-import waypoints as marks and routes as courses
+
+### Tracks (public)
+
+Loop-buffer track recording and GPX export.
+
+- **Loop recording** — Start/Stop toggle runs a circular buffer on SD card at `/sdcard/tracks/.loop.bin`; recording pauses automatically when GPS fix is lost
+- **Segment extraction** — tap **Select Start** to mark the beginning of a named segment; tap **Select Stop** to export the loop slice as a GPX file
+- **File written indicator** — shows the filename of the last successfully exported GPX
+- **Recording Settings** — configure recording interval (1 / 5 / 10 / 30 / 60 s) and loop buffer duration (1 – 24 h); changing these settings recreates the loop file
+- Downloaded via the Files tab — no separate download UI
+
+GPX files are written to `/sdcard/tracks/` and named `track_YYYYMMDD_HHMMSSz_to_HHMMSSz.gpx`.  Each `<trkpt>` includes extensions `<sc:hdt>`, `<sc:heel>`, `<sc:sog>`, `<sc:cog>`.
 
 ### Files (public)
 
@@ -275,6 +288,7 @@ SailingComputer/
     ├── config.h            # Config struct + NVS load/save (ConfigManager)
     ├── storage.h           # StorageManager — SD card / SPIFFS, marks, courses JSON
     ├── gpx.h               # GPX file parser (waypoints → marks, routes → courses)
+    ├── track.h             # TrackRecorder — circular loop buffer + GPX export
     ├── um982.h             # UM982 UART init, command helpers, factory reset
     ├── ble_nmea.h          # BLE NUS + HM-10 GATT server for NMEA broadcast
     ├── certs.h             # TLS cert + key as embedded C string literals
@@ -305,6 +319,19 @@ Race state machine: `idle` → `countdown` → `racing` → `complete`
 
 ---
 
+## Track API
+
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | `/tracks/status` | Loop state JSON (running, count, timestamps, segment, last file) |
+| POST | `/tracks/loop/start` | Start loop recording |
+| POST | `/tracks/loop/stop` | Stop loop recording (also cancels open segment) |
+| POST | `/tracks/segment/start` | Mark current GPS time as segment start |
+| POST | `/tracks/segment/stop` | Mark end, export loop slice to GPX file |
+| POST | `/tracks/config` | `{"intervalSec":5,"loopHours":3}` — save settings + rebuild loop |
+
+---
+
 ## Configuration Reference
 
 All settings stored in NVS namespace `sailcomp`.
@@ -327,6 +354,8 @@ All settings stored in NVS namespace `sailcomp`.
 | `cogMinSog` | float | COG freeze threshold in knots (default 0.1) |
 | `bleNmea` | bool | BLE NMEA broadcast enabled |
 | `gpsRate` | uint8 | GPS update rate in Hz (1/2/5/10/20) |
+| `trackInterval` | uint8 | Track recording interval in seconds (default 5) |
+| `trackLoopHrs` | uint8 | Loop buffer duration in hours (default 3) |
 
 ---
 

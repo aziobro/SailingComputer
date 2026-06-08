@@ -73,6 +73,7 @@ inline const char* getWebUI() {
   <button onclick="showPage('config',this)">Configuration</button>
   <button onclick="showPage('start',this)">Race</button>
   <button onclick="showPage('marks',this)">Marks/Routes</button>
+  <button onclick="showPage('tracks',this)">Tracks</button>
   <button onclick="showPage('files',this)">Files</button>
   <button onclick="showPage('system',this)">System</button>
   <button class="logout" onclick="doLogout()">&#x23FB; Log Out</button>
@@ -533,6 +534,58 @@ inline const char* getWebUI() {
 
 </div>
 
+<!-- TRACKS PAGE -->
+<div id="tracks" class="page">
+
+  <div class="card">
+    <h2>Track Recording</h2>
+    <div id="trackStatusLine" style="margin-bottom:1rem;font-size:.9rem;color:#aaa">
+      Initializing…
+    </div>
+
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:1rem">
+      <button id="trackLoopBtn" onclick="toggleTrackLoop()" style="min-width:130px">▶ Start Loop</button>
+      <button id="trackSegBtn"  onclick="toggleTrackSeg()"  style="min-width:150px" disabled>Select Start</button>
+    </div>
+
+    <div id="trackFileStatus" style="display:none;padding:.5rem .75rem;border-radius:6px;
+         background:#1a3a1a;color:#4caf82;font-size:.9rem;margin-top:.5rem">
+      ✓ File written: <span id="trackFileName"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 onclick="toggleTrackSettings()" style="cursor:pointer">
+      Recording Settings <span id="trackSettingsChevron" style="float:right;transition:transform .2s">▼</span>
+    </h2>
+    <div id="trackSettingsBody">
+      <label style="display:block;margin-bottom:.3rem">Recording Interval</label>
+      <select id="trackIntervalSel" style="width:100%;margin-bottom:1rem">
+        <option value="1">1 second</option>
+        <option value="5">5 seconds</option>
+        <option value="10">10 seconds</option>
+        <option value="30">30 seconds</option>
+        <option value="60">1 minute</option>
+      </select>
+      <label style="display:block;margin-bottom:.3rem">Loop Buffer Duration</label>
+      <select id="trackLoopHrsSel" style="width:100%;margin-bottom:1rem">
+        <option value="1">1 hour</option>
+        <option value="2">2 hours</option>
+        <option value="3">3 hours</option>
+        <option value="6">6 hours</option>
+        <option value="12">12 hours</option>
+        <option value="24">24 hours</option>
+      </select>
+      <p style="font-size:.8rem;color:#888;margin-bottom:1rem">
+        Changing these settings will erase the current loop buffer and create a new one.
+        Use the Files tab to download saved track files.
+      </p>
+      <button onclick="saveTrackSettings()">Save Settings</button>
+    </div>
+  </div>
+
+</div>
+
 <!-- FILES PAGE -->
 <div id="files" class="page">
 
@@ -614,6 +667,8 @@ function showPage(id, btn) {
   if (id === 'config') loadConfig();
   if (id === 'marks')  { loadMarks(); loadCourses(); }
   if (id === 'start')  { loadRaceState(); loadRaceMarksAndCourses(); startRacePolling(); }
+  if (id === 'tracks') { startTrackPolling(); }
+  if (id !== 'tracks') { stopTrackPolling(); }
   if (id === 'files')  { initFilesPage(); }
   if (id === 'system') {
     fetch('/config').then(function(r) {
@@ -1744,6 +1799,112 @@ function formatSd() {
     } else {
       toast('Format failed', false);
     }
+  }).catch(function() { toast('Request failed', false); });
+}
+
+// ── Tracks tab ────────────────────────────────────────────────────────────────
+
+var trackPollTimer = null;
+
+function startTrackPolling() {
+  loadTrackStatus();
+  if (!trackPollTimer) trackPollTimer = setInterval(loadTrackStatus, 2000);
+}
+
+function stopTrackPolling() {
+  if (trackPollTimer) { clearInterval(trackPollTimer); trackPollTimer = null; }
+}
+
+function loadTrackStatus() {
+  fetch('/tracks/status').then(function(r) { return r.json(); }).then(function(d) {
+    renderTrackPage(d);
+  }).catch(function() {});
+}
+
+function renderTrackPage(d) {
+  // Status line
+  var sl = document.getElementById('trackStatusLine');
+  if (d.loopRunning) {
+    var pct = d.maxPoints > 0 ? Math.round(d.count / d.maxPoints * 100) : 0;
+    var hist = d.historyMin >= 60
+      ? (Math.floor(d.historyMin/60) + 'h ' + (d.historyMin%60) + 'm')
+      : (d.historyMin + 'm');
+    sl.innerHTML = '&#9679; Loop running &nbsp;|&nbsp; ' + d.count + ' pts &nbsp;|&nbsp; ' +
+                   hist + ' history &nbsp;|&nbsp; ' + pct + '% full';
+    sl.style.color = '#4caf82';
+  } else {
+    sl.innerHTML = '&#9675; Loop stopped';
+    sl.style.color = '#888';
+  }
+
+  // Loop start/stop button
+  var lb = document.getElementById('trackLoopBtn');
+  lb.textContent = d.loopRunning ? '&#9632; Stop Loop' : '&#9654; Start Loop';
+
+  // Segment button
+  var sb = document.getElementById('trackSegBtn');
+  sb.disabled = !d.loopRunning;
+  if (d.segActive) {
+    var t = new Date(d.segStartTs * 1000);
+    sb.textContent = '&#9632; Select Stop (started ' + t.toUTCString().slice(17,25) + 'Z)';
+    sb.style.background = '#8B1A1A';
+  } else {
+    sb.textContent = 'Select Start';
+    sb.style.background = '';
+  }
+
+  // File written status
+  var fw = document.getElementById('trackFileStatus');
+  if (d.fileReady && d.lastFile) {
+    document.getElementById('trackFileName').textContent = d.lastFile;
+    fw.style.display = 'block';
+  } else {
+    fw.style.display = 'none';
+  }
+
+  // Populate settings selectors on first load (only if they haven't been
+  // touched by the user in this session)
+  var iv = document.getElementById('trackIntervalSel');
+  var lh = document.getElementById('trackLoopHrsSel');
+  if (!iv._loaded) { iv.value = String(d.intervalSec); iv._loaded = true; }
+  if (!lh._loaded) { lh.value = String(d.loopHours);   lh._loaded = true; }
+}
+
+function toggleTrackLoop() {
+  var running = document.getElementById('trackLoopBtn').textContent.indexOf('Stop') >= 0;
+  fetch(running ? '/tracks/loop/stop' : '/tracks/loop/start', {method:'POST'})
+    .then(function() { loadTrackStatus(); })
+    .catch(function() { toast('Request failed', false); });
+}
+
+function toggleTrackSeg() {
+  var active = document.getElementById('trackSegBtn').textContent.indexOf('Stop') >= 0;
+  var url = active ? '/tracks/segment/stop' : '/tracks/segment/start';
+  fetch(url, {method:'POST'}).then(function(r) { return r.json(); }).then(function(d) {
+    if (!d.ok) { toast(d.error || 'Failed', false); return; }
+    if (active && d.file) toast('Track saved: ' + d.file);
+    loadTrackStatus();
+  }).catch(function() { toast('Request failed', false); });
+}
+
+function toggleTrackSettings() {
+  var body = document.getElementById('trackSettingsBody');
+  var chev = document.getElementById('trackSettingsChevron');
+  var open = body.style.display !== 'none';
+  body.style.display = open ? 'none' : '';
+  chev.style.transform = open ? 'rotate(-90deg)' : '';
+}
+
+function saveTrackSettings() {
+  var iv = parseInt(document.getElementById('trackIntervalSel').value);
+  var lh = parseInt(document.getElementById('trackLoopHrsSel').value);
+  fetch('/tracks/config', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({intervalSec: iv, loopHours: lh})
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) { toast('Track settings saved'); loadTrackStatus(); }
+    else toast('Save failed', false);
   }).catch(function() { toast('Request failed', false); });
 }
 </script>

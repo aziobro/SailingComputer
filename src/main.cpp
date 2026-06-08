@@ -32,6 +32,7 @@
 #include "ble_nmea.h"
 #include "storage.h"
 #include "gpx.h"
+#include "track.h"
 #include "cJSON.h"
 
 #include "certs.h"
@@ -81,6 +82,8 @@ static int   satCount   = 0;
 static float latitude   = 0, longitude = 0, heading = 0, sog = 0, cog = 0;
 static float hdop = 0, altitude = 0;
 static char  ggaUtcTime[12] = "000000.00"; // last UTC time from incoming GGA
+static char  rmcDate[8]     = "010100";    // DDMMYY from last RMC sentence
+static uint32_t gpsUnixTime = 0;           // UTC unix timestamp from RMC+GGA
 static float roll = 0;          // heel: pitch of athwartships baseline
 static float cogFiltered    = 0;
 static bool  cogInitialized = false;
@@ -116,6 +119,10 @@ struct RaceData {
 };
 
 static RaceData raceData;
+
+// ── Track recorder ────────────────────────────────────────────────────────────
+
+static TrackRecorder trackRec;
 
 // Diagnostic counters
 static uint32_t nmeaBytesRx       = 0;  // raw bytes received from UART_NMEA
@@ -415,6 +422,35 @@ static void parseGGA(const char *s) {
         if (f[3][0] == 'S') latitude  = -latitude;
         if (f[5][0] == 'W') longitude = -longitude;
     }
+
+    trackRec.tryWrite(latitude, longitude, heading, roll,
+                      sog, cog, (uint8_t)fixQuality, gpsUnixTime);
+}
+
+// Parse $GNRMC / $GPRMC to extract date (field 9: DDMMYY) and recompute
+// gpsUnixTime combining the date with the UTC time already in ggaUtcTime.
+static void parseRMC(const char *s) {
+    char buf[256]; strlcpy(buf, s, sizeof(buf));
+    char *f[12] = {};
+    if (splitNmeaFields(buf, f, 12) < 10) return;
+    if (!f[9] || strlen(f[9]) < 6) return;
+    strlcpy(rmcDate, f[9], sizeof(rmcDate));
+
+    // Recompute unix timestamp from rmcDate (DDMMYY) + ggaUtcTime (HHMMSS.ss)
+    const char *d = rmcDate;
+    const char *t = ggaUtcTime;
+    if (strlen(d) < 6 || strlen(t) < 6) return;
+    struct tm tm_ = {};
+    tm_.tm_mday  = (d[0]-'0')*10 + (d[1]-'0');
+    tm_.tm_mon   = (d[2]-'0')*10 + (d[3]-'0') - 1;
+    int yy       = (d[4]-'0')*10 + (d[5]-'0');
+    tm_.tm_year  = (yy + 2000) - 1900;
+    tm_.tm_hour  = (t[0]-'0')*10 + (t[1]-'0');
+    tm_.tm_min   = (t[2]-'0')*10 + (t[3]-'0');
+    tm_.tm_sec   = (t[4]-'0')*10 + (t[5]-'0');
+    tm_.tm_isdst = 0;
+    time_t ts = mktime(&tm_);  // TZ must be set to UTC0 at startup
+    if (ts > 0) gpsUnixTime = (uint32_t)ts;
 }
 
 static void parseHDT(const char *s) {
@@ -484,6 +520,7 @@ static void parseHEADINGA(const char *line) {
 
 static void processNmeaLine(const char *line) {
     if      (strncmp(line, "$GNGGA",    6) == 0 || strncmp(line, "$GPGGA",    6) == 0) parseGGA(line);
+    else if (strncmp(line, "$GNRMC",    6) == 0 || strncmp(line, "$GPRMC",    6) == 0) parseRMC(line);
     else if (strncmp(line, "$GNHDT",    6) == 0 || strncmp(line, "$GPHDT",    6) == 0) parseHDT(line);
     else if (strncmp(line, "$GNVTG",    6) == 0 || strncmp(line, "$GPVTG",    6) == 0) parseVTG(line);
     else if (strncmp(line, "#HEADINGA", 9) == 0)                                        parseHEADINGA(line);
@@ -2025,13 +2062,126 @@ static esp_err_t handleGpxImport(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// ── Track recording handlers ──────────────────────────────────────────────────
+
+static esp_err_t handleTrackStatus(httpd_req_t *req) {
+    char buf[512];
+    uint32_t histMin = 0;
+    if (trackRec.loopFirstTs() && trackRec.loopLastTs() > trackRec.loopFirstTs())
+        histMin = (trackRec.loopLastTs() - trackRec.loopFirstTs()) / 60;
+
+    snprintf(buf, sizeof(buf),
+        "{\"loopRunning\":%s,\"count\":%u,\"maxPoints\":%u"
+        ",\"firstTs\":%u,\"lastTs\":%u,\"historyMin\":%u"
+        ",\"segActive\":%s,\"segStartTs\":%u"
+        ",\"fileReady\":%s,\"lastFile\":\"%s\""
+        ",\"gpsTime\":%u,\"intervalSec\":%u,\"loopHours\":%u}",
+        trackRec.loopRunning ? "true" : "false",
+        trackRec.loopCount(), trackRec.loopMaxPts(),
+        trackRec.loopFirstTs(), trackRec.loopLastTs(), histMin,
+        trackRec.segActive ? "true" : "false", trackRec.segStartTs,
+        trackRec.fileReady ? "true" : "false",
+        trackRec.fileReady ? trackRec.lastFileName() : "",
+        gpsUnixTime, trackRec.intervalSec(), trackRec.loopHours());
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleTrackLoopStart(httpd_req_t *req) {
+    trackRec.loopRunning = true;
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleTrackLoopStop(httpd_req_t *req) {
+    trackRec.loopRunning = false;
+    trackRec.segActive   = false;  // abort any open segment
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// POST /tracks/segment/start — mark current GPS time as segment start
+static esp_err_t handleTrackSegStart(httpd_req_t *req) {
+    if (gpsUnixTime == 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"no GPS time\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    trackRec.segActive   = true;
+    trackRec.segStartTs  = gpsUnixTime;
+    trackRec.fileReady   = false;
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"startTs\":%u}", gpsUnixTime);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// POST /tracks/segment/stop — export loop slice from segStartTs..now, write GPX
+static esp_err_t handleTrackSegStop(httpd_req_t *req) {
+    if (!trackRec.segActive) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"no active segment\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    uint32_t t0 = trackRec.segStartTs;
+    uint32_t t1 = gpsUnixTime ? gpsUnixTime : t0;
+    trackRec.segActive = false;
+    bool ok = trackRec.exportSegment(t0, t1);
+    char resp[128];
+    snprintf(resp, sizeof(resp), "{\"ok\":%s,\"file\":\"%s\"}",
+             ok ? "true" : "false",
+             ok ? trackRec.lastFileName() : "");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// POST /tracks/config — update recording rate and loop duration, persist to NVS
+static esp_err_t handleTrackConfig(httpd_req_t *req) {
+    char body[128] = {};
+    int  len = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (len <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "{\"ok\":false}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    cJSON *j = cJSON_Parse(body);
+    if (!j) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "{\"ok\":false}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    cJSON *iv = cJSON_GetObjectItem(j, "intervalSec");
+    cJSON *lh = cJSON_GetObjectItem(j, "loopHours");
+    uint8_t newInterval = cfgMgr.cfg.trackIntervalSec;
+    uint8_t newHours    = cfgMgr.cfg.trackLoopHours;
+    if (cJSON_IsNumber(iv)) newInterval = (uint8_t)iv->valueint;
+    if (cJSON_IsNumber(lh)) newHours    = (uint8_t)lh->valueint;
+    cJSON_Delete(j);
+
+    bool changed = (newInterval != cfgMgr.cfg.trackIntervalSec ||
+                    newHours    != cfgMgr.cfg.trackLoopHours);
+    cfgMgr.cfg.trackIntervalSec = newInterval;
+    cfgMgr.cfg.trackLoopHours   = newHours;
+    cfgMgr.save();
+
+    if (changed) trackRec.reconfigure(newInterval, newHours);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 // ── Web server setup ──────────────────────────────────────────────────────────
 
 static void startWebServer() {
     // ── HTTPS server on port 443 ─────────────────────────────────────────────
     httpd_ssl_config_t ssl_cfg         = HTTPD_SSL_CONFIG_DEFAULT();
     ssl_cfg.httpd.max_open_sockets     = 10; // status poll + race poll + concurrent button clicks
-    ssl_cfg.httpd.max_uri_handlers     = 32; // default is 8
+    ssl_cfg.httpd.max_uri_handlers     = 40; // default is 8
     ssl_cfg.httpd.stack_size           = 10240;
     ssl_cfg.httpd.lru_purge_enable     = true;
     ssl_cfg.servercert                 = (const uint8_t *)server_cert_pem;
@@ -2082,7 +2232,13 @@ static void startWebServer() {
     reg(webServer, "/race/course",    HTTP_POST, handleRaceCourse);   // public — set active course
     reg(webServer, "/race/nextleg",   HTTP_POST, handleRaceNextLeg);  // public — advance to next mark
     reg(webServer, "/race/prevleg",   HTTP_POST, handleRacePrevLeg);  // public — go back to previous mark
-    reg(webServer, "/race/end",       HTTP_POST, handleRaceEnd);      // public — end race, go to stats
+    reg(webServer, "/race/end",          HTTP_POST, handleRaceEnd);      // public — end race, go to stats
+    reg(webServer, "/tracks/status",     HTTP_GET,  handleTrackStatus);     // public — track state
+    reg(webServer, "/tracks/loop/start", HTTP_POST, handleTrackLoopStart);  // public — start loop
+    reg(webServer, "/tracks/loop/stop",  HTTP_POST, handleTrackLoopStop);   // public — stop loop
+    reg(webServer, "/tracks/segment/start", HTTP_POST, handleTrackSegStart);// public — mark start
+    reg(webServer, "/tracks/segment/stop",  HTTP_POST, handleTrackSegStop); // public — mark stop + export
+    reg(webServer, "/tracks/config",     HTTP_POST, handleTrackConfig);     // auth — save settings
 
     ESP_LOGI(TAG, "[Web] HTTPS server started on port 443");
 
@@ -2223,8 +2379,21 @@ extern "C" void app_main(void) {
 
     raceData.duration_s = 300;  // 5-minute sequence default
 
+    setenv("TZ", "UTC0", 1);  // mktime must treat broken-down time as UTC
+    tzset();
+
     cfgMgr.load();
     storageMgr.begin();
+
+    // Track recorder needs SD card mounted — open loop file after storageMgr.begin()
+    {
+        char trackDir[64];
+        snprintf(trackDir, sizeof(trackDir), "%s/tracks", storageMgr.mountPoint());
+        trackRec.begin(trackDir,
+                       cfgMgr.cfg.trackIntervalSec,
+                       cfgMgr.cfg.trackLoopHours);
+    }
+
     telemetryMtx = xSemaphoreCreateMutex();
     uartNmeaMtx  = xSemaphoreCreateMutex();
     ntripUpdateEnabled();

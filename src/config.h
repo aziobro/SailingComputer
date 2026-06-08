@@ -66,6 +66,8 @@ struct Config {
     char        apPassword[64];
     char        adminPassword[64];  // HTTP Basic Auth for config/OTA pages
     uint8_t     gpsUpdateRate;      // Hz: 1, 2, 5, 10, 20
+    uint8_t     trackIntervalSec;   // seconds between track points (1/5/10/30/60)
+    uint8_t     trackLoopHours;     // loop buffer duration in hours (1-24)
 };
 
 // Store/load float via its bit pattern — NVS has no native float type.
@@ -81,7 +83,9 @@ public:
         cfg.apMode        = true;
         cfg.headingOffset = 90.0f;
         cfg.cogMinSog     = COG_MIN_SOG_DEFAULT;
-        cfg.gpsUpdateRate = GPS_RATE_DEFAULT;
+        cfg.gpsUpdateRate    = GPS_RATE_DEFAULT;
+        cfg.trackIntervalSec = 5;
+        cfg.trackLoopHours   = 3;
         for (int i = 0; i < NTRIP_SOURCES; i++) cfg.ntrip[i].port = 2101;
         strlcpy(cfg.apSSID,       DEFAULT_AP_SSID,     sizeof(cfg.apSSID));
         strlcpy(cfg.apPassword,   DEFAULT_AP_PASSWORD, sizeof(cfg.apPassword));
@@ -141,7 +145,9 @@ public:
         if (nvs_get_u32(h, "hdgOffset", &u) == ESP_OK) cfg.headingOffset = u2f(u);
         if (nvs_get_u32(h, "cogMinSog", &u) == ESP_OK) cfg.cogMinSog     = u2f(u);
         b = 0; nvs_get_u8(h, "bleNmea",  &b); cfg.bleNmea = b;
-        b = GPS_RATE_DEFAULT; nvs_get_u8(h, "gpsRate", &b); cfg.gpsUpdateRate = b;
+        b = GPS_RATE_DEFAULT; nvs_get_u8(h, "gpsRate",      &b); cfg.gpsUpdateRate    = b;
+        b = 5;               nvs_get_u8(h, "trackInterval", &b); cfg.trackIntervalSec = b;
+        b = 3;               nvs_get_u8(h, "trackLoopHrs",  &b); cfg.trackLoopHours   = b;
 
         len = sizeof(cfg.apSSID);       nvs_get_str(h, "apSSID",    cfg.apSSID,       &len);
         len = sizeof(cfg.apPassword);   nvs_get_str(h, "apPass",    cfg.apPassword,   &len);
@@ -180,7 +186,9 @@ public:
         nvs_set_u32(h, "hdgOffset", f2u(cfg.headingOffset));
         nvs_set_u32(h, "cogMinSog", f2u(cfg.cogMinSog));
         nvs_set_u8 (h, "bleNmea",   cfg.bleNmea ? 1 : 0);
-        nvs_set_u8 (h, "gpsRate",   cfg.gpsUpdateRate);
+        nvs_set_u8 (h, "gpsRate",        cfg.gpsUpdateRate);
+        nvs_set_u8 (h, "trackInterval",  cfg.trackIntervalSec);
+        nvs_set_u8 (h, "trackLoopHrs",   cfg.trackLoopHours);
         nvs_set_str(h, "apSSID",    cfg.apSSID);
         nvs_set_str(h, "apPass",    cfg.apPassword);
         nvs_set_str(h, "adminPass", cfg.adminPassword);
