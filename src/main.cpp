@@ -2175,13 +2175,19 @@ static esp_err_t handleTrackSegStop(httpd_req_t *req) {
 
 // POST /tracks/segment/export — export loop slice with explicit {t0, t1} unix timestamps
 static esp_err_t handleTrackExportSegment(httpd_req_t *req) {
+    // Reject if loop file itself isn't healthy, before touching the SD card check
+    if (!trackRec.sdAvailable) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"SD card not available\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
     uint64_t sdTotal = 0, sdUsed = 0;
-    if (!storageMgr.mounted || !storageMgr.isSdCard() ||
-        !storageMgr.getInfo(&sdTotal, &sdUsed) ||
+    if (storageMgr.isSdCard() && storageMgr.getInfo(&sdTotal, &sdUsed) &&
         (sdTotal - sdUsed) < 2ULL * 1024 * 1024) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, "{\"ok\":false,\"error\":\"SD card full or unavailable\"}", HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"SD card almost full (< 2 MB free)\"}", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
     char body[64] = {};
@@ -2211,11 +2217,15 @@ static esp_err_t handleTrackExportSegment(httpd_req_t *req) {
         httpd_resp_send(req, "{\"ok\":false,\"error\":\"t0 must be before t1\"}", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
+    ESP_LOGI("Track", "Export request t0=%u t1=%u loopCount=%u sdAvail=%d",
+             t0, t1, trackRec.loopCount(), trackRec.sdAvailable);
     bool ok = trackRec.exportSegment(t0, t1);
-    char resp[128];
-    snprintf(resp, sizeof(resp), "{\"ok\":%s,\"file\":\"%s\"}",
-             ok ? "true" : "false",
-             ok ? trackRec.lastFileName() : "");
+    char resp[192];
+    if (ok) {
+        snprintf(resp, sizeof(resp), "{\"ok\":true,\"file\":\"%s\"}", trackRec.lastFileName());
+    } else {
+        snprintf(resp, sizeof(resp), "{\"ok\":false,\"error\":\"%s\"}", trackRec.exportErr);
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;

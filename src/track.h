@@ -94,11 +94,34 @@ public:
         xSemaphoreGive(mtx);
     }
 
+    // exportSegment: returns true on success.
+    // On failure, exportErr[] holds a short human-readable reason for the HTTP response.
+    char exportErr[64] = {};
+
     bool exportSegment(uint32_t t0, uint32_t t1) {
-        if (!mtx) return false;
+        exportErr[0] = '\0';
+        if (!mtx) {
+            snprintf(exportErr, sizeof(exportErr), "no mutex");
+            ESP_LOGE(TRACK_TAG, "exportSegment: no mutex");
+            return false;
+        }
         xSemaphoreTake(mtx, portMAX_DELAY);
 
-        if (!loopFp_ || count_ == 0) { xSemaphoreGive(mtx); return false; }
+        if (!loopFp_) {
+            xSemaphoreGive(mtx);
+            snprintf(exportErr, sizeof(exportErr), "loop file not open");
+            ESP_LOGE(TRACK_TAG, "exportSegment: loopFp_ is null (sdAvailable=%d)", sdAvailable);
+            return false;
+        }
+        if (count_ == 0) {
+            xSemaphoreGive(mtx);
+            snprintf(exportErr, sizeof(exportErr), "loop buffer empty");
+            ESP_LOGE(TRACK_TAG, "exportSegment: count_=0");
+            return false;
+        }
+
+        ESP_LOGI(TRACK_TAG, "exportSegment t0=%u t1=%u count=%u writeIdx=%u maxPts=%u",
+                 t0, t1, count_, writeIdx_, maxPts_);
 
         char t0str[24], t1str[24];
         fmtTs(t0, t0str, sizeof(t0str));
@@ -122,14 +145,22 @@ public:
                       hdr.max_points > 0);
         if (!hdrOk) {
             // Fall back to in-memory state — header may not have been flushed yet
+            ESP_LOGW(TRACK_TAG, "exportSegment: header fread failed or bad magic — using in-memory state");
             hdr.magic      = TRACK_LOOP_MAGIC;
             hdr.write_idx  = writeIdx_;
             hdr.count      = count_;
             hdr.max_points = maxPts_;
         }
+        ESP_LOGI(TRACK_TAG, "exportSegment hdr: count=%u write_idx=%u max=%u",
+                 hdr.count, hdr.write_idx, hdr.max_points);
 
         FILE *out = fopen(tmpPath, "w");
-        if (!out) { xSemaphoreGive(mtx); return false; }
+        if (!out) {
+            xSemaphoreGive(mtx);
+            snprintf(exportErr, sizeof(exportErr), "fopen(%s) failed", tmpPath);
+            ESP_LOGE(TRACK_TAG, "exportSegment: fopen(%s) failed", tmpPath);
+            return false;
+        }
 
         char trkName[48];
         snprintf(trkName, sizeof(trkName), "%s_to_%s", t0str, t1str);
@@ -145,18 +176,19 @@ public:
         uint32_t stored = hdr.count < hdr.max_points ? hdr.count : hdr.max_points;
         uint32_t oldest = (hdr.count < hdr.max_points) ? 0u : (hdr.write_idx % hdr.max_points);
         int      written = 0;
+        int      skipped = 0;
 
         for (uint32_t i = 0; i < stored; i++) {
             uint32_t idx = (oldest + i) % hdr.max_points;
             long     off = (long)(sizeof(LoopHeader) + idx * (long)sizeof(TrackPoint));
             fseek(loopFp_, off, SEEK_SET);
             TrackPoint pt = {};
-            if (fread(&pt, sizeof(pt), 1, loopFp_) != 1) continue;
-            if (pt.unix_ts == 0 || pt.unix_ts < t0 || pt.unix_ts > t1) continue;
+            if (fread(&pt, sizeof(pt), 1, loopFp_) != 1) { skipped++; continue; }
+            if (pt.unix_ts == 0 || pt.unix_ts < t0 || pt.unix_ts > t1) { skipped++; continue; }
 
-            time_t t = (time_t)pt.unix_ts;
+            time_t tt = (time_t)pt.unix_ts;
             struct tm tm_ = {};
-            gmtime_r(&t, &tm_);
+            gmtime_r(&tt, &tm_);
             char iso[24];
             strftime(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%SZ", &tm_);
 
@@ -185,6 +217,9 @@ public:
 
         xSemaphoreGive(mtx);
 
+        ESP_LOGI(TRACK_TAG, "exportSegment: wrote %d pts, skipped %d, t0=%u t1=%u",
+                 written, skipped, t0, t1);
+
         if (written > 0) {
             remove(lastFile);
             rename(tmpPath, lastFile);
@@ -193,6 +228,9 @@ public:
             return true;
         }
         remove(tmpPath);
+        snprintf(exportErr, sizeof(exportErr), "no points in range [%u,%u]", t0, t1);
+        ESP_LOGE(TRACK_TAG, "exportSegment: 0 points in t0=%u..t1=%u (stored=%u oldest=%u)",
+                 t0, t1, stored, oldest);
         return false;
     }
 
