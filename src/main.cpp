@@ -26,6 +26,7 @@
 #include "lwip/netdb.h"
 #include "lwip/err.h"
 #include "config.h"
+#include "version.h"
 #include "webui.h"
 #include "um982.h"
 #include "ble_nmea.h"
@@ -1073,7 +1074,8 @@ static esp_err_t handleStatus(httpd_req_t *req) {
         "\"bleDrops\":%u,"
         "\"wifiMode\":\"%s\","
         "\"ip\":\"%s\","
-        "\"apIP\":\"%s\""
+        "\"apIP\":\"%s\","
+        "\"version\":\"%s\""
         "}",
         fixQuality,
         (fixQuality >= 0 && fixQuality <= 9) ? fixLabels[fixQuality] : "Unknown",
@@ -1097,7 +1099,7 @@ static esp_err_t handleStatus(httpd_req_t *req) {
         nmeaOverflowDrops, nmeaParseDrops, nmeaOutputDrops, nmeaTcpDrops,
         bleDropCount,
         cfgMgr.cfg.apMode ? "AP" : "Station",
-        staIP, apIP
+        staIP, apIP, FW_VERSION
     );
     if (telemetryMtx) xSemaphoreGive(telemetryMtx);
 

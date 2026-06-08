@@ -66,7 +66,7 @@ inline const char* getWebUI() {
 <body>
 <header>
   <h1>&#9741; Sailing Computer</h1>
-  <span id="deviceIP"></span>
+  <span id="deviceIP"></span><span id="fwVersion" style="font-size:0.75rem;color:#3a6a8a;margin-left:10px"></span>
 </header>
 <nav>
   <button class="active" onclick="showPage('status',this)">Status</button>
@@ -611,6 +611,10 @@ function updateStatus() {
     setText('s-nmea-lines', nmeaLines + ' sentences');
     setText('sysIP', ip || '--');
     setText('deviceIP', ip || '--');
+    if (d.version) {
+      var vEl = document.getElementById('fwVersion');
+      if (vEl && vEl.textContent !== 'v' + d.version) vEl.textContent = 'v' + d.version;
+    }
     var ntrip = document.getElementById('s-ntrip');
     ntrip.textContent = d.ntripConnected ? 'Connected' : 'Off';
     ntrip.className = 'stat-value ' + (d.ntripConnected ? 'ok' : 'err');
