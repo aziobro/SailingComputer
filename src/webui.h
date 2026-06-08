@@ -555,6 +555,16 @@ inline const char* getWebUI() {
          background:#1a3a1a;color:#4caf82;font-size:.9rem;margin-top:.5rem">
       ✓ File written: <span id="trackFileName"></span>
     </div>
+
+    <p style="font-size:.78rem;color:#666;margin-top:1rem;line-height:1.5">
+      The loop continuously records to a circular buffer on the SD card.
+      <strong>Select Start</strong> marks a timestamp in the buffer —
+      no separate file is written yet.
+      <strong>Select Stop</strong> extracts that segment from the buffer
+      and writes the GPX file.
+      If power is lost between Start and Stop, the buffer data survives
+      and can be recovered by restarting the loop and re-marking the segment.
+    </p>
   </div>
 
   <div class="card">
