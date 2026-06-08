@@ -71,6 +71,7 @@ inline const char* getWebUI() {
 <nav>
   <button class="active" onclick="showPage('status',this)">Status</button>
   <button onclick="showPage('config',this)">Configuration</button>
+  <button onclick="showPage('racing',this)">Racing</button>
   <button onclick="showPage('system',this)">System</button>
   <button class="logout" onclick="doLogout()">&#x23FB; Log Out</button>
 </nav>
@@ -334,6 +335,72 @@ inline const char* getWebUI() {
   </div><!-- systemContent -->
 </div>
 
+<!-- RACING PAGE -->
+<div id="racing" class="page">
+  <!-- Mark Manager -->
+  <div class="card">
+    <h2>Mark Manager</h2>
+    <div id="markList" style="margin-bottom:1rem">
+      <p style="color:#5a7a9a;font-size:0.85rem">Loading marks&hellip;</p>
+    </div>
+    <div class="section-title">Add Mark</div>
+    <div class="row">
+      <div>
+        <label>Name</label>
+        <input id="mkName" type="text" placeholder="e.g. Pin End" maxlength="31">
+      </div>
+      <div>
+        <button class="btn btn-primary" style="margin-top:22px;width:100%" onclick="useGpsForMark()">&#8982; Use GPS Position</button>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Latitude</label>
+        <input id="mkLat" type="number" step="0.0000001" placeholder="41.2345678">
+      </div>
+      <div>
+        <label>Longitude</label>
+        <input id="mkLon" type="number" step="0.0000001" placeholder="-70.1234567">
+      </div>
+    </div>
+    <button class="btn btn-primary" onclick="addMark()">Add Mark</button>
+  </div>
+
+  <!-- Courses -->
+  <div class="card">
+    <h2>Courses</h2>
+    <div id="courseList">
+      <p style="color:#5a7a9a;font-size:0.85rem">Loading courses&hellip;</p>
+    </div>
+  </div>
+
+  <!-- GPX Import -->
+  <div class="card">
+    <h2>Import GPX File</h2>
+    <p style="font-size:0.82rem;color:#7a9ab8;margin-bottom:12px">
+      Import waypoints as marks and routes as courses from a standard GPX file.
+      Duplicate mark names are skipped. Route points are matched to marks by name.
+    </p>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <input id="gpxFile" type="file" accept=".gpx,.xml"
+             style="flex:1;min-width:0;background:#091a36;border:1px dashed #1e4080;padding:8px;border-radius:5px;color:#7a9ab8;font-size:0.85rem">
+      <button class="btn btn-primary" style="white-space:nowrap" onclick="importGpx()">&#8593; Import</button>
+    </div>
+    <div id="gpxResult" style="margin-top:10px;font-size:0.85rem;display:none"></div>
+  </div>
+
+  <!-- Storage Debug -->
+  <div class="card">
+    <h2>Storage Info <button class="btn" style="padding:3px 10px;font-size:0.75rem;margin-left:8px;background:#1a3a5c" onclick="loadStorageInfo()">Refresh</button></h2>
+    <div id="storageInfo" style="font-size:0.85rem;color:#7a9ab8">Loading&hellip;</div>
+    <div style="margin-top:10px">
+      <div style="background:#091a36;border-radius:4px;height:10px;overflow:hidden">
+        <div id="storageBar" style="height:100%;background:#5ab4e8;width:0%;transition:width 0.4s"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -365,6 +432,7 @@ function showPage(id, btn) {
   document.getElementById(id).classList.add('active');
   btn.classList.add('active');
   if (id === 'config') loadConfig();
+  if (id === 'racing') { loadMarks(); loadCourses(); loadStorageInfo(); }
   if (id === 'system') {
     fetch('/config').then(function(r) {
       if (r.ok) hideAuthWall('system');
@@ -663,7 +731,8 @@ function buildNtripSources(sources) {
       '<div id="n'+i+'fields" style="display:' + (src.enabled ? '' : 'none') + '">' +
         '<div class="row">' +
           '<div><label>Caster Host</label>' +
-            '<input type="text" name="n'+i+'host" id="n'+i+'host" value="' + (src.host||'') + '" placeholder="rtk2go.com" maxlength="127"></div>' +
+            '<input type="text" name="n'+i+'host" id="n'+i+'host" value="' + (src.host||'') + '" placeholder="192.168.8.195 (no http://)" maxlength="127">' +
+            '<div style="font-size:0.7rem;color:#5a7a9a;margin-top:3px">Hostname or IP only; URL prefixes are removed automatically.</div></div>' +
           '<div><label>Port</label>' +
             '<input type="number" name="n'+i+'port" id="n'+i+'port" value="' + (src.port||2101) + '" min="1" max="65535"></div>' +
         '</div>' +
@@ -812,6 +881,163 @@ function startOTA(e) {
     status.textContent = 'Upload error — check connection.';
   };
   xhr.send(file);
+}
+
+// ── Racing: marks ─────────────────────────────────────────────────────────────
+function loadMarks() {
+  fetch('/marks').then(r => r.json()).then(function(marks) {
+    var el = document.getElementById('markList');
+    if (!marks.length) {
+      el.innerHTML = '<p style="color:#5a7a9a;font-size:0.85rem">No marks saved.</p>';
+      return;
+    }
+    var rows = marks.map(function(m) {
+      return '<tr>' +
+        '<td style="padding:6px 8px;color:#e0e8f0">' + escHtml(m.name) + '</td>' +
+        '<td style="padding:6px 8px;color:#aac8e0;font-variant-numeric:tabular-nums">' + m.lat.toFixed(7) + '</td>' +
+        '<td style="padding:6px 8px;color:#aac8e0;font-variant-numeric:tabular-nums">' + m.lon.toFixed(7) + '</td>' +
+        '<td style="padding:6px 8px"><span style="font-size:0.72rem;color:#5a7a9a">' + escHtml(m.id) + '</span></td>' +
+        '<td style="padding:6px 4px"><button class="btn btn-danger" style="padding:3px 10px;font-size:0.8rem" onclick="deleteMark(\'' + escHtml(m.id) + '\')">&#128465;</button></td>' +
+        '</tr>';
+    }).join('');
+    el.innerHTML = '<table style="width:100%;border-collapse:collapse">' +
+      '<thead><tr style="font-size:0.72rem;color:#5a7a9a;text-transform:uppercase">' +
+      '<th style="text-align:left;padding:4px 8px">Name</th>' +
+      '<th style="text-align:left;padding:4px 8px">Lat</th>' +
+      '<th style="text-align:left;padding:4px 8px">Lon</th>' +
+      '<th style="text-align:left;padding:4px 8px">ID</th>' +
+      '<th></th></tr></thead><tbody>' + rows + '</tbody></table>';
+  }).catch(function() {
+    document.getElementById('markList').innerHTML = '<p style="color:#e85a5a;font-size:0.85rem">Failed to load marks.</p>';
+  });
+}
+
+function addMark() {
+  var name = document.getElementById('mkName').value.trim();
+  var lat  = parseFloat(document.getElementById('mkLat').value);
+  var lon  = parseFloat(document.getElementById('mkLon').value);
+  if (!name) { toast('Enter a mark name', false); return; }
+  if (isNaN(lat) || isNaN(lon)) { toast('Enter valid lat/lon', false); return; }
+  fetch('/marks', { method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name:name, lat:lat, lon:lon})
+  }).then(r => r.json()).then(function(res) {
+    if (res.ok) {
+      toast('Mark saved (' + res.id + ')');
+      document.getElementById('mkName').value = '';
+      document.getElementById('mkLat').value  = '';
+      document.getElementById('mkLon').value  = '';
+      loadMarks();
+      loadStorageInfo();
+    } else { toast('Save failed', false); }
+  }).catch(function() { toast('Request failed', false); });
+}
+
+function deleteMark(id) {
+  if (!confirm('Delete mark ' + id + '?')) return;
+  fetch('/marks/delete', { method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id:id})
+  }).then(r => r.json()).then(function(res) {
+    if (res.ok) { toast('Mark deleted'); loadMarks(); loadStorageInfo(); }
+    else toast('Delete failed', false);
+  }).catch(function() { toast('Request failed', false); });
+}
+
+function useGpsForMark() {
+  fetch('/status').then(r => r.json()).then(function(s) {
+    if (!s.lat && !s.lon) { toast('No GPS fix', false); return; }
+    document.getElementById('mkLat').value = s.lat.toFixed(7);
+    document.getElementById('mkLon').value = s.lon.toFixed(7);
+    toast('GPS position loaded');
+  }).catch(function() { toast('Failed to get GPS', false); });
+}
+
+function loadCourses() {
+  fetch('/courses').then(r => r.json()).then(function(courses) {
+    var el = document.getElementById('courseList');
+    if (!courses.length) {
+      el.innerHTML = '<p style="color:#5a7a9a;font-size:0.85rem">No courses saved. Import a GPX file to add courses.</p>';
+      return;
+    }
+    // Also fetch marks so we can show names instead of IDs
+    fetch('/marks').then(r => r.json()).then(function(marks) {
+      var markMap = {};
+      marks.forEach(function(m) { markMap[m.id] = m.name; });
+      var html = courses.map(function(c) {
+        var markNames = c.marks.map(function(ref) {
+          var n = markMap[ref.mark_id] || ref.mark_id;
+          var rnd = ref.port ? '<span style="font-size:0.68rem;color:#4caf82">P</span>' : '<span style="font-size:0.68rem;color:#e8a830">S</span>';
+          return '<span style="display:inline-block;background:#0d2244;border:1px solid #1e4080;border-radius:4px;padding:1px 6px;margin:2px;font-size:0.78rem">' + escHtml(n) + ' ' + rnd + '</span>';
+        }).join('<span style="color:#5a7a9a;margin:0 2px">&#8594;</span>');
+        return '<div style="border-bottom:1px solid #1e4080;padding:10px 0">' +
+          '<div style="font-weight:bold;color:#e0e8f0;margin-bottom:6px">' + escHtml(c.name) +
+          ' <span style="font-size:0.72rem;color:#5a7a9a">(' + c.marks.length + ' marks)</span></div>' +
+          '<div style="line-height:2">' + (markNames || '<em style="color:#5a7a9a">No marks</em>') + '</div>' +
+          '</div>';
+      }).join('');
+      el.innerHTML = html;
+    });
+  }).catch(function() {
+    document.getElementById('courseList').innerHTML = '<p style="color:#e85a5a;font-size:0.85rem">Failed to load courses.</p>';
+  });
+}
+
+function importGpx() {
+  var fileInput = document.getElementById('gpxFile');
+  var resultEl  = document.getElementById('gpxResult');
+  if (!fileInput.files.length) { toast('Select a GPX file first', false); return; }
+  var file = fileInput.files[0];
+  resultEl.style.display = 'block';
+  resultEl.style.color   = '#7a9ab8';
+  resultEl.textContent   = 'Importing ' + file.name + '…';
+
+  fetch('/gpx/import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/gpx+xml' },
+    body: file
+  }).then(r => r.json()).then(function(res) {
+    if (res.ok) {
+      resultEl.style.color = '#4caf82';
+      resultEl.textContent = '✓ Done: ' + res.marks_found + ' waypoints found, ' +
+        res.marks_added + ' marks added; ' + res.routes_found + ' routes found, ' +
+        res.courses_added + ' courses added.';
+      loadMarks();
+      loadCourses();
+      loadStorageInfo();
+    } else {
+      resultEl.style.color = '#e85a5a';
+      resultEl.textContent = 'Import failed.';
+    }
+  }).catch(function(err) {
+    resultEl.style.color = '#e85a5a';
+    resultEl.textContent = 'Request failed: ' + err;
+  });
+}
+
+function loadStorageInfo() {
+  fetch('/storage/info').then(r => r.json()).then(function(s) {
+    var pct = s.total > 0 ? Math.round(s.used / s.total * 100) : 0;
+    var backend = s.backend === 'sdcard' ? 'SD card' :
+                  (s.backend === 'spiffs' ? 'Internal flash fallback' : 'Unavailable');
+    if (!s.available) {
+      document.getElementById('storageInfo').textContent = backend;
+      return;
+    }
+    document.getElementById('storageInfo').innerHTML =
+      '<span style="color:#5ab4e8">' + backend + '</span> &nbsp;&#8212;&nbsp; ' +
+      '<span style="color:#e0e8f0">' + (s.used/1024).toFixed(1) + ' KB</span> used of ' +
+      (s.total/1024).toFixed(0) + ' KB total &nbsp;&#8212;&nbsp; ' +
+      '<span style="color:#4caf82">' + (s.free/1024).toFixed(1) + ' KB free</span> (' + pct + '%)';
+    document.getElementById('storageBar').style.width = pct + '%';
+    document.getElementById('storageBar').style.background = pct > 80 ? '#e85a5a' : '#5ab4e8';
+  }).catch(function() {
+    document.getElementById('storageInfo').textContent = 'Failed to load storage info.';
+  });
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 </script>
 </body>

@@ -15,4 +15,9 @@ idf_component_register(
         bt
         lwip
         mbedtls
+        spiffs
+        fatfs
+        esp_driver_sdmmc
+        sdmmc
+        json
 )

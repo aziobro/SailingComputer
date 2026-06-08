@@ -1,5 +1,6 @@
 #include <math.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -28,6 +29,9 @@
 #include "webui.h"
 #include "um982.h"
 #include "ble_nmea.h"
+#include "storage.h"
+#include "gpx.h"
+#include "cJSON.h"
 
 #include "certs.h"
 #include "mbedtls/base64.h"
@@ -64,7 +68,8 @@ static inline uint32_t millis(void) {
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
-ConfigManager cfgMgr;
+ConfigManager  cfgMgr;
+StorageManager storageMgr;
 
 struct NmeaMessage {
     char line[256];
@@ -74,6 +79,7 @@ static int   fixQuality = 0;
 static int   satCount   = 0;
 static float latitude   = 0, longitude = 0, heading = 0, sog = 0, cog = 0;
 static float hdop = 0, altitude = 0;
+static char  ggaUtcTime[12] = "000000.00"; // last UTC time from incoming GGA
 static float roll = 0;          // heel: pitch of athwartships baseline
 static float cogFiltered    = 0;
 static bool  cogInitialized = false;
@@ -110,6 +116,7 @@ static SemaphoreHandle_t uartNmeaMtx = NULL;
 static int      ntripSock        = -1;
 static bool     ntripConnected   = false;
 static uint32_t ntripLastAttempt = 0;
+static uint32_t ntripLastGgaTx   = 0;  // global — persists across reconnects
 static uint32_t ntripBytesIn     = 0;
 static uint32_t ntripConnectTime = 0;
 static uint32_t ntripSessionBytes = 0;
@@ -374,6 +381,7 @@ static void parseGGA(const char *s) {
     satCount   = atoi(f[7]);
     hdop       = atof(f[8]);
     altitude   = atof(f[9]);
+    if (f[1] && f[1][0]) strlcpy(ggaUtcTime, f[1], sizeof(ggaUtcTime));
 
     if (f[2][0] && f[4][0]) {
         latitude  = nmeaToDeg(atof(f[2]));
@@ -521,6 +529,65 @@ static void acceptNmeaClients() {
 
 // ── NTRIP ─────────────────────────────────────────────────────────────────────
 
+// Accept a bare host as intended, but also clean up common URL-style entries
+// such as "http://192.168.8.195/" or "192.168.8.195:2101/MOUNT".
+static bool normalizeNtripSource(NtripSource &src) {
+    char originalHost[sizeof(src.host)];
+    char originalMount[sizeof(src.mount)];
+    strlcpy(originalHost, src.host, sizeof(originalHost));
+    strlcpy(originalMount, src.mount, sizeof(originalMount));
+
+    char value[sizeof(src.host)];
+    strlcpy(value, src.host, sizeof(value));
+
+    char *start = value;
+    while (*start == ' ' || *start == '\t') start++;
+    char *end = start + strlen(start);
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '/'))
+        *--end = '\0';
+
+    if (strncasecmp(start, "http://", 7) == 0) {
+        start += 7;
+    } else if (strncasecmp(start, "https://", 8) == 0) {
+        start += 8;
+        ESP_LOGW(TAG, "[NTRIP] HTTPS URL supplied; NTRIP socket uses plain TCP");
+    }
+
+    char *path = strchr(start, '/');
+    if (path) {
+        *path++ = '\0';
+        if (src.mount[0] == '\0' && *path)
+            strlcpy(src.mount, path, sizeof(src.mount));
+    }
+
+    // Handle the common host:port form. Bracketed IPv6 is left untouched.
+    char *colon = strrchr(start, ':');
+    if (colon && strchr(start, ':') == colon) {
+        char *portText = colon + 1;
+        char *p = portText;
+        while (*p >= '0' && *p <= '9') p++;
+        if (*portText && *p == '\0') {
+            int parsedPort = atoi(portText);
+            if (parsedPort >= 1 && parsedPort <= 65535) {
+                src.port = (uint16_t)parsedPort;
+                *colon = '\0';
+            }
+        }
+    }
+
+    while (src.mount[0] == '/')
+        memmove(src.mount, src.mount + 1, strlen(src.mount));
+    strlcpy(src.host, start, sizeof(src.host));
+
+    bool changed = strcmp(originalHost, src.host) != 0 ||
+                   strcmp(originalMount, src.mount) != 0;
+    if (changed) {
+        ESP_LOGI(TAG, "[NTRIP] Normalized source to %s:%u/%s",
+                 src.host, src.port, src.mount);
+    }
+    return changed;
+}
+
 static void ntripUpdateEnabled() {
     ntripAnyEnabled = false;
     ntripActiveIdx  = 0;
@@ -546,38 +613,80 @@ static int ntripNextSource(int idx) {
 static void ntripDisconnect() {
     if (ntripSock >= 0) { close(ntripSock); ntripSock = -1; }
     ntripConnected = false;
+    ntripLastAttempt = millis();
 }
 
-static void ntripSendGGA() {
+// Complete a TCP write even if lwIP accepts only part of the buffer. A partial
+// HTTP request can make the caster interpret later GGA sentences as a malformed
+// connection request.
+static bool socketSendAll(int sock, const char *data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        int r = send(sock, data + sent, len - sent, 0);
+        if (r > 0) {
+            sent += (size_t)r;
+            continue;
+        }
+        if (r < 0 && errno == EINTR) continue;
+        ESP_LOGE(TAG, "[NTRIP] TCP send failed after %u/%u bytes: errno %d",
+                 (unsigned)sent, (unsigned)len, errno);
+        return false;
+    }
+    return true;
+}
+
+// Send one GGA to the NTRIP caster. Ten seconds is sufficient for moving-base
+// and VRS services without producing unnecessary client traffic.
+#define NTRIP_GGA_INTERVAL_MS 10000
+
+static void ntripSendGGA(bool force = false) {
+    if (ntripSock < 0) return;
+
+    // Rate-limit: drop the call if we sent too recently
+    uint32_t now = millis();
+    if (!force && now - ntripLastGgaTx < NTRIP_GGA_INTERVAL_MS) return;
+
+    // Snapshot telemetry
     int q, sats;
     float latRaw, lonRaw, hdopCopy, altCopy;
+    char utc[12];
     if (telemetryMtx) xSemaphoreTake(telemetryMtx, portMAX_DELAY);
-    q = fixQuality;
-    sats = satCount;
-    latRaw = latitude;
-    lonRaw = longitude;
+    q        = fixQuality;
+    sats     = satCount;
+    latRaw   = latitude;
+    lonRaw   = longitude;
     hdopCopy = hdop;
-    altCopy = altitude;
+    altCopy  = altitude;
+    strlcpy(utc, ggaUtcTime, sizeof(utc));
     if (telemetryMtx) xSemaphoreGive(telemetryMtx);
 
-    if (q == 0 || ntripSock < 0) return;
-    float lat = fabsf(latRaw),  lon = fabsf(lonRaw);
+    // Validate: need a real fix and plausible non-zero coordinates
+    if (q == 0) { ESP_LOGD(TAG, "[NTRIP] GGA skipped — no fix"); return; }
+    if (latRaw == 0.0f && lonRaw == 0.0f) { ESP_LOGW(TAG, "[NTRIP] GGA skipped — zero position"); return; }
+    if (fabsf(latRaw) > 90.0f || fabsf(lonRaw) > 180.0f) { ESP_LOGW(TAG, "[NTRIP] GGA skipped — out-of-range coords"); return; }
+
+    // Build sentence
+    float lat    = fabsf(latRaw), lon = fabsf(lonRaw);
     int   latDeg = (int)lat;  float latMin = (lat - latDeg) * 60.0f;
     int   lonDeg = (int)lon;  float lonMin = (lon - lonDeg) * 60.0f;
-    char body[96];
+    char body[100];
     snprintf(body, sizeof(body),
-             "GPGGA,000000.00,%02d%08.5f,%c,%03d%08.5f,%c,%d,%02d,%.1f,%.1f,M,0.0,M,,",
+             "GPGGA,%s,%02d%08.5f,%c,%03d%08.5f,%c,%d,%02d,%.1f,%.1f,M,0.0,M,,",
+             utc,
              latDeg, latMin, latRaw >= 0 ? 'N' : 'S',
              lonDeg, lonMin, lonRaw >= 0 ? 'E' : 'W',
              q, sats, hdopCopy, altCopy);
-    char sentence[110];
+    char sentence[120];
     snprintf(sentence, sizeof(sentence), "$%s*%02X\r\n", body, nmeaChecksum(body));
-    if (send(ntripSock, sentence, strlen(sentence), MSG_DONTWAIT) < 0 &&
-        errno != EAGAIN && errno != EWOULDBLOCK) {
-        ESP_LOGE(TAG, "[NTRIP%d] GGA send error %d", ntripActiveIdx, errno);
+
+    if (!socketSendAll(ntripSock, sentence, strlen(sentence))) {
+        ESP_LOGE(TAG, "[NTRIP%d] GGA send failed", ntripActiveIdx);
         ntripDisconnect();
         ntripFailCount++;
+        return;
     }
+    ntripLastGgaTx = millis();
+    ESP_LOGD(TAG, "[NTRIP%d] Sent GGA: %s", ntripActiveIdx, sentence);
 }
 
 // Read one line from socket into buf (strips \r). Returns char count or -1 on error.
@@ -596,6 +705,7 @@ static int sockReadLine(int sock, char *buf, size_t len) {
 
 static bool ntripConnect(int idx) {
     NtripSource &src = cfgMgr.cfg.ntrip[idx];
+    normalizeNtripSource(src);
     if (!src.enabled || strlen(src.host) == 0) return false;
 
     struct addrinfo hints = {};
@@ -643,24 +753,54 @@ static bool ntripConnect(int idx) {
         strlcat(req, "\r\n", sizeof(req));
     }
     strlcat(req, "\r\n", sizeof(req));
-    if (send(sock, req, strlen(req), 0) < 0) {
+    if (!socketSendAll(sock, req, strlen(req))) {
         ESP_LOGE(TAG, "[NTRIP%d] Request send failed", idx);
         close(sock); return false;
     }
 
-    // Read HTTP response headers
-    bool got200 = false;
+    // Validate the status line exactly. Searching every header for "200" can
+    // turn an error response (for example Content-Length: 200) into a false
+    // successful connection, after which periodic GGA looks like a garbled
+    // request to the caster.
     char line[256];
-    for (int tries = 0; tries < 30; tries++) {
+    int statusLen = sockReadLine(sock, line, sizeof(line));
+    if (statusLen < 0) {
+        ESP_LOGE(TAG, "[NTRIP%d] No response status", idx);
+        close(sock); return false;
+    }
+    ESP_LOGI(TAG, "[NTRIP%d] < %s", idx, line);
+    bool http200 = strncmp(line, "HTTP/1.0 200 ", 13) == 0 ||
+                   strncmp(line, "HTTP/1.1 200 ", 13) == 0;
+    bool icy200  = strcmp(line, "ICY 200 OK") == 0;
+    if (!http200 && !icy200) {
+        ESP_LOGE(TAG, "[NTRIP%d] Rejected status: %s", idx, line);
+        close(sock); return false;
+    }
+
+    // HTTP responses must end with a blank line. ICY/NTRIP v1 streams may put
+    // RTCM immediately after the single status line, so leave those bytes alone.
+    bool headersComplete = icy200;
+    bool nonStreamContent = false;
+    for (int tries = 0; http200 && tries < 30; tries++) {
         int n = sockReadLine(sock, line, sizeof(line));
         if (n < 0) break;
         ESP_LOGI(TAG, "[NTRIP%d] < %s", idx, line);
-        if (!got200 && strstr(line, "200")) got200 = true;
-        if (got200 && n <= 0) break;   // blank line = end of headers
+        if (n == 0) {
+            headersComplete = true;
+            break;
+        }
+        if (strncasecmp(line, "Content-Type:", 13) == 0 &&
+            (strstr(line, "text/") || strstr(line, "html") ||
+             strstr(line, "json") || strstr(line, "xml"))) {
+            nonStreamContent = true;
+        }
     }
-
-    if (!got200) {
-        ESP_LOGE(TAG, "[NTRIP%d] No 200 response", idx);
+    if (!headersComplete) {
+        ESP_LOGE(TAG, "[NTRIP%d] Incomplete response headers", idx);
+        close(sock); return false;
+    }
+    if (nonStreamContent) {
+        ESP_LOGE(TAG, "[NTRIP%d] Response is not a correction stream", idx);
         close(sock); return false;
     }
 
@@ -670,7 +810,7 @@ static bool ntripConnect(int idx) {
     ntripConnectTime  = millis();
     ntripSessionBytes = 0;
     ESP_LOGI(TAG, "[NTRIP%d] Connected OK", idx);
-    ntripSendGGA();
+    ntripSendGGA(true);
     return true;
 }
 
@@ -716,11 +856,7 @@ static void ntripLoop() {
                 ESP_LOGI(TAG, "[NTRIP%d] Server closed after %us / %u bytes",
                          ntripActiveIdx, sessSecs, ntripSessionBytes);
                 ntripDisconnect();
-                if (ntripSessionBytes > 0) {
-                    ntripLastAttempt = 0;   // immediate reconnect
-                } else {
-                    ntripFailCount++;
-                }
+                ntripFailCount++;
                 return;
             } else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                 ESP_LOGE(TAG, "[NTRIP%d] Socket error %d", ntripActiveIdx, errno);
@@ -731,9 +867,8 @@ static void ntripLoop() {
         }
     }
 
-    // Send GGA every 3 seconds
-    static uint32_t lastGgaTx = 0;
-    if (millis() - lastGgaTx > 3000) { ntripSendGGA(); lastGgaTx = millis(); }
+    // Send GGA periodically — ntripSendGGA() enforces NTRIP_GGA_INTERVAL_MS internally
+    ntripSendGGA();
 
     // Inject corrections on COM2, whose receiver input is already proven by
     // the successful startup configuration commands. NMEA output is on the
@@ -1065,6 +1200,8 @@ static esp_err_t handleSaveConfig(httpd_req_t *req) {
             if (ok && strlen(val) > 0 && strcmp(val, "(unchanged)") != 0)
                 strlcpy(cfg.ntrip[i].pass, val, sizeof(cfg.ntrip[i].pass));
         }
+
+        normalizeNtripSource(cfg.ntrip[i]);
     }
 
     if (formGet(body, "headingOffset", val, sizeof(val))) cfg.headingOffset = atof(val);
@@ -1265,13 +1402,195 @@ static esp_err_t handleRedirect(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// ── Racing / storage HTTP handlers ───────────────────────────────────────────
+
+static esp_err_t handleGetMarks(httpd_req_t *req) {
+    Mark marks[MAX_MARKS];
+    int count = storageMgr.loadMarks(marks, MAX_MARKS);
+    char *json = storageMgr.marksToJson(marks, count);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json ? json : "[]", HTTPD_RESP_USE_STRLEN);
+    if (json) free(json);
+    return ESP_OK;
+}
+
+static esp_err_t handlePostMark(httpd_req_t *req) {
+    if (!checkAuth(req)) return ESP_OK;
+    char body[512];
+    if (readBody(req, body, sizeof(body)) < 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
+        return ESP_OK;
+    }
+    cJSON *obj = cJSON_Parse(body);
+    if (!obj) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_OK;
+    }
+    Mark m = {};
+    storageMgr.generateMarkId(m.id, sizeof(m.id));
+    cJSON *v;
+    if ((v = cJSON_GetObjectItem(obj, "name")) && cJSON_IsString(v)) strlcpy(m.name, v->valuestring, sizeof(m.name));
+    if ((v = cJSON_GetObjectItem(obj, "lat"))  && cJSON_IsNumber(v)) m.lat = v->valuedouble;
+    if ((v = cJSON_GetObjectItem(obj, "lon"))  && cJSON_IsNumber(v)) m.lon = v->valuedouble;
+    m.created = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    cJSON_Delete(obj);
+
+    if (strlen(m.name) == 0) strlcpy(m.name, "Mark", sizeof(m.name));
+
+    char resp[64];
+    if (storageMgr.saveMark(m)) {
+        snprintf(resp, sizeof(resp), "{\"ok\":true,\"id\":\"%s\"}", m.id);
+    } else {
+        strlcpy(resp, "{\"ok\":false}", sizeof(resp));
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleDeleteMark(httpd_req_t *req) {
+    if (!checkAuth(req)) return ESP_OK;
+    char body[64];
+    readBody(req, body, sizeof(body));
+    cJSON *obj = cJSON_Parse(body);
+    const char *id = nullptr;
+    cJSON *v;
+    if (obj && (v = cJSON_GetObjectItem(obj, "id")) && cJSON_IsString(v)) id = v->valuestring;
+    bool ok = id && storageMgr.deleteMark(id);
+    cJSON_Delete(obj);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, ok ? "{\"ok\":true}" : "{\"ok\":false}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleGetCourses(httpd_req_t *req) {
+    Course *courses = (Course *)malloc(MAX_COURSES * sizeof(Course));
+    if (!courses) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
+    int count = storageMgr.loadCourses(courses, MAX_COURSES);
+    char *json = storageMgr.coursesToJson(courses, count);
+    free(courses);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json ? json : "[]", HTTPD_RESP_USE_STRLEN);
+    if (json) free(json);
+    return ESP_OK;
+}
+
+static esp_err_t handleStorageInfo(httpd_req_t *req) {
+    uint64_t total = 0, used = 0;
+    bool available = storageMgr.getInfo(&total, &used);
+    uint64_t freeBytes = used <= total ? total - used : 0;
+    char json[224];
+    snprintf(json, sizeof(json),
+             "{\"available\":%s,\"backend\":\"%s\",\"total\":%llu,\"used\":%llu,\"free\":%llu}",
+             available ? "true" : "false", storageMgr.backendName(),
+             (unsigned long long)total, (unsigned long long)used,
+             (unsigned long long)freeBytes);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleGpxImport(httpd_req_t *req) {
+    if (!checkAuth(req)) return ESP_OK;
+
+    int contentLen = req->content_len;
+    if (contentLen <= 0 || contentLen > 65536) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid content length");
+        return ESP_OK;
+    }
+
+    // Heap-allocate: GpxImporter contains a 64KB buffer
+    GpxImporter *importer = new GpxImporter();
+    if (!importer) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_OK;
+    }
+
+    char chunk[512];
+    int  remaining = contentLen;
+    while (remaining > 0) {
+        int toRead = MIN(remaining, (int)sizeof(chunk));
+        int r = httpd_req_recv(req, chunk, toRead);
+        if (r <= 0) break;
+        importer->feed(chunk, r, false);
+        remaining -= r;
+    }
+    importer->feed("", 0, true);
+    importer->parse();
+
+    // ── Save marks (skip duplicates by name) ─────────────────────────────────
+    Mark existing[MAX_MARKS];
+    int  existCount = storageMgr.loadMarks(existing, MAX_MARKS);
+    int  marksAdded = 0;
+
+    int newMarkCount = importer->markCount();
+    Mark *newMarks   = importer->newMarks;
+
+    for (int i = 0; i < newMarkCount; i++) {
+        bool dup = false;
+        for (int j = 0; j < existCount; j++) {
+            if (strcasecmp(existing[j].name, newMarks[i].name) == 0) {
+                // Re-use existing ID so routes can resolve against it
+                strlcpy(newMarks[i].id, existing[j].id, sizeof(newMarks[i].id));
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            storageMgr.generateMarkId(newMarks[i].id, sizeof(newMarks[i].id));
+            vTaskDelay(2);  // ensure timer-based IDs are unique
+            newMarks[i].created = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+            if (storageMgr.saveMark(newMarks[i])) {
+                existing[existCount++] = newMarks[i];
+                marksAdded++;
+            }
+        }
+    }
+
+    // ── Build and save courses (heap-allocated — 64×Course exceeds stack) ────────
+    Course *newCourses  = (Course *)malloc(MAX_COURSES * sizeof(Course));
+    Course *existCourses = (Course *)malloc(MAX_COURSES * sizeof(Course));
+    if (!newCourses || !existCourses) {
+        free(newCourses); free(existCourses);
+        delete importer;
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_OK;
+    }
+    int courseCount      = importer->buildCourses(newCourses, MAX_COURSES, existing, existCount);
+    int existCourseCount = storageMgr.loadCourses(existCourses, MAX_COURSES);
+    int coursesAdded = 0;
+
+    for (int i = 0; i < courseCount; i++) {
+        bool dup = false;
+        for (int j = 0; j < existCourseCount; j++) {
+            if (strcasecmp(existCourses[j].name, newCourses[i].name) == 0) { dup = true; break; }
+        }
+        if (!dup) {
+            storageMgr.generateCourseId(newCourses[i].id, sizeof(newCourses[i].id));
+            vTaskDelay(2);
+            if (storageMgr.saveCourse(newCourses[i])) coursesAdded++;
+        }
+    }
+    free(newCourses);
+    free(existCourses);
+
+    char resp[160];
+    snprintf(resp, sizeof(resp),
+             "{\"ok\":true,\"marks_found\":%d,\"marks_added\":%d,\"routes_found\":%d,\"courses_added\":%d}",
+             newMarkCount, marksAdded, importer->routeCount(), coursesAdded);
+    delete importer;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 // ── Web server setup ──────────────────────────────────────────────────────────
 
 static void startWebServer() {
     // ── HTTPS server on port 443 ─────────────────────────────────────────────
     httpd_ssl_config_t ssl_cfg         = HTTPD_SSL_CONFIG_DEFAULT();
     ssl_cfg.httpd.max_open_sockets     = 2;  // 2 sessions × ~10KB each; lru_purge evicts idle ones
-    ssl_cfg.httpd.max_uri_handlers     = 12; // default is 8; we register 9 handlers
+    ssl_cfg.httpd.max_uri_handlers     = 20; // default is 8
     ssl_cfg.httpd.stack_size           = 10240;
     ssl_cfg.httpd.lru_purge_enable     = true;
     ssl_cfg.servercert                 = (const uint8_t *)server_cert_pem;
@@ -1301,6 +1620,12 @@ static void startWebServer() {
     reg(webServer, "/update",      HTTP_POST, handleOTA);         // auth — OTA firmware upload
     reg(webServer, "/ble/toggle",  HTTP_POST, handleBleToggle);   // auth
     reg(webServer, "/logout",      HTTP_GET,  handleLogout);      // public — always returns 401 to bust browser auth cache
+    reg(webServer, "/marks",         HTTP_GET,  handleGetMarks);    // public — mark list
+    reg(webServer, "/marks",         HTTP_POST, handlePostMark);    // auth — add mark
+    reg(webServer, "/marks/delete",  HTTP_POST, handleDeleteMark);  // auth — delete mark
+    reg(webServer, "/courses",       HTTP_GET,  handleGetCourses);  // public — course list
+    reg(webServer, "/storage/info",  HTTP_GET,  handleStorageInfo); // public — partition stats
+    reg(webServer, "/gpx/import",    HTTP_POST, handleGpxImport);   // auth — GPX file import
 
     ESP_LOGI(TAG, "[Web] HTTPS server started on port 443");
 
@@ -1440,6 +1765,7 @@ extern "C" void app_main(void) {
     }
 
     cfgMgr.load();
+    storageMgr.begin();
     telemetryMtx = xSemaphoreCreateMutex();
     uartNmeaMtx  = xSemaphoreCreateMutex();
     ntripUpdateEnabled();
