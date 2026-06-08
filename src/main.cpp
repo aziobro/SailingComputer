@@ -1684,6 +1684,44 @@ static esp_err_t handleRaceStop(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// Export the loop buffer covering the race: 5 min before gun → 5 min after end.
+// Called after state transitions to RACE_COMPLETE, with end_ms already set.
+static void triggerRaceTrackExport() {
+    if (!trackRec.sdAvailable || trackRec.loopCount() == 0 || gpsUnixTime == 0) {
+        ESP_LOGW("Race", "Race track export skipped: sdAvail=%d count=%u gpsTime=%u",
+                 trackRec.sdAvailable, trackRec.loopCount(), gpsUnixTime);
+        return;
+    }
+    // Convert boot-millisecond timestamps to UTC unix seconds.
+    // gpsUnixTime is the GPS-derived UTC second corresponding to the current boot-ms.
+    int64_t nowMs   = (int64_t)(esp_timer_get_time() / 1000LL);
+    int64_t t0OffS  = (raceData.t0_ms  - nowMs) / 1000LL;  // seconds from now to gun
+    int64_t endOffS = (raceData.end_ms - nowMs) / 1000LL;  // seconds from now to end
+
+    uint32_t gunUnix = (uint32_t)((int64_t)gpsUnixTime + t0OffS);
+    uint32_t endUnix = (uint32_t)((int64_t)gpsUnixTime + endOffS);
+
+    static const uint32_t PAD = 300;  // 5 minutes
+    uint32_t t0 = (gunUnix > PAD) ? gunUnix - PAD : 0;
+    uint32_t t1 = endUnix + PAD;
+
+    // Clamp to actual buffer contents
+    uint32_t loopFirst = trackRec.loopFirstTs();
+    uint32_t loopLast  = trackRec.loopLastTs();
+    if (t0 < loopFirst) t0 = loopFirst;
+    if (t1 > loopLast)  t1 = loopLast;
+
+    if (t0 >= t1) {
+        ESP_LOGW("Race", "Race track export: computed window [%u,%u] is invalid — skipping", t0, t1);
+        return;
+    }
+    ESP_LOGI("Race", "Race track export: gun=%u end=%u → export [%u,%u]",
+             gunUnix, endUnix, t0, t1);
+    bool ok = trackRec.exportSegment(t0, t1);
+    ESP_LOGI("Race", "Race track export %s: %s", ok ? "OK" : "FAILED",
+             ok ? trackRec.lastFileName() : trackRec.exportErr);
+}
+
 static esp_err_t handleRaceEnd(httpd_req_t *req) {
     if (raceData.state != RACE_RACING) {
         httpd_resp_set_type(req, "application/json");
@@ -1692,6 +1730,7 @@ static esp_err_t handleRaceEnd(httpd_req_t *req) {
     }
     raceData.state  = RACE_COMPLETE;
     raceData.end_ms = (int64_t)(esp_timer_get_time() / 1000LL);
+    triggerRaceTrackExport();
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -1823,6 +1862,7 @@ static esp_err_t handleRaceNextLeg(httpd_req_t *req) {
                         raceData.state  = RACE_COMPLETE;
                         raceData.end_ms = now;
                         complete = true;
+                        triggerRaceTrackExport();
                     }
                     break;
                 }
