@@ -2066,9 +2066,9 @@ static esp_err_t handleGpxImport(httpd_req_t *req) {
 
 static esp_err_t handleTrackStatus(httpd_req_t *req) {
     char buf[640];
-    uint32_t histMin = 0;
+    uint32_t histSec = 0;
     if (trackRec.loopFirstTs() && trackRec.loopLastTs() > trackRec.loopFirstTs())
-        histMin = (trackRec.loopLastTs() - trackRec.loopFirstTs()) / 60;
+        histSec = trackRec.loopLastTs() - trackRec.loopFirstTs();
 
     // Free space on the active storage backend (0 if unavailable)
     uint64_t sdTotal = 0, sdUsed = 0;
@@ -2080,14 +2080,14 @@ static esp_err_t handleTrackStatus(httpd_req_t *req) {
     snprintf(buf, sizeof(buf),
         "{\"sdAvailable\":%s,\"sdFreeKB\":%llu"
         ",\"loopRunning\":%s,\"count\":%u,\"maxPoints\":%u"
-        ",\"firstTs\":%u,\"lastTs\":%u,\"historyMin\":%u"
+        ",\"firstTs\":%u,\"lastTs\":%u,\"historySec\":%u"
         ",\"segActive\":%s,\"segStartTs\":%u"
         ",\"fileReady\":%s,\"lastFile\":\"%s\""
         ",\"gpsTime\":%u,\"intervalSec\":%u,\"loopHours\":%u}",
         trackRec.sdAvailable ? "true" : "false", sdFreeKB,
         trackRec.loopRunning ? "true" : "false",
         trackRec.loopCount(), trackRec.loopMaxPts(),
-        trackRec.loopFirstTs(), trackRec.loopLastTs(), histMin,
+        trackRec.loopFirstTs(), trackRec.loopLastTs(), histSec,
         trackRec.segActive ? "true" : "false", trackRec.segStartTs,
         trackRec.fileReady ? "true" : "false",
         trackRec.fileReady ? trackRec.lastFileName() : "",
@@ -2203,10 +2203,14 @@ static esp_err_t handleTrackConfig(httpd_req_t *req) {
     cfgMgr.cfg.trackLoopHours   = newHours;
     cfgMgr.save();
 
-    if (changed) trackRec.reconfigure(newInterval, newHours);
-
+    // Send the response BEFORE reconfigure() — zero-filling a large loop file
+    // (e.g. 24h @ 1s = 2.7 MB) can take several seconds and the browser will
+    // time out the request if we block first.
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+
+    if (changed) trackRec.reconfigure(newInterval, newHours);
+
     return ESP_OK;
 }
 

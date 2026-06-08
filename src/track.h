@@ -205,6 +205,10 @@ public:
         writeIdx_    = 0;  count_    = 0;
         firstTs_     = 0;  lastTs_   = 0;
         lastWriteTs_ = 0;  syncCtr_  = 0;
+        // Old loop data is gone — cancel any in-progress segment mark.
+        segActive    = false;
+        segStartTs   = 0;
+        fileReady    = false;
         remove(loopPath_);
         sdAvailable = openOrCreateLoop();
         if (mtx) xSemaphoreGive(mtx);

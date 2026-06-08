@@ -1866,9 +1866,10 @@ function renderTrackPage(d) {
     sl.style.color = '#c04040';
   } else if (d.loopRunning) {
     var pct = d.maxPoints > 0 ? Math.round(d.count / d.maxPoints * 100) : 0;
-    var hist = d.historyMin >= 60
-      ? (Math.floor(d.historyMin/60) + 'h ' + (d.historyMin%60) + 'm')
-      : (d.historyMin + 'm');
+    var hs = d.historySec || 0;
+    var hist = hs < 60    ? hs + 's'
+             : hs < 3600  ? Math.floor(hs/60) + 'm'
+             : (Math.floor(hs/3600) + 'h ' + (Math.floor(hs/60)%60) + 'm');
     var freeStr = fmtStorage(sdFreeKB);
     sl.innerHTML = '&#9679; Loop running &nbsp;|&nbsp; ' + d.count + ' pts &nbsp;|&nbsp; ' +
                    hist + ' history &nbsp;|&nbsp; ' + pct + '% full &nbsp;|&nbsp; ' +
