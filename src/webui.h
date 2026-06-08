@@ -1824,6 +1824,12 @@ function loadTrackStatus() {
   }).catch(function() {});
 }
 
+function fmtStorage(kb) {
+  if (kb >= 1024 * 1024) return (kb / 1024 / 1024).toFixed(1) + ' GB';
+  if (kb >= 1024)        return Math.round(kb / 1024) + ' MB';
+  return kb + ' KB';
+}
+
 function renderTrackPage(d) {
   var sdOk     = d.sdAvailable;
   var sdFreeKB = d.sdFreeKB || 0;
@@ -1835,7 +1841,7 @@ function renderTrackPage(d) {
     warn.textContent = 'No SD card detected — insert a card to enable track recording.';
     warn.style.display = 'block';
   } else if (sdLow) {
-    warn.textContent = 'SD card low on space (' + Math.round(sdFreeKB/1024) + ' MB free) — exports may fail.';
+    warn.textContent = 'SD card low on space (' + fmtStorage(sdFreeKB) + ' free) — exports may fail.';
     warn.style.display = 'block';
     warn.style.background = '#3a2800';
     warn.style.color = '#f0a000';
@@ -1853,13 +1859,13 @@ function renderTrackPage(d) {
     var hist = d.historyMin >= 60
       ? (Math.floor(d.historyMin/60) + 'h ' + (d.historyMin%60) + 'm')
       : (d.historyMin + 'm');
-    var freeStr = sdFreeKB >= 1024 ? Math.round(sdFreeKB/1024) + ' MB' : sdFreeKB + ' KB';
+    var freeStr = fmtStorage(sdFreeKB);
     sl.innerHTML = '&#9679; Loop running &nbsp;|&nbsp; ' + d.count + ' pts &nbsp;|&nbsp; ' +
                    hist + ' history &nbsp;|&nbsp; ' + pct + '% full &nbsp;|&nbsp; ' +
                    freeStr + ' free';
     sl.style.color = '#4caf82';
   } else {
-    var freeStr2 = sdFreeKB >= 1024 ? Math.round(sdFreeKB/1024) + ' MB' : sdFreeKB + ' KB';
+    var freeStr2 = fmtStorage(sdFreeKB);
     sl.innerHTML = '&#9675; Loop stopped &nbsp;|&nbsp; ' + freeStr2 + ' free';
     sl.style.color = '#888';
   }
@@ -1874,7 +1880,9 @@ function renderTrackPage(d) {
   sb.disabled = !sdOk || !d.loopRunning || sdLow;
   if (d.segActive) {
     var t = new Date(d.segStartTs * 1000);
-    sb.textContent = '&#9632; Select Stop (started ' + t.toUTCString().slice(17,25) + 'Z)';
+    // toISOString() → "2024-01-15T14:23:00.000Z"; drop milliseconds for display
+    var iso = t.toISOString().replace('T',' ').slice(0,19) + 'Z';
+    sb.textContent = '&#9632; Select Stop (started ' + iso + ')';
     sb.style.background = '#8B1A1A';
   } else {
     sb.textContent = 'Select Start';
