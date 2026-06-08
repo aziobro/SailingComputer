@@ -1479,14 +1479,131 @@ static esp_err_t handleStorageInfo(httpd_req_t *req) {
     uint64_t total = 0, used = 0;
     bool available = storageMgr.getInfo(&total, &used);
     uint64_t freeBytes = used <= total ? total - used : 0;
-    char json[224];
+    char json[256];
     snprintf(json, sizeof(json),
-             "{\"available\":%s,\"backend\":\"%s\",\"total\":%llu,\"used\":%llu,\"free\":%llu}",
+             "{\"available\":%s,\"backend\":\"%s\",\"mount_point\":\"%s\","
+             "\"total\":%llu,\"used\":%llu,\"free\":%llu}",
              available ? "true" : "false", storageMgr.backendName(),
+             storageMgr.mountPoint(),
              (unsigned long long)total, (unsigned long long)used,
              (unsigned long long)freeBytes);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// ── File manager HTTP handlers ────────────────────────────────────────────────
+
+static esp_err_t handleFilesList(httpd_req_t *req) {
+    char path[128] = {};
+    size_t qLen = httpd_req_get_url_query_len(req);
+    if (qLen > 0 && qLen < sizeof(path) + 10) {
+        char qbuf[160];
+        if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK)
+            httpd_query_key_value(qbuf, "path", path, sizeof(path));
+    }
+    if (path[0] == '\0') strlcpy(path, storageMgr.mountPoint(), sizeof(path));
+    const char *safe = storageMgr.safePath(path);
+    if (!safe) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path"); return ESP_OK; }
+    char *json = storageMgr.listDir(safe);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json ? json : "[]", HTTPD_RESP_USE_STRLEN);
+    if (json) free(json);
+    return ESP_OK;
+}
+
+static esp_err_t handleFilesRename(httpd_req_t *req) {
+    if (!checkAuth(req)) return ESP_OK;
+    char body[512];
+    if (readBody(req, body, sizeof(body)) < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large"); return ESP_OK; }
+    cJSON *obj = cJSON_Parse(body);
+    const char *from = nullptr, *to = nullptr;
+    cJSON *v;
+    if (obj) {
+        if ((v = cJSON_GetObjectItem(obj, "from")) && cJSON_IsString(v)) from = v->valuestring;
+        if ((v = cJSON_GetObjectItem(obj, "to"))   && cJSON_IsString(v)) to   = v->valuestring;
+    }
+    bool ok = from && to &&
+              storageMgr.safePath(from) && storageMgr.safePath(to) &&
+              storageMgr.renameEntry(from, to);
+    cJSON_Delete(obj);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, ok ? "{\"ok\":true}" : "{\"ok\":false}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleFilesDelete(httpd_req_t *req) {
+    if (!checkAuth(req)) return ESP_OK;
+    char body[256];
+    readBody(req, body, sizeof(body));
+    cJSON *obj = cJSON_Parse(body);
+    const char *path = nullptr;
+    cJSON *v;
+    if (obj && (v = cJSON_GetObjectItem(obj, "path")) && cJSON_IsString(v)) path = v->valuestring;
+    bool ok = path && storageMgr.safePath(path) && storageMgr.deleteEntry(path);
+    cJSON_Delete(obj);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, ok ? "{\"ok\":true}" : "{\"ok\":false}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleFilesCopy(httpd_req_t *req) {
+    if (!checkAuth(req)) return ESP_OK;
+    char body[512];
+    readBody(req, body, sizeof(body));
+    cJSON *obj = cJSON_Parse(body);
+    const char *src = nullptr, *dst = nullptr;
+    cJSON *v;
+    if (obj) {
+        if ((v = cJSON_GetObjectItem(obj, "src")) && cJSON_IsString(v)) src = v->valuestring;
+        if ((v = cJSON_GetObjectItem(obj, "dst")) && cJSON_IsString(v)) dst = v->valuestring;
+    }
+    bool ok = src && dst &&
+              storageMgr.safePath(src) && storageMgr.safePath(dst) &&
+              storageMgr.copyFile(src, dst);
+    cJSON_Delete(obj);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, ok ? "{\"ok\":true}" : "{\"ok\":false}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleFilesDownload(httpd_req_t *req) {
+    char path[128] = {};
+    size_t qLen = httpd_req_get_url_query_len(req);
+    if (qLen > 0 && qLen < sizeof(path) + 10) {
+        char qbuf[160];
+        if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK)
+            httpd_query_key_value(qbuf, "path", path, sizeof(path));
+    }
+    const char *safe = storageMgr.safePath(path);
+    if (!safe || !path[0]) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path"); return ESP_OK; }
+    struct stat st;
+    if (stat(safe, &st) != 0 || S_ISDIR(st.st_mode)) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found"); return ESP_OK;
+    }
+    FILE *f = fopen(safe, "rb");
+    if (!f) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Open failed"); return ESP_OK; }
+    const char *filename = strrchr(safe, '/');
+    filename = filename ? filename + 1 : safe;
+    char disp[128];
+    snprintf(disp, sizeof(disp), "attachment; filename=\"%s\"", filename);
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Content-Disposition", disp);
+    char buf[512];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        if (httpd_resp_send_chunk(req, buf, (ssize_t)n) != ESP_OK) break;
+    }
+    fclose(f);
+    httpd_resp_send_chunk(req, nullptr, 0);
+    return ESP_OK;
+}
+
+static esp_err_t handleSdFormat(httpd_req_t *req) {
+    if (!checkAuth(req)) return ESP_OK;
+    bool ok = storageMgr.formatSdCard();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, ok ? "{\"ok\":true}" : "{\"ok\":false}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -1590,7 +1707,7 @@ static void startWebServer() {
     // ── HTTPS server on port 443 ─────────────────────────────────────────────
     httpd_ssl_config_t ssl_cfg         = HTTPD_SSL_CONFIG_DEFAULT();
     ssl_cfg.httpd.max_open_sockets     = 2;  // 2 sessions × ~10KB each; lru_purge evicts idle ones
-    ssl_cfg.httpd.max_uri_handlers     = 20; // default is 8
+    ssl_cfg.httpd.max_uri_handlers     = 24; // default is 8
     ssl_cfg.httpd.stack_size           = 10240;
     ssl_cfg.httpd.lru_purge_enable     = true;
     ssl_cfg.servercert                 = (const uint8_t *)server_cert_pem;
@@ -1620,12 +1737,18 @@ static void startWebServer() {
     reg(webServer, "/update",      HTTP_POST, handleOTA);         // auth — OTA firmware upload
     reg(webServer, "/ble/toggle",  HTTP_POST, handleBleToggle);   // auth
     reg(webServer, "/logout",      HTTP_GET,  handleLogout);      // public — always returns 401 to bust browser auth cache
-    reg(webServer, "/marks",         HTTP_GET,  handleGetMarks);    // public — mark list
-    reg(webServer, "/marks",         HTTP_POST, handlePostMark);    // auth — add mark
-    reg(webServer, "/marks/delete",  HTTP_POST, handleDeleteMark);  // auth — delete mark
-    reg(webServer, "/courses",       HTTP_GET,  handleGetCourses);  // public — course list
-    reg(webServer, "/storage/info",  HTTP_GET,  handleStorageInfo); // public — partition stats
-    reg(webServer, "/gpx/import",    HTTP_POST, handleGpxImport);   // auth — GPX file import
+    reg(webServer, "/marks",           HTTP_GET,  handleGetMarks);    // public — mark list
+    reg(webServer, "/marks",           HTTP_POST, handlePostMark);    // auth — add mark
+    reg(webServer, "/marks/delete",    HTTP_POST, handleDeleteMark);  // auth — delete mark
+    reg(webServer, "/courses",         HTTP_GET,  handleGetCourses);  // public — course list
+    reg(webServer, "/storage/info",    HTTP_GET,  handleStorageInfo); // public — partition stats
+    reg(webServer, "/gpx/import",      HTTP_POST, handleGpxImport);   // auth — GPX file import
+    reg(webServer, "/files/list",      HTTP_GET,  handleFilesList);    // public — directory listing
+    reg(webServer, "/files/rename",    HTTP_POST, handleFilesRename);  // auth — rename entry
+    reg(webServer, "/files/delete",    HTTP_POST, handleFilesDelete);  // auth — delete entry
+    reg(webServer, "/files/copy",      HTTP_POST, handleFilesCopy);    // auth — copy file
+    reg(webServer, "/files/download",  HTTP_GET,  handleFilesDownload);// public — download file
+    reg(webServer, "/sdcard/format",   HTTP_POST, handleSdFormat);     // auth — format SD card
 
     ESP_LOGI(TAG, "[Web] HTTPS server started on port 443");
 

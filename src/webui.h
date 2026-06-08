@@ -72,6 +72,7 @@ inline const char* getWebUI() {
   <button class="active" onclick="showPage('status',this)">Status</button>
   <button onclick="showPage('config',this)">Configuration</button>
   <button onclick="showPage('racing',this)">Racing</button>
+  <button onclick="showPage('files',this)">Files</button>
   <button onclick="showPage('system',this)">System</button>
   <button class="logout" onclick="doLogout()">&#x23FB; Log Out</button>
 </nav>
@@ -389,9 +390,14 @@ inline const char* getWebUI() {
     <div id="gpxResult" style="margin-top:10px;font-size:0.85rem;display:none"></div>
   </div>
 
-  <!-- Storage Debug -->
+</div>
+
+<!-- FILES PAGE -->
+<div id="files" class="page">
+
+  <!-- Storage summary -->
   <div class="card">
-    <h2>Storage Info <button class="btn" style="padding:3px 10px;font-size:0.75rem;margin-left:8px;background:#1a3a5c" onclick="loadStorageInfo()">Refresh</button></h2>
+    <h2>Storage <button class="btn" style="padding:3px 10px;font-size:0.75rem;margin-left:8px;background:#1a3a5c" onclick="loadStorageInfo()">&#8635; Refresh</button></h2>
     <div id="storageInfo" style="font-size:0.85rem;color:#7a9ab8">Loading&hellip;</div>
     <div style="margin-top:10px">
       <div style="background:#091a36;border-radius:4px;height:10px;overflow:hidden">
@@ -399,6 +405,39 @@ inline const char* getWebUI() {
       </div>
     </div>
   </div>
+
+  <!-- File browser -->
+  <div class="card">
+    <h2>File Browser</h2>
+    <div id="fileBreadcrumb" style="font-size:0.82rem;color:#7a9ab8;margin-bottom:12px;word-break:break-all;line-height:1.8">
+      /
+    </div>
+    <div style="overflow-x:auto">
+      <table style="width:100%;border-collapse:collapse;font-size:0.85rem">
+        <thead>
+          <tr style="font-size:0.72rem;color:#5a7a9a;text-transform:uppercase">
+            <th style="text-align:left;padding:4px 8px">Name</th>
+            <th style="text-align:right;padding:4px 8px;white-space:nowrap">Size</th>
+            <th style="text-align:right;padding:4px 6px">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="fileList">
+          <tr><td colspan="3" style="padding:10px 8px;color:#5a7a9a">Loading&hellip;</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Danger zone -->
+  <div class="card">
+    <h2 style="color:#e85a5a">Danger Zone</h2>
+    <p style="font-size:0.82rem;color:#7a9ab8;margin-bottom:12px">
+      Formatting erases <strong>all files</strong> on the SD card, then recreates the empty marks and courses files.
+      This cannot be undone.
+    </p>
+    <button class="btn btn-danger" onclick="formatSd()">&#9888; Format SD Card</button>
+  </div>
+
 </div>
 
 <div class="toast" id="toast"></div>
@@ -432,7 +471,8 @@ function showPage(id, btn) {
   document.getElementById(id).classList.add('active');
   btn.classList.add('active');
   if (id === 'config') loadConfig();
-  if (id === 'racing') { loadMarks(); loadCourses(); loadStorageInfo(); }
+  if (id === 'racing') { loadMarks(); loadCourses(); }
+  if (id === 'files')  { initFilesPage(); }
   if (id === 'system') {
     fetch('/config').then(function(r) {
       if (r.ok) hideAuthWall('system');
@@ -928,7 +968,6 @@ function addMark() {
       document.getElementById('mkLat').value  = '';
       document.getElementById('mkLon').value  = '';
       loadMarks();
-      loadStorageInfo();
     } else { toast('Save failed', false); }
   }).catch(function() { toast('Request failed', false); });
 }
@@ -939,7 +978,7 @@ function deleteMark(id) {
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({id:id})
   }).then(r => r.json()).then(function(res) {
-    if (res.ok) { toast('Mark deleted'); loadMarks(); loadStorageInfo(); }
+    if (res.ok) { toast('Mark deleted'); loadMarks(); }
     else toast('Delete failed', false);
   }).catch(function() { toast('Request failed', false); });
 }
@@ -1004,7 +1043,6 @@ function importGpx() {
         res.courses_added + ' courses added.';
       loadMarks();
       loadCourses();
-      loadStorageInfo();
     } else {
       resultEl.style.color = '#e85a5a';
       resultEl.textContent = 'Import failed.';
@@ -1038,6 +1076,154 @@ function loadStorageInfo() {
 
 function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Files page ────────────────────────────────────────────────────────────────
+var fileBrowserPath = '/sdcard';
+var fileEntries     = [];
+var storageMountPt  = '/sdcard';
+
+function initFilesPage() {
+  fetch('/storage/info').then(r => r.json()).then(function(s) {
+    storageMountPt  = s.mount_point || '/sdcard';
+    fileBrowserPath = storageMountPt;
+    loadStorageInfo();
+    loadFiles(fileBrowserPath);
+  }).catch(function() {
+    loadStorageInfo();
+    loadFiles(fileBrowserPath);
+  });
+}
+
+function loadFiles(path) {
+  fileBrowserPath = path;
+  renderBreadcrumb(path);
+  var tbody = document.getElementById('fileList');
+  tbody.innerHTML = '<tr><td colspan="3" style="padding:10px 8px;color:#5a7a9a">Loading&hellip;</td></tr>';
+  fetch('/files/list?path=' + encodeURIComponent(path))
+    .then(r => r.json())
+    .then(function(entries) {
+      fileEntries = entries.sort(function(a, b) {
+        if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+        return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+      });
+      var rows = '';
+      // Parent row when not at mount root
+      if (path !== storageMountPt) {
+        var parent = path.substring(0, path.lastIndexOf('/')) || storageMountPt;
+        rows += '<tr style="border-bottom:1px solid #0d2244">' +
+          '<td colspan="3" style="padding:5px 8px">' +
+          '<span style="cursor:pointer;color:#5ab4e8" onclick="loadFiles(\'' + escHtml(parent) + '\')">' +
+          '&#8679; ..</span></td></tr>';
+      }
+      if (!fileEntries.length) {
+        rows += '<tr><td colspan="3" style="padding:10px 8px;color:#5a7a9a">Empty directory</td></tr>';
+      }
+      fileEntries.forEach(function(e, i) {
+        var sizeStr = e.is_dir ? '<span style="color:#5a7a9a">Folder</span>' :
+          (e.size >= 1048576 ? (e.size/1048576).toFixed(1)+' MB' :
+           e.size >= 1024    ? (e.size/1024).toFixed(1)+' KB'    :
+           e.size + ' B');
+        var icon = e.is_dir ? '&#128193;' : '&#128196;';
+        var nameCell = e.is_dir
+          ? '<span style="cursor:pointer;color:#5ab4e8" onclick="loadFiles(fileEntries['+i+'].path)">' + icon + ' ' + escHtml(e.name) + '</span>'
+          : icon + ' ' + escHtml(e.name);
+        var actions = '<span style="white-space:nowrap">';
+        if (!e.is_dir)
+          actions += '<button class="btn" style="padding:2px 7px;font-size:0.75rem;background:#1a3a5c;margin:1px" title="Download" onclick="downloadFile('+i+')">&#8595;</button>';
+        actions += '<button class="btn" style="padding:2px 7px;font-size:0.75rem;background:#1a3a5c;margin:1px" title="Rename" onclick="renameEntry('+i+')">&#9998;</button>';
+        if (!e.is_dir)
+          actions += '<button class="btn" style="padding:2px 7px;font-size:0.75rem;background:#1a3a5c;margin:1px" title="Copy" onclick="copyFilePrompt('+i+')">&#10064;</button>';
+        actions += '<button class="btn btn-danger" style="padding:2px 7px;font-size:0.75rem;margin:1px" title="Delete" onclick="deleteEntry('+i+')">&#128465;</button>';
+        actions += '</span>';
+        rows += '<tr style="border-bottom:1px solid #0d2244">' +
+          '<td style="padding:6px 8px">' + nameCell + '</td>' +
+          '<td style="padding:6px 8px;text-align:right;color:#aac8e0;font-variant-numeric:tabular-nums">' + sizeStr + '</td>' +
+          '<td style="padding:6px 4px;text-align:right">' + actions + '</td></tr>';
+      });
+      tbody.innerHTML = rows;
+    })
+    .catch(function() {
+      document.getElementById('fileList').innerHTML =
+        '<tr><td colspan="3" style="padding:10px 8px;color:#e85a5a">Failed to load directory</td></tr>';
+    });
+}
+
+function renderBreadcrumb(path) {
+  var parts = path.split('/').filter(function(p) { return p.length > 0; });
+  var html  = '';
+  var built = '';
+  parts.forEach(function(part, i) {
+    built += '/' + part;
+    var b = built;
+    if (i < parts.length - 1) {
+      html += '<span style="cursor:pointer;color:#5ab4e8" onclick="loadFiles(\'' + escHtml(b) + '\')">' +
+              escHtml(part) + '</span><span style="color:#2a4a7f;margin:0 4px">/</span>';
+    } else {
+      html += '<span style="color:#e0e8f0">' + escHtml(part) + '</span>';
+    }
+  });
+  document.getElementById('fileBreadcrumb').innerHTML =
+    '<span style="color:#2a4a7f;margin-right:4px">/</span>' + html;
+}
+
+function renameEntry(idx) {
+  var e = fileEntries[idx];
+  var newName = prompt('Rename "' + e.name + '" to:', e.name);
+  if (!newName || newName === e.name) return;
+  var dir = e.path.substring(0, e.path.lastIndexOf('/'));
+  fetch('/files/rename', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({from: e.path, to: dir + '/' + newName})
+  }).then(r => r.json()).then(function(res) {
+    if (res.ok) { toast('Renamed'); loadFiles(fileBrowserPath); }
+    else toast('Rename failed', false);
+  }).catch(function() { toast('Request failed', false); });
+}
+
+function deleteEntry(idx) {
+  var e = fileEntries[idx];
+  if (!confirm('Delete ' + (e.is_dir ? 'folder' : 'file') + ' "' + e.name + '"?')) return;
+  fetch('/files/delete', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({path: e.path})
+  }).then(r => r.json()).then(function(res) {
+    if (res.ok) { toast('Deleted'); loadFiles(fileBrowserPath); loadStorageInfo(); }
+    else toast('Delete failed', false);
+  }).catch(function() { toast('Request failed', false); });
+}
+
+function copyFilePrompt(idx) {
+  var e = fileEntries[idx];
+  var newName = prompt('Copy "' + e.name + '" as:', 'copy_of_' + e.name);
+  if (!newName) return;
+  var dir = e.path.substring(0, e.path.lastIndexOf('/'));
+  fetch('/files/copy', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({src: e.path, dst: dir + '/' + newName})
+  }).then(r => r.json()).then(function(res) {
+    if (res.ok) { toast('Copied'); loadFiles(fileBrowserPath); loadStorageInfo(); }
+    else toast('Copy failed', false);
+  }).catch(function() { toast('Request failed', false); });
+}
+
+function downloadFile(idx) {
+  window.location.href = '/files/download?path=' + encodeURIComponent(fileEntries[idx].path);
+}
+
+function formatSd() {
+  if (!confirm('WARNING: This will permanently erase ALL files on the SD card.\n\nContinue?')) return;
+  if (!confirm('Second confirmation required.\n\nFormat SD card and lose all data?')) return;
+  fetch('/sdcard/format', {method:'POST'}).then(r => r.json()).then(function(res) {
+    if (res.ok) {
+      toast('SD card formatted');
+      fileBrowserPath = storageMountPt;
+      loadFiles(storageMountPt);
+      loadStorageInfo();
+    } else {
+      toast('Format failed', false);
+    }
+  }).catch(function() { toast('Request failed', false); });
 }
 </script>
 </body>

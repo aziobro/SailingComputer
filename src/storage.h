@@ -88,6 +88,109 @@ public:
         return backend == Backend::SdCard;
     }
 
+    const char *mountPoint() const {
+        if (backend == Backend::SdCard) return SD_MOUNT_POINT;
+        if (backend == Backend::Spiffs) return SPIFFS_MOUNT_POINT;
+        return "";
+    }
+
+    // Returns path if safely under the active mount point, else nullptr.
+    // Rejects empty strings, wrong prefix, and path traversal sequences.
+    const char *safePath(const char *path) const {
+        if (!path || !path[0]) return nullptr;
+        const char *mp = mountPoint();
+        size_t mpLen = strlen(mp);
+        if (mpLen == 0) return nullptr;
+        if (strncmp(path, mp, mpLen) != 0) return nullptr;
+        if (path[mpLen] != '\0' && path[mpLen] != '/') return nullptr;
+        if (strstr(path, "..")) return nullptr;
+        return path;
+    }
+
+    // ── File browser ─────────────────────────────────────────────────────────
+
+    // Returns heap-allocated JSON array of directory entries; caller must free().
+    char *listDir(const char *path) {
+        if (!mounted || !path) return nullptr;
+        DIR *d = opendir(path);
+        if (!d) return nullptr;
+        cJSON *arr = cJSON_CreateArray();
+        struct dirent *ent;
+        while ((ent = readdir(d)) != nullptr) {
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+            char fp[160];
+            snprintf(fp, sizeof(fp), "%s/%s", path, ent->d_name);
+            struct stat st = {};
+            stat(fp, &st);
+            bool isDir = S_ISDIR(st.st_mode);
+            cJSON *o = cJSON_CreateObject();
+            cJSON_AddStringToObject(o, "name",   ent->d_name);
+            cJSON_AddStringToObject(o, "path",   fp);
+            cJSON_AddBoolToObject  (o, "is_dir", isDir);
+            cJSON_AddNumberToObject(o, "size",   isDir ? 0 : (double)st.st_size);
+            cJSON_AddItemToArray(arr, o);
+        }
+        closedir(d);
+        char *json = cJSON_PrintUnformatted(arr);
+        cJSON_Delete(arr);
+        return json;
+    }
+
+    bool renameEntry(const char *from, const char *to) {
+        if (!from || !to || !mounted) return false;
+        int r = rename(from, to);
+        if (r != 0) ESP_LOGW(STORAGE_TAG, "Rename %s→%s failed: errno %d", from, to, errno);
+        return r == 0;
+    }
+
+    bool deleteEntry(const char *path) {
+        if (!path || !mounted) return false;
+        struct stat st;
+        if (stat(path, &st) != 0) return false;
+        int r = S_ISDIR(st.st_mode) ? rmdir(path) : unlink(path);
+        if (r != 0) ESP_LOGW(STORAGE_TAG, "Delete %s failed: errno %d", path, errno);
+        return r == 0;
+    }
+
+    bool copyFile(const char *src, const char *dst) {
+        if (!src || !dst || !mounted) return false;
+        FILE *in = fopen(src, "rb");
+        if (!in) return false;
+        FILE *out = fopen(dst, "wb");
+        if (!out) { fclose(in); return false; }
+        char buf[512];
+        bool ok = true;
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+            if (fwrite(buf, 1, n, out) != n) { ok = false; break; }
+        }
+        if (ferror(in)) ok = false;
+        fclose(in);
+        fflush(out); fsync(fileno(out));
+        fclose(out);
+        if (!ok) { unlink(dst); ESP_LOGW(STORAGE_TAG, "Copy %s→%s failed", src, dst); }
+        return ok;
+    }
+
+    // Formats the SD card FAT partition, then recreates default data files.
+    // SD card only — returns false if backend is SPIFFS.
+    bool formatSdCard() {
+        if (backend != Backend::SdCard || !sdCard) {
+            ESP_LOGE(STORAGE_TAG, "Format requires SD card backend");
+            return false;
+        }
+        ESP_LOGW(STORAGE_TAG, "Formatting SD card — all data will be erased");
+        esp_err_t ret = esp_vfs_fat_sdcard_format(SD_MOUNT_POINT, sdCard);
+        if (ret != ESP_OK) {
+            ESP_LOGE(STORAGE_TAG, "Format failed: %s", esp_err_to_name(ret));
+            return false;
+        }
+        ESP_LOGI(STORAGE_TAG, "SD card formatted — recreating default files");
+        ensureFile(marksPath(), "[]");
+        ensureFile(coursesPath(), "[]");
+        return true;
+    }
+
     // ── Marks ────────────────────────────────────────────────────────────────
     int loadMarks(Mark *marks, int max_count) {
         char *buf = readFile(marksPath());
