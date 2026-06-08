@@ -34,6 +34,7 @@ struct LoopHeader {
 
 class TrackRecorder {
 public:
+    bool     sdAvailable = false;   // loop file opened successfully on SD card
     bool     loopRunning = false;   // user-controlled start/stop
     bool     segActive   = false;   // between Select Start and Select Stop
     uint32_t segStartTs  = 0;
@@ -55,16 +56,16 @@ public:
         mkdir(dir, 0755);  // no-op if already exists
 
         snprintf(loopPath_, sizeof(loopPath_), "%s/.loop.bin", dir);
-        bool ok = openOrCreateLoop();
-        if (ok) ESP_LOGI(TRACK_TAG, "begin ok  maxPts=%u interval=%us", maxPts_, intervalSec_);
-        return ok;
+        sdAvailable = openOrCreateLoop();
+        if (sdAvailable) ESP_LOGI(TRACK_TAG, "begin ok  maxPts=%u interval=%us", maxPts_, intervalSec_);
+        return sdAvailable;
     }
 
     // Called from the NMEA parse task for every GGA with fix>0.
     // Thread-safe; rate-limited internally.
     void tryWrite(double lat, double lon, float hdt, float heel,
                   float sog, float cog, uint8_t fix, uint32_t ts) {
-        if (!loopRunning || fix == 0 || ts == 0) return;
+        if (!sdAvailable || !loopRunning || fix == 0 || ts == 0) return;
         if (ts == lastWriteTs_ && lastWriteTs_ != 0) return;          // same second
         if (ts - lastWriteTs_ < intervalSec_ && lastWriteTs_ != 0) return;
         lastWriteTs_ = ts;
@@ -187,7 +188,7 @@ public:
         lastTs_      = 0;
         lastWriteTs_ = 0;
         remove(loopPath_);
-        openOrCreateLoop();
+        sdAvailable = openOrCreateLoop();
         if (mtx) xSemaphoreGive(mtx);
     }
 

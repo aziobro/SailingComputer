@@ -2065,17 +2065,26 @@ static esp_err_t handleGpxImport(httpd_req_t *req) {
 // ── Track recording handlers ──────────────────────────────────────────────────
 
 static esp_err_t handleTrackStatus(httpd_req_t *req) {
-    char buf[512];
+    char buf[640];
     uint32_t histMin = 0;
     if (trackRec.loopFirstTs() && trackRec.loopLastTs() > trackRec.loopFirstTs())
         histMin = (trackRec.loopLastTs() - trackRec.loopFirstTs()) / 60;
 
+    // Free space on the active storage backend (0 if unavailable)
+    uint64_t sdTotal = 0, sdUsed = 0;
+    uint64_t sdFreeKB = 0;
+    if (storageMgr.mounted && storageMgr.isSdCard() &&
+        storageMgr.getInfo(&sdTotal, &sdUsed))
+        sdFreeKB = (sdTotal > sdUsed) ? (sdTotal - sdUsed) / 1024 : 0;
+
     snprintf(buf, sizeof(buf),
-        "{\"loopRunning\":%s,\"count\":%u,\"maxPoints\":%u"
+        "{\"sdAvailable\":%s,\"sdFreeKB\":%llu"
+        ",\"loopRunning\":%s,\"count\":%u,\"maxPoints\":%u"
         ",\"firstTs\":%u,\"lastTs\":%u,\"historyMin\":%u"
         ",\"segActive\":%s,\"segStartTs\":%u"
         ",\"fileReady\":%s,\"lastFile\":\"%s\""
         ",\"gpsTime\":%u,\"intervalSec\":%u,\"loopHours\":%u}",
+        trackRec.sdAvailable ? "true" : "false", sdFreeKB,
         trackRec.loopRunning ? "true" : "false",
         trackRec.loopCount(), trackRec.loopMaxPts(),
         trackRec.loopFirstTs(), trackRec.loopLastTs(), histMin,
@@ -2089,7 +2098,14 @@ static esp_err_t handleTrackStatus(httpd_req_t *req) {
 }
 
 static esp_err_t handleTrackLoopStart(httpd_req_t *req) {
+    if (!trackRec.sdAvailable) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"no SD card\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
     trackRec.loopRunning = true;
+    httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -2103,8 +2119,15 @@ static esp_err_t handleTrackLoopStop(httpd_req_t *req) {
 
 // POST /tracks/segment/start — mark current GPS time as segment start
 static esp_err_t handleTrackSegStart(httpd_req_t *req) {
+    if (!trackRec.sdAvailable) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"no SD card\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
     if (gpsUnixTime == 0) {
         httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, "{\"ok\":false,\"error\":\"no GPS time\"}", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
@@ -2122,7 +2145,19 @@ static esp_err_t handleTrackSegStart(httpd_req_t *req) {
 static esp_err_t handleTrackSegStop(httpd_req_t *req) {
     if (!trackRec.segActive) {
         httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, "{\"ok\":false,\"error\":\"no active segment\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    // Require at least 2 MB free so the GPX file has room to be written.
+    uint64_t sdTotal = 0, sdUsed = 0;
+    if (!storageMgr.mounted || !storageMgr.isSdCard() ||
+        !storageMgr.getInfo(&sdTotal, &sdUsed) ||
+        (sdTotal - sdUsed) < 2ULL * 1024 * 1024) {
+        trackRec.segActive = false;
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"SD card full or unavailable\"}", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
     uint32_t t0 = trackRec.segStartTs;

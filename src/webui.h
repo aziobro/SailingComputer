@@ -539,6 +539,9 @@ inline const char* getWebUI() {
 
   <div class="card">
     <h2>Track Recording</h2>
+    <div id="trackSdWarning" style="display:none;padding:.5rem .75rem;border-radius:6px;
+         background:#3a1010;color:#e85a5a;font-size:.88rem;margin-bottom:.75rem">
+    </div>
     <div id="trackStatusLine" style="margin-bottom:1rem;font-size:.9rem;color:#aaa">
       Initializing…
     </div>
@@ -1822,28 +1825,53 @@ function loadTrackStatus() {
 }
 
 function renderTrackPage(d) {
+  var sdOk     = d.sdAvailable;
+  var sdFreeKB = d.sdFreeKB || 0;
+  var sdLow    = sdOk && sdFreeKB < 2048;  // < 2 MB free
+
+  // SD / space warning banner
+  var warn = document.getElementById('trackSdWarning');
+  if (!sdOk) {
+    warn.textContent = 'No SD card detected — insert a card to enable track recording.';
+    warn.style.display = 'block';
+  } else if (sdLow) {
+    warn.textContent = 'SD card low on space (' + Math.round(sdFreeKB/1024) + ' MB free) — exports may fail.';
+    warn.style.display = 'block';
+    warn.style.background = '#3a2800';
+    warn.style.color = '#f0a000';
+  } else {
+    warn.style.display = 'none';
+  }
+
   // Status line
   var sl = document.getElementById('trackStatusLine');
-  if (d.loopRunning) {
+  if (!sdOk) {
+    sl.innerHTML = '&#9675; No SD card';
+    sl.style.color = '#c04040';
+  } else if (d.loopRunning) {
     var pct = d.maxPoints > 0 ? Math.round(d.count / d.maxPoints * 100) : 0;
     var hist = d.historyMin >= 60
       ? (Math.floor(d.historyMin/60) + 'h ' + (d.historyMin%60) + 'm')
       : (d.historyMin + 'm');
+    var freeStr = sdFreeKB >= 1024 ? Math.round(sdFreeKB/1024) + ' MB' : sdFreeKB + ' KB';
     sl.innerHTML = '&#9679; Loop running &nbsp;|&nbsp; ' + d.count + ' pts &nbsp;|&nbsp; ' +
-                   hist + ' history &nbsp;|&nbsp; ' + pct + '% full';
+                   hist + ' history &nbsp;|&nbsp; ' + pct + '% full &nbsp;|&nbsp; ' +
+                   freeStr + ' free';
     sl.style.color = '#4caf82';
   } else {
-    sl.innerHTML = '&#9675; Loop stopped';
+    var freeStr2 = sdFreeKB >= 1024 ? Math.round(sdFreeKB/1024) + ' MB' : sdFreeKB + ' KB';
+    sl.innerHTML = '&#9675; Loop stopped &nbsp;|&nbsp; ' + freeStr2 + ' free';
     sl.style.color = '#888';
   }
 
   // Loop start/stop button
   var lb = document.getElementById('trackLoopBtn');
+  lb.disabled = !sdOk;
   lb.textContent = d.loopRunning ? '&#9632; Stop Loop' : '&#9654; Start Loop';
 
   // Segment button
   var sb = document.getElementById('trackSegBtn');
-  sb.disabled = !d.loopRunning;
+  sb.disabled = !sdOk || !d.loopRunning || sdLow;
   if (d.segActive) {
     var t = new Date(d.segStartTs * 1000);
     sb.textContent = '&#9632; Select Stop (started ' + t.toUTCString().slice(17,25) + 'Z)';
@@ -1868,6 +1896,9 @@ function renderTrackPage(d) {
   var lh = document.getElementById('trackLoopHrsSel');
   if (!iv._loaded) { iv.value = String(d.intervalSec); iv._loaded = true; }
   if (!lh._loaded) { lh.value = String(d.loopHours);   lh._loaded = true; }
+
+  // Settings save is always allowed (persists to NVS; loop rebuilt when SD returns)
+  // but warn via the existing banner if SD is absent
 }
 
 function toggleTrackLoop() {
