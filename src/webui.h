@@ -71,7 +71,8 @@ inline const char* getWebUI() {
 <nav>
   <button class="active" onclick="showPage('status',this)">Status</button>
   <button onclick="showPage('config',this)">Configuration</button>
-  <button onclick="showPage('racing',this)">Racing</button>
+  <button onclick="showPage('start',this)">Race</button>
+  <button onclick="showPage('marks',this)">Marks/Routes</button>
   <button onclick="showPage('files',this)">Files</button>
   <button onclick="showPage('system',this)">System</button>
   <button class="logout" onclick="doLogout()">&#x23FB; Log Out</button>
@@ -263,7 +264,16 @@ inline const char* getWebUI() {
       <p style="font-size:0.8rem;color:#8899aa;margin:0.25rem 0 0.75rem">Degrees added to UM982 heading. Default 90&deg; for port/starboard aft-rail mounting (ANT1=stbd, ANT2=port). Set 0 for fore/aft mounting.</p>
       <label>COG Minimum SOG (knots)</label>
       <input type="number" name="cogMinSog" id="cogMinSog" value="0.1" min="0" max="5" step="0.1">
-      <p style="font-size:0.8rem;color:#8899aa;margin:0.25rem 0 0">COG is frozen below this speed to suppress GPS position noise. Default 0.1 kts. Increase if COG is still unstable at rest.</p>
+      <p style="font-size:0.8rem;color:#8899aa;margin:0.25rem 0 0.75rem">COG is frozen below this speed to suppress GPS position noise. Default 0.1 kts. Increase if COG is still unstable at rest.</p>
+      <label>GPS Update Rate</label>
+      <select name="gpsUpdateRate" id="gpsUpdateRate">
+        <option value="1">1 Hz</option>
+        <option value="2">2 Hz</option>
+        <option value="5">5 Hz</option>
+        <option value="10">10 Hz</option>
+        <option value="20">20 Hz</option>
+      </select>
+      <p style="font-size:0.8rem;color:#8899aa;margin:0.25rem 0 0">NMEA sentence output rate. Higher rates improve responsiveness but increase CPU load. 10 Hz is recommended for most use.</p>
     </div>
     <div class="card">
       <h2>NTRIP Corrections</h2>
@@ -337,7 +347,138 @@ inline const char* getWebUI() {
 </div>
 
 <!-- RACING PAGE -->
-<div id="racing" class="page">
+<!-- START / RACE SEQUENCE PAGE -->
+<div id="start" class="page">
+
+  <!-- Race Clock -->
+  <div class="card">
+    <h2>Race Sequence</h2>
+
+    <!-- IDLE: duration picker + arm button -->
+    <div id="raceSetupView">
+      <div style="display:flex;align-items:center;justify-content:center;gap:16px;margin:1rem 0">
+        <button class="btn" onclick="adjustDuration(-60)" style="font-size:1.1rem;padding:8px 14px">&#8722;1</button>
+        <div id="raceDurationDisplay" style="font-size:3.2rem;font-weight:bold;font-variant-numeric:tabular-nums;color:#e0e8f0;min-width:90px;text-align:center">5:00</div>
+        <button class="btn" onclick="adjustDuration(60)"  style="font-size:1.1rem;padding:8px 14px">+1</button>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:center;margin-bottom:1.25rem">
+        <button class="btn" id="durBtn5"  onclick="setDuration(300)"> 5 min</button>
+        <button class="btn" id="durBtn10" onclick="setDuration(600)">10 min</button>
+        <button class="btn" id="durBtn15" onclick="setDuration(900)">15 min</button>
+      </div>
+      <div style="display:flex;gap:10px">
+        <button class="btn btn-primary" style="flex:1;padding:12px" onclick="armRace()">ARM SEQUENCE</button>
+        <button class="btn" onclick="resetRace()">Reset</button>
+      </div>
+    </div>
+
+    <!-- COUNTDOWN / RACING: live clock -->
+    <div id="raceActiveView" style="display:none">
+      <div id="racePhaseLabel" style="font-size:0.75rem;text-transform:uppercase;letter-spacing:1px;color:#7a9ab8;text-align:center;margin-bottom:4px">STARTING IN</div>
+      <div id="raceClock"
+           onclick="syncRace()" title="Tap to sync to nearest minute"
+           style="font-size:5rem;font-weight:bold;text-align:center;font-variant-numeric:tabular-nums;cursor:pointer;padding:0.4rem 0 0;border-radius:8px;line-height:1">0:00</div>
+      <div style="text-align:center;font-size:0.68rem;color:#2a5a7a;margin-bottom:0.9rem">tap to sync</div>
+
+      <!-- Pre-start: time to line -->
+      <div id="racePreInfo" style="background:#060f1e;border:1px solid #1a3050;border-radius:6px;padding:0.65rem 0.9rem;margin-bottom:0.75rem">
+        <div style="display:flex;justify-content:space-between;align-items:baseline">
+          <span style="color:#7a9ab8;font-size:0.82rem">Time to Line</span>
+          <span id="raceTTL" style="font-variant-numeric:tabular-nums;color:#e0e8f0;font-size:1.1rem;font-weight:bold">--:--</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:4px">
+          <span style="color:#7a9ab8;font-size:0.82rem">Speed (SOG)</span>
+          <span id="raceTTLSog" style="font-variant-numeric:tabular-nums;color:#aac8e0;font-size:0.9rem">-- kts</span>
+        </div>
+      </div>
+
+      <!-- Racing: next mark info -->
+      <div id="raceMarkInfo" style="display:none;background:#060f1e;border:1px solid #1a3050;border-radius:6px;padding:0.65rem 0.9rem;margin-bottom:0.75rem">
+        <div id="raceNextMarkName" style="font-weight:bold;color:#5ab4e8;margin-bottom:6px;font-size:0.95rem">Next Mark</div>
+        <div style="display:flex;justify-content:space-between;align-items:baseline">
+          <span style="color:#7a9ab8;font-size:0.82rem">Distance</span>
+          <span id="raceMarkDist" style="font-variant-numeric:tabular-nums;color:#e0e8f0">-- nm</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:4px">
+          <span style="color:#7a9ab8;font-size:0.82rem">Bearing</span>
+          <span id="raceMarkBrg"  style="font-variant-numeric:tabular-nums;color:#e0e8f0">--&deg;</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:4px">
+          <span style="color:#7a9ab8;font-size:0.82rem">ETA</span>
+          <span id="raceMarkETA"  style="font-variant-numeric:tabular-nums;color:#e0e8f0">--:--</span>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:10px">
+        <button id="racePrevLegBtn" class="btn" style="flex:1;display:none" onclick="prevLeg()">&#8592; Prev Mark</button>
+        <button id="raceNextLegBtn" class="btn btn-primary" style="flex:1;display:none" onclick="nextLeg()">Next Mark &#8594;</button>
+        <button class="btn btn-danger" onclick="endRace()">End Race</button>
+      </div>
+    </div>
+
+    <!-- COMPLETE / STATS -->
+    <div id="raceCompleteView" style="display:none">
+      <div style="text-align:center;margin-bottom:1rem">
+        <div style="font-size:0.75rem;text-transform:uppercase;letter-spacing:2px;color:#4caf82;margin-bottom:4px">Race Complete</div>
+        <div id="raceElapsedDisplay" style="font-size:4rem;font-weight:bold;font-variant-numeric:tabular-nums;color:#4caf82;line-height:1">0:00:00</div>
+      </div>
+      <div id="raceStatsBody" style="background:#060f1e;border:1px solid #1a3050;border-radius:6px;padding:0.7rem 0.9rem;margin-bottom:1rem">
+        <div id="raceStatsCourse" style="font-size:0.82rem;color:#7a9ab8;margin-bottom:0.5rem"></div>
+        <div id="raceStatsLegs"></div>
+      </div>
+      <button class="btn btn-primary" style="width:100%;padding:12px" onclick="resetRace()">New Race</button>
+    </div>
+  </div>
+
+  <!-- Start Line (collapsible) -->
+  <div class="card">
+    <h2 onclick="toggleStartLine()" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;margin:0">
+      Start Line
+      <span id="startLineChevron" style="font-size:0.9rem;color:#5a7a9a;transition:transform 0.2s">&#9660;</span>
+    </h2>
+    <div id="startLineBody" style="margin-top:1rem">
+      <div style="margin-bottom:1.1rem">
+        <div class="section-title">Port End (Pin)</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+          <button class="btn" style="white-space:nowrap" onclick="useGpsForLine(0)">&#8982; GPS</button>
+          <select id="lineMarkSel0" onchange="useMarkForLine(0)"
+            style="flex:1;min-width:0;background:#091a36;border:1px solid #1e4080;color:#e0e8f0;padding:6px 8px;border-radius:5px;font-size:0.85rem">
+            <option value="">&#8212; saved mark &#8212;</option>
+          </select>
+        </div>
+        <div id="lineStatus0" style="font-size:0.8rem;color:#5a7a9a">Not set</div>
+      </div>
+      <div>
+        <div class="section-title">Starboard End (Boat)</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+          <button class="btn" style="white-space:nowrap" onclick="useGpsForLine(1)">&#8982; GPS</button>
+          <select id="lineMarkSel1" onchange="useMarkForLine(1)"
+            style="flex:1;min-width:0;background:#091a36;border:1px solid #1e4080;color:#e0e8f0;padding:6px 8px;border-radius:5px;font-size:0.85rem">
+            <option value="">&#8212; saved mark &#8212;</option>
+          </select>
+        </div>
+        <div id="lineStatus1" style="font-size:0.8rem;color:#5a7a9a">Not set</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Course -->
+  <div class="card">
+    <h2>Course</h2>
+    <div style="display:flex;gap:8px;align-items:center">
+      <select id="raceCourseSelect"
+        style="flex:1;background:#091a36;border:1px solid #1e4080;color:#e0e8f0;padding:8px;border-radius:5px;font-size:0.85rem">
+        <option value="">&#8212; no course &#8212;</option>
+      </select>
+      <button class="btn btn-primary" onclick="setRaceCourse()">Set</button>
+    </div>
+    <div id="raceCourseStatus" style="font-size:0.8rem;color:#5a7a9a;margin-top:6px"></div>
+  </div>
+
+</div>
+
+<!-- MARKS / ROUTES PAGE -->
+<div id="marks" class="page">
   <!-- Mark Manager -->
   <div class="card">
     <h2>Mark Manager</h2>
@@ -471,7 +612,8 @@ function showPage(id, btn) {
   document.getElementById(id).classList.add('active');
   btn.classList.add('active');
   if (id === 'config') loadConfig();
-  if (id === 'racing') { loadMarks(); loadCourses(); }
+  if (id === 'marks')  { loadMarks(); loadCourses(); }
+  if (id === 'start')  { loadRaceState(); loadRaceMarksAndCourses(); startRacePolling(); }
   if (id === 'files')  { initFilesPage(); }
   if (id === 'system') {
     fetch('/config').then(function(r) {
@@ -503,6 +645,7 @@ function formatBytes(b) {
 
 function updateStatus() {
   fetch('/status').then(function(r) { return r.json(); }).then(function(d) {
+    raceStatusCache = d;
     var fixColors = {0:'err',1:'warn',2:'ok',4:'rtk',5:'ok'};
     var el = document.getElementById('s-fix');
     el.textContent = d.fixLabel || '--';
@@ -657,7 +800,7 @@ function updateStatus() {
 
   }).catch(function(e) { console.error('Status fetch error:', e); });
 }
-setInterval(updateStatus, 2000);
+setInterval(updateStatus, 500);
 updateStatus();
 
 // ── Instrument initialisation ─────────────────────────────────────────────────
@@ -807,6 +950,7 @@ function loadConfig() {
     document.getElementById('wifiSSID').value  = d.wifiSSID || '';
     document.getElementById('headingOffset').value = d.headingOffset != null ? d.headingOffset : 90;
     document.getElementById('cogMinSog').value = d.cogMinSog != null ? d.cogMinSog : 0.1;
+    document.getElementById('gpsUpdateRate').value = d.gpsUpdateRate != null ? String(d.gpsUpdateRate) : '1';
     var bleCb = document.getElementById('bleNmea');
     if (bleCb) bleCb.checked = d.bleNmea || false;
     document.getElementById('apSSID').value    = d.apSSID || '';
@@ -927,7 +1071,380 @@ function startOTA(e) {
   xhr.send(file);
 }
 
-// ── Racing: marks ─────────────────────────────────────────────────────────────
+// ── Start / Race Sequence ─────────────────────────────────────────────────────
+
+var raceStatusCache = null;   // latest /status payload — updated by updateStatus()
+var racePollTimer   = null;
+var raceStateCache  = null;   // latest /race/state response
+
+function startRacePolling() {
+  if (racePollTimer) return;
+  racePollTimer = setInterval(function() {
+    var activePage = document.querySelector('.page.active');
+    if (!activePage || activePage.id !== 'start') {
+      clearInterval(racePollTimer);
+      racePollTimer = null;
+      return;
+    }
+    loadRaceState();
+  }, 500);
+}
+
+function loadRaceState() {
+  fetch('/race/state').then(function(r) { return r.json(); }).then(function(d) {
+    raceStateCache = d;
+    renderRacePage(d);
+  }).catch(function() {});
+}
+
+function fmtMS(ms) {
+  var s = Math.floor(Math.abs(ms) / 1000);
+  var m = Math.floor(s / 60); s = s % 60;
+  return m + ':' + (s < 10 ? '0' : '') + s;
+}
+
+function fmtHMS(totalSec) {
+  var h = Math.floor(totalSec / 3600);
+  var m = Math.floor((totalSec % 3600) / 60);
+  var s = totalSec % 60;
+  return (h > 0 ? h + ':' + (m < 10 ? '0' : '') : '') + m + ':' + (s < 10 ? '0' : '') + s;
+}
+
+function renderRacePage(d) {
+  var setupView    = document.getElementById('raceSetupView');
+  var activeView   = document.getElementById('raceActiveView');
+  var completeView = document.getElementById('raceCompleteView');
+  if (!setupView) return;
+
+  var state = d.state || 'idle';
+  var now   = d.server_now_ms;
+  var t0    = d.t0_ms;
+
+  setupView.style.display    = (state === 'idle')    ? '' : 'none';
+  activeView.style.display   = (state === 'countdown' || state === 'racing') ? '' : 'none';
+  completeView.style.display = (state === 'complete') ? '' : 'none';
+
+  if (state === 'idle') {
+    var durSec = d.duration_s || 300;
+    var durMin = Math.floor(durSec / 60);
+    document.getElementById('raceDurationDisplay').textContent = durMin + ':00';
+    ['5','10','15'].forEach(function(m) {
+      var btn = document.getElementById('durBtn' + m);
+      if (btn) btn.style.background = (durSec === parseInt(m) * 60) ? '#1e5080' : '';
+    });
+  }
+
+  if (state === 'countdown' || state === 'racing') {
+    var remainingMs = t0 - now;
+    var clock      = document.getElementById('raceClock');
+    var phaseLabel = document.getElementById('racePhaseLabel');
+    var preInfo    = document.getElementById('racePreInfo');
+    var markInfo   = document.getElementById('raceMarkInfo');
+    var nextLegBtn = document.getElementById('raceNextLegBtn');
+    var prevLegBtn = document.getElementById('racePrevLegBtn');
+
+    if (remainingMs > 0) {
+      var secs = Math.ceil(remainingMs / 1000);
+      clock.textContent      = fmtMS(remainingMs);
+      phaseLabel.textContent = 'STARTING IN';
+      clock.style.color      = secs <= 60  ? '#e85a5a' :
+                               secs <= 240 ? '#f59e0b' : '#e0e8f0';
+      preInfo.style.display  = '';
+      markInfo.style.display = 'none';
+      nextLegBtn.style.display = 'none';
+      prevLegBtn.style.display = 'none';
+      updateTTL(d);
+    } else {
+      var elapsed = -remainingMs;
+      clock.textContent      = '+' + fmtHMS(Math.floor(elapsed / 1000));
+      clock.style.color      = '#4caf82';
+      phaseLabel.textContent = 'RACING';
+      preInfo.style.display  = 'none';
+      if (d.nextMark) {
+        markInfo.style.display   = '';
+        nextLegBtn.style.display = '';
+        prevLegBtn.style.display = (d.legIdx > 0) ? '' : 'none';
+        document.getElementById('raceNextMarkName').textContent = d.nextMark.name;
+        updateMarkInfo(d.nextMark);
+      } else {
+        markInfo.style.display   = 'none';
+        nextLegBtn.style.display = 'none';
+        prevLegBtn.style.display = (d.legIdx > 0) ? '' : 'none';
+      }
+    }
+  }
+
+  if (state === 'complete') {
+    var elapsedSec = Math.max(0, Math.floor((d.end_ms - d.t0_ms) / 1000));
+    document.getElementById('raceElapsedDisplay').textContent = fmtHMS(elapsedSec);
+
+    // Course summary line
+    var courseEl = document.getElementById('raceStatsCourse');
+    if (courseEl) {
+      var rounded = (d.legs && d.legs.length) || 0;
+      var total   = d.courseTotalMarks || 0;
+      var cname   = d.courseName ? escHtml(d.courseName) + ' &mdash; ' : '';
+      courseEl.innerHTML = cname + rounded + (total ? ' of ' + total : '') + ' mark' + (total !== 1 ? 's' : '') + ' rounded';
+    }
+
+    // Leg splits table
+    var legsEl = document.getElementById('raceStatsLegs');
+    if (legsEl) {
+      if (d.legs && d.legs.length) {
+        var rows = d.legs.map(function(leg, i) {
+          return '<div style="display:flex;justify-content:space-between;align-items:baseline;' +
+                 (i > 0 ? 'border-top:1px solid #0d2244;' : '') + 'padding:5px 0">' +
+            '<span style="color:#aac8e0;font-size:0.82rem">' + escHtml(leg.mark) + '</span>' +
+            '<span style="font-variant-numeric:tabular-nums;font-size:0.9rem;color:#e0e8f0">' + fmtHMS(leg.elapsed_s) +
+            ' <span style="color:#5a7a9a;font-size:0.75rem">(+' + fmtHMS(leg.split_s) + ')</span></span>' +
+          '</div>';
+        }).join('');
+        legsEl.innerHTML = '<div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.5px;color:#3a6a8a;margin-bottom:4px">Elapsed &nbsp;/&nbsp; Split</div>' + rows;
+      } else {
+        legsEl.innerHTML = '<div style="color:#5a7a9a;font-size:0.82rem">No marks rounded</div>';
+      }
+    }
+  }
+
+  // Start line status
+  if (d.line) {
+    [0, 1].forEach(function(i) {
+      var el = document.getElementById('lineStatus' + i);
+      if (!el) return;
+      var end = d.line[i];
+      if (end && end.set) {
+        el.style.color = '#4caf82';
+        el.textContent = end.name + ' — ' + Number(end.lat).toFixed(5) + ', ' + Number(end.lon).toFixed(5);
+      } else {
+        el.style.color = '#5a7a9a';
+        el.textContent = 'Not set';
+      }
+    });
+  }
+
+  // Course status text (selector value managed separately by loadRaceMarksAndCourses)
+  var courseStatusEl = document.getElementById('raceCourseStatus');
+  if (courseStatusEl) {
+    if (d.courseId) {
+      courseStatusEl.style.color = '#4caf82';
+      courseStatusEl.textContent = 'Active — leg ' + ((d.legIdx || 0) + 1);
+    } else {
+      courseStatusEl.style.color = '#5a7a9a';
+      courseStatusEl.textContent = 'No course selected';
+    }
+  }
+}
+
+function updateTTL(raceD) {
+  var sog = raceStatusCache ? (raceStatusCache.sog || 0) : 0;
+  document.getElementById('raceTTLSog').textContent = sog.toFixed(1) + ' kts';
+  var line = raceD ? raceD.line : null;
+  if (!line || !line[0].set || !line[1].set || !raceStatusCache) {
+    document.getElementById('raceTTL').textContent = '--:--';
+    return;
+  }
+  var lat = raceStatusCache.lat, lon = raceStatusCache.lon;
+  if (!lat && !lon) { document.getElementById('raceTTL').textContent = '--:--'; return; }
+  var distNm = distToSegNm(lat, lon, line[0].lat, line[0].lon, line[1].lat, line[1].lon);
+  if (sog < 0.1) { document.getElementById('raceTTL').textContent = '--:--'; return; }
+  var ttlSec = Math.round((distNm / sog) * 3600);
+  document.getElementById('raceTTL').textContent = fmtHMS(ttlSec);
+}
+
+function updateMarkInfo(mark) {
+  if (!raceStatusCache || !mark) return;
+  var lat = raceStatusCache.lat, lon = raceStatusCache.lon;
+  var sog = raceStatusCache ? (raceStatusCache.sog || 0) : 0;
+  var dist = haversineNm(lat, lon, mark.lat, mark.lon);
+  var brg  = bearingDeg(lat, lon, mark.lat, mark.lon);
+  document.getElementById('raceMarkDist').textContent = dist.toFixed(2) + ' nm';
+  document.getElementById('raceMarkBrg').textContent  = Math.round(brg) + '° T';
+  if (sog >= 0.1) {
+    document.getElementById('raceMarkETA').textContent = fmtHMS(Math.round((dist / sog) * 3600));
+  } else {
+    document.getElementById('raceMarkETA').textContent = '--:--';
+  }
+}
+
+function haversineNm(lat1, lon1, lat2, lon2) {
+  var R    = 3440.065;
+  var dLat = (lat2 - lat1) * Math.PI / 180;
+  var dLon = (lon2 - lon1) * Math.PI / 180;
+  var a    = Math.sin(dLat/2)*Math.sin(dLat/2) +
+             Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*
+             Math.sin(dLon/2)*Math.sin(dLon/2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+function bearingDeg(lat1, lon1, lat2, lon2) {
+  var y = Math.sin((lon2-lon1)*Math.PI/180)*Math.cos(lat2*Math.PI/180);
+  var x = Math.cos(lat1*Math.PI/180)*Math.sin(lat2*Math.PI/180) -
+          Math.sin(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.cos((lon2-lon1)*Math.PI/180);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+
+function distToSegNm(plat, plon, alat, alon, blat, blon) {
+  var clat = (alat + blat) / 2 * Math.PI / 180;
+  var cos  = Math.cos(clat);
+  var ax = alon*cos, ay = alat, bx = blon*cos, by = blat;
+  var px = plon*cos, py = plat;
+  var dx = bx-ax,    dy = by-ay;
+  var lenSq = dx*dx + dy*dy;
+  if (lenSq === 0) return haversineNm(plat, plon, alat, alon);
+  var t  = Math.max(0, Math.min(1, ((px-ax)*dx + (py-ay)*dy) / lenSq));
+  return haversineNm(plat, plon, ay + t*dy, (ax + t*dx) / cos);
+}
+
+function armRace() {
+  fetch('/race/start', {method:'POST'}).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) loadRaceState(); else toast('Arm failed: ' + (d.err || ''), false);
+  }).catch(function() { toast('Request failed', false); });
+}
+
+function endRace() {
+  fetch('/race/end', {method:'POST'}).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) loadRaceState(); else toast('Failed: ' + (d.err || ''), false);
+  }).catch(function() { toast('Request failed', false); });
+}
+
+function resetRace() {
+  fetch('/race/stop', {method:'POST'}).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) loadRaceState(); else toast('Reset failed', false);
+  }).catch(function() { toast('Request failed', false); });
+}
+
+function syncRace() {
+  fetch('/race/sync', {method:'POST'}).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) { loadRaceState(); toast('Synced to nearest minute'); }
+    else toast('Sync failed: ' + (d.err || ''), false);
+  }).catch(function() { toast('Request failed', false); });
+}
+
+function adjustDuration(deltaSec) {
+  var cur  = raceStateCache ? raceStateCache.duration_s : 300;
+  var next = Math.max(60, Math.min(1800, cur + deltaSec));
+  fetch('/race/duration', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({seconds: next})
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) loadRaceState();
+  }).catch(function() {});
+}
+
+function setDuration(sec) {
+  fetch('/race/duration', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({seconds: sec})
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) loadRaceState();
+  }).catch(function() {});
+}
+
+function useGpsForLine(endIdx) {
+  fetch('/status').then(function(r) { return r.json(); }).then(function(s) {
+    if (!s.fix) { toast('No GPS fix', false); return; }
+    var name = endIdx === 0 ? 'Port End' : 'Stbd End';
+    fetch('/race/startline', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({end: endIdx, lat: s.lat, lon: s.lon, name: name})
+    }).then(function(r) { return r.json(); }).then(function(d) {
+      if (d.ok) { toast('Line end set'); loadRaceState(); }
+      else toast('Failed to set line end', false);
+    });
+  }).catch(function() { toast('Failed to get GPS', false); });
+}
+
+function useMarkForLine(endIdx) {
+  var sel    = document.getElementById('lineMarkSel' + endIdx);
+  var markId = sel ? sel.value : '';
+  if (!markId) return;
+  fetch('/race/startline', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({end: endIdx, markId: markId})
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) { toast('Line end set'); loadRaceState(); }
+    else { toast('Mark not found', false); if (sel) sel.value = ''; }
+  }).catch(function() { toast('Request failed', false); });
+}
+
+function setRaceCourse() {
+  var sel      = document.getElementById('raceCourseSelect');
+  var courseId = sel ? sel.value : '';
+  fetch('/race/course', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({courseId: courseId, leg: 0})
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) {
+      toast(courseId ? 'Course set' : 'Course cleared');
+      // Keep selector stable while the next poll arrives
+      if (sel) sel.value = courseId;
+      loadRaceState();
+    } else toast('Failed', false);
+  }).catch(function() { toast('Request failed', false); });
+}
+
+function nextLeg() {
+  fetch('/race/nextleg', {method:'POST'}).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) { if (d.complete) toast('Race complete!'); loadRaceState(); }
+    else toast('Failed: ' + (d.err || ''), false);
+  }).catch(function() { toast('Request failed', false); });
+}
+
+function prevLeg() {
+  fetch('/race/prevleg', {method:'POST'}).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) loadRaceState();
+    else toast('Failed: ' + (d.err || ''), false);
+  }).catch(function() { toast('Request failed', false); });
+}
+
+function toggleStartLine() {
+  var body    = document.getElementById('startLineBody');
+  var chevron = document.getElementById('startLineChevron');
+  if (!body) return;
+  var collapsed = body.style.display === 'none';
+  body.style.display    = collapsed ? '' : 'none';
+  chevron.style.transform = collapsed ? '' : 'rotate(-90deg)';
+}
+
+function loadRaceMarksAndCourses() {
+  // Marks for start line pickers
+  fetch('/marks').then(function(r) { return r.json(); }).then(function(marks) {
+    [0, 1].forEach(function(i) {
+      var sel = document.getElementById('lineMarkSel' + i);
+      if (!sel) return;
+      var cur = sel.value;
+      while (sel.options.length > 1) sel.remove(1);
+      marks.forEach(function(m) {
+        var opt = document.createElement('option');
+        opt.value = m.id; opt.textContent = m.name;
+        sel.appendChild(opt);
+      });
+      if (cur) sel.value = cur;
+    });
+  }).catch(function() {});
+
+  // Courses + race state fetched together so options exist before value is set
+  Promise.all([
+    fetch('/courses').then(function(r) { return r.json(); }),
+    fetch('/race/state').then(function(r) { return r.json(); })
+  ]).then(function(res) {
+    var courses = res[0], state = res[1];
+    raceStateCache = state;
+    var sel = document.getElementById('raceCourseSelect');
+    if (!sel) return;
+    while (sel.options.length > 1) sel.remove(1);
+    courses.forEach(function(c) {
+      var opt = document.createElement('option');
+      opt.value = c.id;
+      opt.textContent = c.name + ' (' + c.marks.length + ' marks)';
+      sel.appendChild(opt);
+    });
+    sel.value = state.courseId || '';
+    renderRacePage(state);
+  }).catch(function() {});
+}
+
+// ── Marks / Routes ────────────────────────────────────────────────────────────
 function loadMarks() {
   fetch('/marks').then(r => r.json()).then(function(marks) {
     var el = document.getElementById('markList');

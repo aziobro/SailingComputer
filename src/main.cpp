@@ -92,6 +92,31 @@ static float lateralDrift       = 0;
 static float driveSpeed         = 0;
 static bool  sailingMetricsValid = false;
 
+// ── Race state ────────────────────────────────────────────────────────────────
+
+enum RaceState { RACE_IDLE, RACE_COUNTDOWN, RACE_RACING, RACE_COMPLETE };
+
+struct StartLineEnd {
+    char   markId[16];
+    double lat, lon;
+    char   name[32];
+    bool   set;
+};
+
+struct RaceData {
+    RaceState    state;
+    int64_t      t0_ms;                         // millis since boot when T-0 fires
+    int64_t      end_ms;                        // millis since boot when race ended
+    int          duration_s;                    // sequence length in seconds
+    StartLineEnd line[2];                       // [0]=port end, [1]=starboard end
+    char         courseId[16];
+    int          legIdx;
+    int64_t      legTimes[MAX_COURSE_MARKS];    // time each mark was rounded (ms since boot)
+    int          legTimesCount;                 // how many marks have been rounded
+};
+
+static RaceData raceData;
+
 // Diagnostic counters
 static uint32_t nmeaBytesRx       = 0;  // raw bytes received from UART_NMEA
 static uint32_t nmeaLinesRx       = 0;  // complete NMEA sentences parsed
@@ -1130,9 +1155,10 @@ static esp_err_t handleGetConfig(httpd_req_t *req) {
         ok = ok && appendFmt(json, sizeof(json), &off, "}");
     }
     ok = ok && appendFmt(json, sizeof(json), &off,
-        "],\"headingOffset\":%.1f,\"cogMinSog\":%.2f,\"bleNmea\":%s,\"apSSID\":",
+        "],\"headingOffset\":%.1f,\"cogMinSog\":%.2f,\"bleNmea\":%s,\"gpsUpdateRate\":%d,\"apSSID\":",
         cfg.headingOffset, cfg.cogMinSog,
-        cfg.bleNmea ? "true" : "false");
+        cfg.bleNmea ? "true" : "false",
+        cfg.gpsUpdateRate);
     ok = ok && appendJsonString(json, sizeof(json), &off, cfg.apSSID);
     ok = ok && appendFmt(json, sizeof(json), &off, "}");
     if (!ok) {
@@ -1206,9 +1232,16 @@ static esp_err_t handleSaveConfig(httpd_req_t *req) {
         normalizeNtripSource(cfg.ntrip[i]);
     }
 
-    if (formGet(body, "headingOffset", val, sizeof(val))) cfg.headingOffset = atof(val);
-    if (formGet(body, "cogMinSog",     val, sizeof(val))) cfg.cogMinSog     = atof(val);
-    if (formGet(body, "bleNmea",       val, sizeof(val)))
+    if (formGet(body, "headingOffset",  val, sizeof(val))) cfg.headingOffset = atof(val);
+    if (formGet(body, "cogMinSog",      val, sizeof(val))) cfg.cogMinSog     = atof(val);
+    if (formGet(body, "gpsUpdateRate",  val, sizeof(val))) {
+        const uint8_t validRates[] = {1, 2, 5, 10, 20};
+        uint8_t r = (uint8_t)atoi(val);
+        cfg.gpsUpdateRate = 1;
+        for (uint8_t i = 0; i < sizeof(validRates); i++)
+            if (r == validRates[i]) { cfg.gpsUpdateRate = r; break; }
+    }
+    if (formGet(body, "bleNmea",        val, sizeof(val)))
         cfg.bleNmea = (strcmp(val, "true") == 0 || strcmp(val, "on") == 0);
     else
         cfg.bleNmea = false;
@@ -1257,7 +1290,7 @@ static esp_err_t handleUM982Reset(httpd_req_t *req) {
     ESP_LOGI(TAG, "[Web] UM982 factory reset requested");
     vTaskDelay(pdMS_TO_TICKS(100));
     if (uartNmeaMtx) xSemaphoreTake(uartNmeaMtx, portMAX_DELAY);
-    um982FactoryReset(UART_NMEA);
+    um982FactoryReset(UART_NMEA, cfgMgr.cfg.gpsUpdateRate);
     if (uartNmeaMtx) xSemaphoreGive(uartNmeaMtx);
     return ESP_OK;
 }
@@ -1494,6 +1527,293 @@ static esp_err_t handleStorageInfo(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// ── Race sequence HTTP handlers ───────────────────────────────────────────────
+
+static esp_err_t handleRaceState(httpd_req_t *req) {
+    int64_t now = (int64_t)(esp_timer_get_time() / 1000LL);
+
+    // Auto-transition COUNTDOWN → RACING when T-0 passes
+    if (raceData.state == RACE_COUNTDOWN && now >= raceData.t0_ms)
+        raceData.state = RACE_RACING;
+
+    const char *stateStr =
+        raceData.state == RACE_COUNTDOWN ? "countdown" :
+        raceData.state == RACE_RACING    ? "racing"    :
+        raceData.state == RACE_COMPLETE  ? "complete"  : "idle";
+
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(obj, "state",         stateStr);
+    cJSON_AddNumberToObject(obj, "t0_ms",         (double)raceData.t0_ms);
+    cJSON_AddNumberToObject(obj, "end_ms",        (double)raceData.end_ms);
+    cJSON_AddNumberToObject(obj, "server_now_ms", (double)now);
+    cJSON_AddNumberToObject(obj, "duration_s",    raceData.duration_s);
+    cJSON_AddStringToObject(obj, "courseId",      raceData.courseId);
+    cJSON_AddNumberToObject(obj, "legIdx",        raceData.legIdx);
+
+    cJSON *lineArr = cJSON_AddArrayToObject(obj, "line");
+    for (int i = 0; i < 2; i++) {
+        cJSON *end = cJSON_CreateObject();
+        cJSON_AddBoolToObject(end,   "set",    raceData.line[i].set);
+        cJSON_AddStringToObject(end, "markId", raceData.line[i].markId);
+        cJSON_AddStringToObject(end, "name",   raceData.line[i].name);
+        cJSON_AddNumberToObject(end, "lat",    raceData.line[i].lat);
+        cJSON_AddNumberToObject(end, "lon",    raceData.line[i].lon);
+        cJSON_AddItemToArray(lineArr, end);
+    }
+
+    // Look up course data for next mark (racing) or leg stats (complete)
+    if (raceData.courseId[0] && raceData.state != RACE_IDLE) {
+        Course *courses = (Course *)malloc(MAX_COURSES * sizeof(Course));
+        if (courses) {
+            int nc = storageMgr.loadCourses(courses, MAX_COURSES);
+            for (int i = 0; i < nc; i++) {
+                if (strcmp(courses[i].id, raceData.courseId) == 0) {
+                    cJSON_AddStringToObject(obj, "courseName",      courses[i].name);
+                    cJSON_AddNumberToObject(obj, "courseTotalMarks", courses[i].mark_count);
+
+                    if (raceData.state == RACE_RACING && raceData.legIdx < courses[i].mark_count) {
+                        // Next mark for live navigation
+                        const char *markId = courses[i].marks[raceData.legIdx].mark_id;
+                        Mark marks[MAX_MARKS];
+                        int nm = storageMgr.loadMarks(marks, MAX_MARKS);
+                        for (int j = 0; j < nm; j++) {
+                            if (strcmp(marks[j].id, markId) == 0) {
+                                cJSON *nm_obj = cJSON_CreateObject();
+                                cJSON_AddStringToObject(nm_obj, "name", marks[j].name);
+                                cJSON_AddNumberToObject(nm_obj, "lat",  marks[j].lat);
+                                cJSON_AddNumberToObject(nm_obj, "lon",  marks[j].lon);
+                                cJSON_AddItemToObject(obj, "nextMark", nm_obj);
+                                break;
+                            }
+                        }
+                    }
+
+                    if (raceData.state == RACE_COMPLETE && raceData.legTimesCount > 0) {
+                        // Build leg splits for stats page
+                        Mark marks[MAX_MARKS];
+                        int nm = storageMgr.loadMarks(marks, MAX_MARKS);
+                        cJSON *legsArr = cJSON_AddArrayToObject(obj, "legs");
+                        int64_t prev = raceData.t0_ms;
+                        for (int k = 0; k < raceData.legTimesCount && k < courses[i].mark_count; k++) {
+                            const char *mid = courses[i].marks[k].mark_id;
+                            const char *mname = mid;
+                            for (int j = 0; j < nm; j++) {
+                                if (strcmp(marks[j].id, mid) == 0) { mname = marks[j].name; break; }
+                            }
+                            int64_t t   = raceData.legTimes[k];
+                            cJSON *leg  = cJSON_CreateObject();
+                            cJSON_AddStringToObject(leg, "mark",      mname);
+                            cJSON_AddNumberToObject(leg, "elapsed_s", (double)((t - raceData.t0_ms) / 1000LL));
+                            cJSON_AddNumberToObject(leg, "split_s",   (double)((t - prev) / 1000LL));
+                            cJSON_AddItemToArray(legsArr, leg);
+                            prev = t;
+                        }
+                    }
+                    break;
+                }
+            }
+            free(courses);
+        }
+    }
+
+    char *json = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json ? json : "{}", HTTPD_RESP_USE_STRLEN);
+    if (json) free(json);
+    return ESP_OK;
+}
+
+static esp_err_t handleRaceStart(httpd_req_t *req) {
+    if (raceData.state != RACE_IDLE) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"err\":\"not idle\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    int64_t now    = (int64_t)(esp_timer_get_time() / 1000LL);
+    raceData.t0_ms = now + (int64_t)raceData.duration_s * 1000LL;
+    raceData.state = RACE_COUNTDOWN;
+    raceData.legIdx = 0;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleRaceStop(httpd_req_t *req) {
+    memset(&raceData, 0, sizeof(raceData));
+    raceData.duration_s = 300;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleRaceEnd(httpd_req_t *req) {
+    if (raceData.state != RACE_RACING) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"err\":\"not racing\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    raceData.state  = RACE_COMPLETE;
+    raceData.end_ms = (int64_t)(esp_timer_get_time() / 1000LL);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleRaceSync(httpd_req_t *req) {
+    if (raceData.state == RACE_IDLE || raceData.state == RACE_COMPLETE) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"err\":\"not active\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    int64_t now       = (int64_t)(esp_timer_get_time() / 1000LL);
+    int64_t remaining = raceData.t0_ms - now;
+    // Round remaining to nearest whole minute
+    int64_t snapped   = ((remaining + 30000LL) / 60000LL) * 60000LL;
+    raceData.t0_ms    = now + snapped;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleRaceDuration(httpd_req_t *req) {
+    if (raceData.state != RACE_IDLE) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"err\":\"not idle\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    char body[64];
+    readBody(req, body, sizeof(body));
+    cJSON *obj = cJSON_Parse(body);
+    cJSON *v;
+    if (obj && (v = cJSON_GetObjectItem(obj, "seconds")) && cJSON_IsNumber(v)) {
+        int sec = (int)v->valuedouble;
+        if (sec >= 60 && sec <= 1800) raceData.duration_s = sec;
+    }
+    cJSON_Delete(obj);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleRaceStartLine(httpd_req_t *req) {
+    char body[256];
+    if (readBody(req, body, sizeof(body)) < 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
+        return ESP_OK;
+    }
+    cJSON *obj = cJSON_Parse(body);
+    if (!obj) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_OK;
+    }
+    cJSON *v;
+    int endIdx = -1;
+    if ((v = cJSON_GetObjectItem(obj, "end")) && cJSON_IsNumber(v)) endIdx = (int)v->valuedouble;
+    if (endIdx < 0 || endIdx > 1) {
+        cJSON_Delete(obj);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "end must be 0 or 1");
+        return ESP_OK;
+    }
+
+    StartLineEnd &lineEnd = raceData.line[endIdx];
+    memset(&lineEnd, 0, sizeof(lineEnd));
+
+    cJSON *markIdJ = cJSON_GetObjectItem(obj, "markId");
+    if (markIdJ && cJSON_IsString(markIdJ) && markIdJ->valuestring[0]) {
+        strlcpy(lineEnd.markId, markIdJ->valuestring, sizeof(lineEnd.markId));
+        Mark marks[MAX_MARKS];
+        int nm = storageMgr.loadMarks(marks, MAX_MARKS);
+        for (int i = 0; i < nm; i++) {
+            if (strcmp(marks[i].id, lineEnd.markId) == 0) {
+                lineEnd.lat = marks[i].lat;
+                lineEnd.lon = marks[i].lon;
+                strlcpy(lineEnd.name, marks[i].name, sizeof(lineEnd.name));
+                lineEnd.set = true;
+                break;
+            }
+        }
+    } else {
+        if ((v = cJSON_GetObjectItem(obj, "lat"))  && cJSON_IsNumber(v)) lineEnd.lat = v->valuedouble;
+        if ((v = cJSON_GetObjectItem(obj, "lon"))  && cJSON_IsNumber(v)) lineEnd.lon = v->valuedouble;
+        if ((v = cJSON_GetObjectItem(obj, "name")) && cJSON_IsString(v)) strlcpy(lineEnd.name, v->valuestring, sizeof(lineEnd.name));
+        if (lineEnd.name[0] == '\0') strlcpy(lineEnd.name, endIdx == 0 ? "Port End" : "Stbd End", sizeof(lineEnd.name));
+        lineEnd.set = (lineEnd.lat != 0.0 || lineEnd.lon != 0.0);
+    }
+    cJSON_Delete(obj);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, lineEnd.set ? "{\"ok\":true}" : "{\"ok\":false,\"err\":\"mark not found\"}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleRaceCourse(httpd_req_t *req) {
+    char body[64];
+    readBody(req, body, sizeof(body));
+    cJSON *obj = cJSON_Parse(body);
+    cJSON *v;
+    if (obj) {
+        if ((v = cJSON_GetObjectItem(obj, "courseId")) && cJSON_IsString(v))
+            strlcpy(raceData.courseId, v->valuestring, sizeof(raceData.courseId));
+        if ((v = cJSON_GetObjectItem(obj, "leg")) && cJSON_IsNumber(v))
+            raceData.legIdx = (int)v->valuedouble;
+        cJSON_Delete(obj);
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleRaceNextLeg(httpd_req_t *req) {
+    if (raceData.state != RACE_RACING) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"err\":\"not racing\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    int64_t now = (int64_t)(esp_timer_get_time() / 1000LL);
+    // Record the time this mark was rounded
+    if (raceData.legIdx < MAX_COURSE_MARKS)
+        raceData.legTimes[raceData.legTimesCount++] = now;
+
+    bool complete = false;
+    if (raceData.courseId[0]) {
+        Course *courses = (Course *)malloc(MAX_COURSES * sizeof(Course));
+        if (courses) {
+            int nc = storageMgr.loadCourses(courses, MAX_COURSES);
+            for (int i = 0; i < nc; i++) {
+                if (strcmp(courses[i].id, raceData.courseId) == 0) {
+                    raceData.legIdx++;
+                    if (raceData.legIdx >= courses[i].mark_count) {
+                        raceData.state  = RACE_COMPLETE;
+                        raceData.end_ms = now;
+                        complete = true;
+                    }
+                    break;
+                }
+            }
+            free(courses);
+        }
+    } else {
+        raceData.legIdx++;
+    }
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"complete\":%s}", complete ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleRacePrevLeg(httpd_req_t *req) {
+    if (raceData.state != RACE_RACING) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"err\":\"not racing\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    if (raceData.legIdx > 0) raceData.legIdx--;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 // ── File manager HTTP handlers ────────────────────────────────────────────────
 
 // Read the "path" query parameter and percent-decode it into dst.
@@ -1710,8 +2030,8 @@ static esp_err_t handleGpxImport(httpd_req_t *req) {
 static void startWebServer() {
     // ── HTTPS server on port 443 ─────────────────────────────────────────────
     httpd_ssl_config_t ssl_cfg         = HTTPD_SSL_CONFIG_DEFAULT();
-    ssl_cfg.httpd.max_open_sockets     = 2;  // 2 sessions × ~10KB each; lru_purge evicts idle ones
-    ssl_cfg.httpd.max_uri_handlers     = 24; // default is 8
+    ssl_cfg.httpd.max_open_sockets     = 10; // status poll + race poll + concurrent button clicks
+    ssl_cfg.httpd.max_uri_handlers     = 32; // default is 8
     ssl_cfg.httpd.stack_size           = 10240;
     ssl_cfg.httpd.lru_purge_enable     = true;
     ssl_cfg.servercert                 = (const uint8_t *)server_cert_pem;
@@ -1753,6 +2073,16 @@ static void startWebServer() {
     reg(webServer, "/files/copy",      HTTP_POST, handleFilesCopy);    // auth — copy file
     reg(webServer, "/files/download",  HTTP_GET,  handleFilesDownload);// public — download file
     reg(webServer, "/sdcard/format",   HTTP_POST, handleSdFormat);     // auth — format SD card
+    reg(webServer, "/race/state",     HTTP_GET,  handleRaceState);    // public — race state
+    reg(webServer, "/race/start",     HTTP_POST, handleRaceStart);    // public — arm countdown
+    reg(webServer, "/race/stop",      HTTP_POST, handleRaceStop);     // public — reset to idle
+    reg(webServer, "/race/sync",      HTTP_POST, handleRaceSync);     // public — snap to nearest minute
+    reg(webServer, "/race/duration",  HTTP_POST, handleRaceDuration); // public — set sequence length
+    reg(webServer, "/race/startline", HTTP_POST, handleRaceStartLine);// public — set start line end
+    reg(webServer, "/race/course",    HTTP_POST, handleRaceCourse);   // public — set active course
+    reg(webServer, "/race/nextleg",   HTTP_POST, handleRaceNextLeg);  // public — advance to next mark
+    reg(webServer, "/race/prevleg",   HTTP_POST, handleRacePrevLeg);  // public — go back to previous mark
+    reg(webServer, "/race/end",       HTTP_POST, handleRaceEnd);      // public — end race, go to stats
 
     ESP_LOGI(TAG, "[Web] HTTPS server started on port 443");
 
@@ -1891,6 +2221,8 @@ extern "C" void app_main(void) {
         nvs_flash_init();
     }
 
+    raceData.duration_s = 300;  // 5-minute sequence default
+
     cfgMgr.load();
     storageMgr.begin();
     telemetryMtx = xSemaphoreCreateMutex();
@@ -1921,7 +2253,7 @@ extern "C" void app_main(void) {
     uart_driver_install(UART_RTCM, 256, 1024, 0, NULL, 0);
     ESP_LOGI(TAG, "[Boot] UART initialized");
 
-    um982Init(UART_NMEA);
+    um982Init(UART_NMEA, cfgMgr.cfg.gpsUpdateRate);
     rtcmUartProbeOk = um982ProbePort(UART_RTCM);
 
     // ── WiFi ────────────────────────────────────────────────────────────────

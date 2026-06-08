@@ -44,6 +44,20 @@ fi
 
 cd "$SCRIPT_DIR"
 
+# ── Auto-bump patch version ───────────────────────────────────────────────────
+VERSION_H="$SCRIPT_DIR/src/version.h"
+MAJOR=$(echo "$VERSION" | cut -d. -f1)
+MINOR=$(echo "$VERSION" | cut -d. -f2)
+PATCH=$(echo "$VERSION" | cut -d. -f3)
+PATCH=$(( PATCH + 1 ))
+VERSION="${MAJOR}.${MINOR}.${PATCH}"
+# Rewrite version.h preserving all lines except the #define
+{
+    grep -v '^#define FW_VERSION' "$VERSION_H"
+    echo "#define FW_VERSION \"${VERSION}\""
+} > "${VERSION_H}.tmp" && mv "${VERSION_H}.tmp" "$VERSION_H"
+info "Version bumped to ${VERSION}"
+
 echo
 echo -e "${BOLD}━━━ Sailing Computer Firmware v${VERSION} ━━━${RESET}"
 echo -e "  Port   : ${CYAN}${PORT}${RESET}"

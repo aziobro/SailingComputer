@@ -1,6 +1,6 @@
 # Sailing Computer
 
-An ESP32-based sailing computer using the **Unicore UM982** dual-antenna GNSS module. Provides centimeter-accuracy RTK position, true heading, roll, speed, and course — all accessible via a password-protected HTTPS web dashboard and broadcast as standard NMEA 0183 sentences over TCP for use with OpenCPN, Signal K, or any chart plotter.
+An ESP32-P4-based sailing computer using the **Unicore UM982** dual-antenna GNSS module. Provides centimeter-accuracy RTK position, true heading, roll, speed, and course — all accessible via a password-protected HTTPS web dashboard and broadcast as standard NMEA 0183 sentences over TCP for use with OpenCPN, Signal K, or any chart plotter.
 
 ---
 
@@ -16,7 +16,12 @@ An ESP32-based sailing computer using the **Unicore UM982** dual-antenna GNSS mo
 - **WiFi AP + STA modes** — creates its own hotspot or joins an existing network
 - **OTA firmware updates** — flash new firmware over WiFi from the System tab (no USB required after initial flash)
 - **NVS-backed configuration** — all settings persist across reboots
-- **UM982 factory reset** — one-click reconfiguration from the web UI
+- **SD card storage** — marks, courses, and GPX files stored on SD card with SPIFFS fallback
+- **Mark & course manager** — save GPS positions as named marks, build courses from mark sequences, import from GPX
+- **Race start sequence** — countdown clock (5 / 10 / 15 min, adjustable ±1 min), tap-to-sync with committee boat, time-to-start-line
+- **Race navigation** — bearing, distance, and ETA to next mark; previous/next mark controls
+- **Race stats** — elapsed time, leg splits, and marks-rounded summary on race completion
+- **SD card file manager** — browse, rename, copy, delete files and directories; format SD card
 
 ---
 
@@ -24,20 +29,21 @@ An ESP32-based sailing computer using the **Unicore UM982** dual-antenna GNSS mo
 
 | Component | Details |
 |-----------|---------|
-| Microcontroller | ESP32-WROOM (MiniESP32 v1.0) |
-| GNSS module | Unicore UM982 dual-antenna breakout |
-| Power | 3.3V |
+| Microcontroller | ESP32-P4 (esp32-p4-function-ev-board) |
+| GNSS module | Unicore UM982 dual-antenna |
+| Storage | MicroSD card (SPIFFS fallback) |
+| Power | 3.3 V |
 
 ### Wiring
 
-| Wire | UM982 Pin | ESP32 Pin | Purpose |
-|------|-----------|-----------|---------|
-| Red | VCC | 3.3V | Power |
-| Black | GND | GND | Ground |
-| Yellow | TXD (COM1) | IO16 (RX1) | NMEA data → ESP32 |
-| Orange | RXD (COM1) | IO17 (TX1) | ESP32 → UM982 commands |
-| White | RX2 (COM2) | IO18 (TX2) | RTCM corrections → UM982 |
-| Brown | TX2 (COM2) | IO19 (RX2) | UM982 → ESP32 (unused) |
+| Signal | UM982 Pin | ESP32-P4 Pin | Purpose |
+|--------|-----------|--------------|---------|
+| NMEA/control | COM2 TX | GPIO 32 (RX) | NMEA sentences and responses → ESP32 |
+| NMEA/control | COM2 RX | GPIO 33 (TX) | ESP32 commands → UM982 |
+| RTCM | COM1 RX | GPIO 48 (TX) | NTRIP corrections → UM982 |
+| RTCM diag | COM1 TX | GPIO 47 (RX) | Auxiliary / diagnostic |
+| PPS | PPS out | GPIO 27 | 1 Hz timing pulse |
+| Debug | — | USB (UART0) | Debug console only |
 
 ### Antenna Mounting
 
@@ -73,24 +79,16 @@ pio run --target upload
 pio device monitor
 ```
 
-The upload port is set to `/dev/tty.usbserial-0001` in `platformio.ini`. Adjust if your port differs.
+The upload port is set in `platformio.ini`. Adjust if your port differs.
 
 ### OTA Updates (after initial flash)
 
+Use the included `flash.sh` script, or update manually:
+
 1. Build the firmware: `pio run`
 2. Open `https://sailingcomputer.local` → **System** tab (login with admin credentials)
-3. Click **Choose .bin file** → select `.pio/build/esp32dev/firmware.bin`
+3. Click **Choose .bin file** → select `.pio/build/esp32p4/firmware.bin`
 4. Click **Upload & Flash** — progress bar shows upload status, device restarts automatically
-
----
-
-## Serial Ports
-
-| Port | Pins | Purpose |
-|------|------|---------|
-| UART0 | USB | Debug console (115200 baud) |
-| UART1 | RX=16, TX=17 | UM982 COM1 — NMEA output |
-| UART2 | RX=19, TX=18 | UM982 COM2 — RTCM input |
 
 ---
 
@@ -111,55 +109,108 @@ The upload port is set to `/dev/tty.usbserial-0001` in `platformio.ini`. Adjust 
 
 ## Web Interface
 
-### Status Tab (public — no login required)
+The single-page app has six tabs in the navigation bar.
 
-Live-updating display (2 second refresh):
+### Status (public — no login required)
+
+Live display (500 ms refresh):
 
 | Field | Source |
 |-------|--------|
 | Fix Type | GGA field 7 (1=GPS, 2=DGPS, 4=RTK Fixed, 5=RTK Float) |
 | Satellites | GGA field 8 |
-| Latitude / Longitude | GGA fields 3–6 (7 decimal places at RTK, 5 at GPS) |
-| True Heading | HEADINGA field 4 + heading offset |
-| Roll | HEADINGA field 5 (tilt of athwartships baseline = heel angle) |
-| Leeway / Lateral Drift | Derived from heading vs COG difference |
-| SOG (knots) | VTG field 6 |
-| COG | VTG field 2 |
+| Latitude / Longitude | GGA (7 dp at RTK, 5 dp at GPS) |
+| True Heading | HEADINGA + heading offset |
+| Roll (heel) | HEADINGA baseline tilt |
+| Leeway / Lateral Drift | Heading vs COG difference |
+| SOG (knots) | VTG |
+| COG | VTG (smoothed, frozen below min-SOG threshold) |
 | Drive Speed | Speed component in heading direction |
-| HDOP | GGA field 9 |
-| Altitude (m) | GGA field 10 |
-| NTRIP | Connected / Off + active source number |
-| RTCM Bytes | Total bytes received from NTRIP caster |
-| BLE | On/Off status |
-| NMEA sentences/sec | Throughput counter |
+| HDOP / Altitude | GGA |
+| NTRIP status | Connected / Off + active source |
+| BLE status | Advertising / Connected (if enabled) |
 
-### Configuration Tab (login required)
+### Configuration (login required)
 
 - **WiFi** — AP mode toggle, SSID, password; or join existing network
-- **Web Admin Password** — change the HTTP Basic Auth password (username always `admin`)
-- **Antenna** — heading offset in degrees (default 90° for athwartships mounting), COG minimum SOG
-- **NTRIP Corrections** — 3 source slots (host, port, mountpoint, username, password) with enable toggle; automatic failover after 3 consecutive failures
+- **Web Admin Password** — change the HTTP Basic Auth password
+- **Antenna** — heading offset (default 90° for athwartships), COG minimum SOG
+- **NTRIP Corrections** — 3 source slots with enable toggle and automatic failover
 - **BLE NMEA** — enable/disable Bluetooth LE NMEA broadcast
+- **GPS Update Rate** — 1 / 2 / 5 / 10 / 20 Hz
 
-### System Tab (login required)
+### Race
 
-- NMEA TCP connection instructions with device IP
+Race sequence management and live racing navigation.
+
+#### Pre-start setup
+
+- **Countdown clock** — large color-coded display: white → yellow at T‑4:00 → red at T‑1:00
+- **Duration** — 5 / 10 / 15 min presets plus ±1 min increment/decrement buttons
+- **ARM** — starts the countdown; **Reset** aborts and returns to setup
+- **Tap to sync** — tapping the clock face snaps T‑0 to the nearest whole minute, allowing re-sync with the committee boat gun at any point during the sequence
+
+#### Start Line (collapsible card)
+
+Each end (Port / Starboard) can be set by:
+- **GPS** — captures current GPS position
+- **Saved mark** — pick from the mark library dropdown
+
+When both ends are set, **Time to Line** is shown during the countdown (distance to start line ÷ current SOG).
+
+#### Course
+
+Select an active course from saved courses. The selected course drives mark-by-mark navigation after the start.
+
+#### Racing (post-start)
+
+- **Elapsed clock** — time since the gun (green)
+- **Next mark** — name, distance (nm), true bearing, and ETA at current SOG
+- **← Prev Mark / Next Mark →** — step forward or backward through course legs
+- **End Race** — stops the timer and navigates to the race stats view
+
+#### Race Stats
+
+Displayed after **End Race** or automatic completion at the last mark:
+
+- Total elapsed time (gun to finish)
+- Course name and marks-rounded count
+- Leg splits table: each mark with elapsed time from T‑0 and per-leg split time
+
+**New Race** clears all data and returns to setup.
+
+### Marks / Routes (login required)
+
+- **Mark library** — list all saved marks with coordinates; delete individual marks
+- **Add mark** — enter name + lat/lon manually, or tap "Use GPS Position" to capture current position
+- **Course list** — view saved courses with mark sequences and rounding directions
+- **GPX import** — upload a `.gpx` file to bulk-import waypoints as marks and routes as courses
+
+### Files (public)
+
+Browse the SD card (or SPIFFS) file system:
+- Navigate directories with breadcrumb trail
+- Download, rename, copy, or delete individual files
+- **Format SD card** — two-step confirmation erase and reinitialise
+
+### System (login required)
+
+- Device IP and NMEA TCP connection instructions
 - **Restart Device**
-- **UM982 Factory Reset** — sends `FRESET`, reconfigures `SIGNALGROUP 4 5`, restores NMEA outputs (~15 seconds)
-- **Firmware Update (OTA)** — upload `.bin` file with progress bar
+- **UM982 Factory Reset** — sends `FRESET`, reconfigures signal groups and NMEA outputs (~15 s)
+- **Firmware Update (OTA)** — upload `.bin` file with live progress bar
+- **BLE toggle** — enable/disable without a full config save/restart
 
 ### Authentication
 
 - Default credentials: **admin / admin**
-- Change the password in the Configuration tab → "Web Admin Password" section
+- Change the password in the Configuration tab → "Web Admin Password"
 - A **Log Out** button in the nav bar clears the browser's cached credentials
 - Closing the browser tab also clears credentials (auto-logout via `beforeunload`)
 
 ---
 
 ## NMEA Output (TCP port 10110)
-
-Sentences broadcast to all connected clients:
 
 | Sentence | Content |
 |----------|---------|
@@ -168,13 +219,11 @@ Sentences broadcast to all connected clients:
 | `$GPVTG` | Course and speed over ground |
 | `$GNRMC` | Date, time, position, speed, course |
 
-> **Note:** `#HEADINGA` (Unicore proprietary) is parsed internally for heading/roll but is **not** broadcast — only standard `$` sentences are sent.
-
 ### OpenCPN Setup
 
 1. Options → Connections → Add Connection
 2. Type: **Network**, Protocol: **TCP**
-3. Address: `192.168.x.x` (device IP), Port: `10110`
+3. Address: device IP, Port: `10110`
 4. Direction: **Input**
 
 ---
@@ -188,13 +237,13 @@ When enabled, NMEA sentences are broadcast over Bluetooth LE using two services 
 | NUS (Nordic UART) | `6E400001-B5A3-F393-E0A9-E50E24DCCA9E` | iNavX, ArduSimple BLE Bridge, SparkFun RTK |
 | HM-10 | `FFE0` / `FFE1` | SW Maps (iOS) |
 
-> **SW Maps note:** SW Maps iOS scans for the HM-10 `FFE0` service. Select **Generic NMEA (Bluetooth LE)** in SW Maps → Bluetooth GPS connections.
+> **SW Maps note:** Select **Generic NMEA (Bluetooth LE)** in SW Maps → Bluetooth GPS connections.
 
 ---
 
 ## UM982 Configuration
 
-The UM982 is configured at boot via `um982Init()` which restores NMEA output settings. Configuration is saved to UM982 flash, so it survives power cycles.
+The UM982 is configured at boot via `um982Init()`. Configuration is saved to UM982 flash and survives power cycles.
 
 **Signal groups for dual-antenna heading:**
 
@@ -203,7 +252,7 @@ The UM982 is configured at boot via `um982Init()` which restores NMEA output set
 | 4 (ANT1) | GPS L1/L2 + GLONASS L1/L2 + BeiDou B1/B2 |
 | 5 (ANT2) | GPS L1/L2 + Galileo E1/E5b + BeiDou B1/B2 |
 
-Only run **UM982 Factory Reset** (System tab) when:
+Only run **UM982 Factory Reset** when:
 - Antennas are first installed
 - Heading/roll stops working after a hardware change
 - The UM982 flash config is corrupted
@@ -214,26 +263,51 @@ Only run **UM982 Factory Reset** (System tab) when:
 
 ```
 SailingComputer/
-├── platformio.ini          # PlatformIO build config (ESP-IDF framework, port, monitor filters)
-├── sdkconfig.defaults      # ESP-IDF build-time config (BLE, HTTPS, mbedTLS, OTA, logging)
+├── platformio.ini          # PlatformIO build config (ESP-IDF, board, port)
+├── sdkconfig.defaults      # ESP-IDF build-time config (BLE, HTTPS, mbedTLS, OTA)
 ├── partitions.csv          # Custom partition table (OTA + NVS)
+├── flash.sh                # Build and OTA-upload helper script
 ├── certs/
-│   ├── cert.pem            # Self-signed TLS certificate (sailingcomputer.local, 10 years)
+│   ├── cert.pem            # Self-signed TLS certificate (10-year validity)
 │   └── key.pem             # RSA-2048 private key
 └── src/
-    ├── main.cpp            # WiFi, NMEA parsing, NTRIP client, web server, OTA, BLE glue
+    ├── main.cpp            # WiFi, NMEA parsing, NTRIP, web server, OTA, race engine
     ├── config.h            # Config struct + NVS load/save (ConfigManager)
+    ├── storage.h           # StorageManager — SD card / SPIFFS, marks, courses JSON
+    ├── gpx.h               # GPX file parser (waypoints → marks, routes → courses)
     ├── um982.h             # UM982 UART init, command helpers, factory reset
     ├── ble_nmea.h          # BLE NUS + HM-10 GATT server for NMEA broadcast
     ├── certs.h             # TLS cert + key as embedded C string literals
+    ├── version.h           # Firmware version string
     └── webui.h             # Single-page web UI (HTML/CSS/JS, inline)
 ```
 
 ---
 
+## Race API
+
+The race engine exposes a REST API consumed by the web UI. All endpoints are unauthenticated (operational controls, not configuration).
+
+| Method | Path | Body / Notes |
+|--------|------|--------------|
+| GET | `/race/state` | Full race state JSON (clock, line, course, legs) |
+| POST | `/race/start` | Arm countdown: now + duration |
+| POST | `/race/stop` | Reset to idle, clear all race data |
+| POST | `/race/end` | End race mid-course, preserve data, show stats |
+| POST | `/race/sync` | Snap T‑0 to nearest whole minute |
+| POST | `/race/duration` | `{"seconds":300}` — set sequence length (idle only) |
+| POST | `/race/startline` | `{"end":0,"lat":…,"lon":…}` or `{"end":0,"markId":"…"}` |
+| POST | `/race/course` | `{"courseId":"…","leg":0}` — set active course |
+| POST | `/race/nextleg` | Advance to next mark (auto-completes at last mark) |
+| POST | `/race/prevleg` | Step back to previous mark |
+
+Race state machine: `idle` → `countdown` → `racing` → `complete`
+
+---
+
 ## Configuration Reference
 
-All settings are stored in NVS namespace `sailcomp`.
+All settings stored in NVS namespace `sailcomp`.
 
 | Key | Type | Description |
 |-----|------|-------------|
@@ -252,6 +326,7 @@ All settings are stored in NVS namespace `sailcomp`.
 | `hdgOffset` | float | Heading correction in degrees (default 90.0) |
 | `cogMinSog` | float | COG freeze threshold in knots (default 0.1) |
 | `bleNmea` | bool | BLE NMEA broadcast enabled |
+| `gpsRate` | uint8 | GPS update rate in Hz (1/2/5/10/20) |
 
 ---
 

@@ -19,8 +19,11 @@
 #define SERIAL2_TX 48   // ESP32 GPIO48   → UM982 COM1 RX (orange, diagnostic)
 #define PPS_PIN    27   // UM982 PPS      → ESP32 GPIO27 (white)
 
-#define NMEA_BAUD  115200
-#define RTCM_BAUD  115200
+#define NMEA_BAUD         460800   // operating baud after negotiation
+#define NMEA_BAUD_DEFAULT 115200   // UM982 power-on / post-FRESET default
+#define RTCM_BAUD         115200
+
+#define GPS_RATE_DEFAULT  1        // Hz — valid: 1, 2, 5, 10, 20
 
 // TCP NMEA broadcast port
 #define NMEA_TCP_PORT 10110
@@ -62,6 +65,7 @@ struct Config {
     char        apSSID[64];
     char        apPassword[64];
     char        adminPassword[64];  // HTTP Basic Auth for config/OTA pages
+    uint8_t     gpsUpdateRate;      // Hz: 1, 2, 5, 10, 20
 };
 
 // Store/load float via its bit pattern — NVS has no native float type.
@@ -77,6 +81,7 @@ public:
         cfg.apMode        = true;
         cfg.headingOffset = 90.0f;
         cfg.cogMinSog     = COG_MIN_SOG_DEFAULT;
+        cfg.gpsUpdateRate = GPS_RATE_DEFAULT;
         for (int i = 0; i < NTRIP_SOURCES; i++) cfg.ntrip[i].port = 2101;
         strlcpy(cfg.apSSID,       DEFAULT_AP_SSID,     sizeof(cfg.apSSID));
         strlcpy(cfg.apPassword,   DEFAULT_AP_PASSWORD, sizeof(cfg.apPassword));
@@ -135,7 +140,8 @@ public:
 
         if (nvs_get_u32(h, "hdgOffset", &u) == ESP_OK) cfg.headingOffset = u2f(u);
         if (nvs_get_u32(h, "cogMinSog", &u) == ESP_OK) cfg.cogMinSog     = u2f(u);
-        b = 0; nvs_get_u8(h, "bleNmea", &b); cfg.bleNmea = b;
+        b = 0; nvs_get_u8(h, "bleNmea",  &b); cfg.bleNmea = b;
+        b = GPS_RATE_DEFAULT; nvs_get_u8(h, "gpsRate", &b); cfg.gpsUpdateRate = b;
 
         len = sizeof(cfg.apSSID);       nvs_get_str(h, "apSSID",    cfg.apSSID,       &len);
         len = sizeof(cfg.apPassword);   nvs_get_str(h, "apPass",    cfg.apPassword,   &len);
@@ -174,6 +180,7 @@ public:
         nvs_set_u32(h, "hdgOffset", f2u(cfg.headingOffset));
         nvs_set_u32(h, "cogMinSog", f2u(cfg.cogMinSog));
         nvs_set_u8 (h, "bleNmea",   cfg.bleNmea ? 1 : 0);
+        nvs_set_u8 (h, "gpsRate",   cfg.gpsUpdateRate);
         nvs_set_str(h, "apSSID",    cfg.apSSID);
         nvs_set_str(h, "apPass",    cfg.apPassword);
         nvs_set_str(h, "adminPass", cfg.adminPassword);
