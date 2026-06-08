@@ -547,7 +547,7 @@ inline const char* getWebUI() {
     </div>
 
     <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:1rem">
-      <button id="trackLoopBtn" onclick="toggleTrackLoop()" style="min-width:130px">▶ Start Loop</button>
+      <button id="trackLoopBtn" onclick="toggleTrackLoop()" style="min-width:200px">Enable Loop Recording</button>
       <button id="trackSegBtn"  onclick="toggleTrackSeg()"  style="min-width:150px" disabled>Select Start</button>
     </div>
 
@@ -1883,7 +1883,7 @@ function renderTrackPage(d) {
   // Loop start/stop button
   var lb = document.getElementById('trackLoopBtn');
   lb.disabled = !sdOk;
-  lb.textContent = d.loopRunning ? '■ Stop Loop' : '▶ Start Loop';
+  lb.textContent = d.loopRunning ? 'Disable Loop Recording' : 'Enable Loop Recording';
 
   // Segment button
   var sb = document.getElementById('trackSegBtn');

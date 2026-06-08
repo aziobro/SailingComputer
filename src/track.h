@@ -9,7 +9,8 @@
 
 static const char *TRACK_TAG = "Track";
 
-#define TRACK_LOOP_MAGIC 0xB0A7FACE
+#define TRACK_LOOP_MAGIC   0xB0A7FACE
+#define TRACK_SYNC_WRITES  60u   // close+reopen loop file every N writes to flush FAT dir entry
 
 // 32-byte binary record stored in the loop file.
 struct TrackPoint {
@@ -24,72 +25,53 @@ struct TrackPoint {
     uint8_t  pad[3];
 };  // 32 bytes — sizeof must stay 32
 
-// Fixed-size header at offset 0 of .loop.bin.
 struct LoopHeader {
     uint32_t magic;
     uint32_t write_idx;   // next slot to write (0..max_points-1)
     uint32_t count;       // points currently stored (≤ max_points)
-    uint32_t max_points;  // capacity (must match current config to be valid)
+    uint32_t max_points;  // capacity (must match current config)
 };  // 16 bytes
 
-// How this works
-// ==============
-// The loop file (.loop.bin) is a fixed-size pre-allocated file on the SD card.
-// It contains a 16-byte LoopHeader followed by (max_points * 32) bytes of
-// TrackPoint data.  Points are written in a circular fashion; the header
-// tracks the next write index and total count so we can reconstruct the
-// chronological order on export.
+// Design notes
+// ============
+// exportSegment() reads from the existing open loopFp_ handle rather than
+// opening a second handle to the same file.  On FATFS, a second read handle
+// opened while a write handle is active sees the directory-entry file_size,
+// which may be 0 until the write handle is closed — causing fread to return
+// nothing and the export to silently fail.
 //
-// "Select Start" just records the current GPS timestamp — nothing extra is
-// written to disk.  The GPX file is created entirely from the loop buffer
-// when "Select Stop" is pressed.  If the loop hasn't been overwritten yet,
-// the full segment is recoverable even after a power cut.
+// After the initial pre-allocation and every TRACK_SYNC_WRITES point writes
+// the file is closed and reopened.  This forces FATFS to commit the
+// directory-entry file_size to disk so the file browser shows the real size.
 //
-// Power-loss resilience
-// ---------------------
-// Worst case for a single point write: the header write (16 bytes in one FAT
-// sector) is interrupted, leaving a corrupt magic value.  The old code
-// deleted the loop file on a bad magic, losing all data.  The new code runs
-// a recovery scan instead:
-//   1. If file is the right size, scan data slots for the first empty (ts==0)
-//      slot — that is write_idx for a non-full buffer.
-//   2. If all slots are non-empty (full buffer), reset write_idx = 0 and
-//      count = max_points; the oldest slot is simply treated as unknown and
-//      we start overwriting from the beginning, which is safe ring-buffer
-//      behaviour.
-// GPX exports write to a .tmp file and rename on completion so an interrupted
-// export never leaves a truncated .gpx on disk.
+// Power-loss resilience: a corrupt/partial header is recovered by scanning
+// data slots for the first empty slot rather than deleting the file.
 
 class TrackRecorder {
 public:
-    bool     sdAvailable = false;   // loop file opened successfully on SD card
-    bool     loopRunning = false;   // user-controlled start/stop
-    bool     segActive   = false;   // between Select Start and Select Stop
+    bool     sdAvailable = false;
+    bool     loopRunning = false;
+    bool     segActive   = false;
     uint32_t segStartTs  = 0;
-    char     lastFile[80] = {};     // full path of last exported GPX
-    bool     fileReady   = false;   // true after successful export
+    char     lastFile[80] = {};
+    bool     fileReady   = false;
 
     SemaphoreHandle_t mtx = nullptr;
 
-    // Call once after SD card mounts.  dir = tracks directory, e.g. "/sdcard/tracks".
     bool begin(const char *dir, uint8_t intervalSec, uint8_t loopHours) {
         intervalSec_ = intervalSec ? intervalSec : 5;
         loopHours_   = loopHours   ? loopHours   : 3;
         maxPts_      = (uint32_t)loopHours_ * 3600u / intervalSec_;
         trackDir_    = dir;
         mtx          = xSemaphoreCreateMutex();
-
-        mkdir(dir, 0755);  // no-op if already exists
+        mkdir(dir, 0755);
         snprintf(loopPath_, sizeof(loopPath_), "%s/.loop.bin", dir);
-
         sdAvailable = openOrCreateLoop();
         if (sdAvailable)
             ESP_LOGI(TRACK_TAG, "begin ok  maxPts=%u interval=%us", maxPts_, intervalSec_);
         return sdAvailable;
     }
 
-    // Called from the NMEA parse task for every GGA with fix>0.
-    // Thread-safe; rate-limited internally.
     void tryWrite(double lat, double lon, float hdt, float heel,
                   float sog, float cog, uint8_t fix, uint32_t ts) {
         if (!sdAvailable || !loopRunning || fix == 0 || ts == 0) return;
@@ -112,12 +94,11 @@ public:
         xSemaphoreGive(mtx);
     }
 
-    // Extract the segment [t0..t1] from the loop and write a GPX file.
-    // Writes to a .tmp file first; renames to the final path on success so
-    // a power cut during export never leaves a truncated .gpx on disk.
     bool exportSegment(uint32_t t0, uint32_t t1) {
         if (!mtx) return false;
         xSemaphoreTake(mtx, portMAX_DELAY);
+
+        if (!loopFp_ || count_ == 0) { xSemaphoreGive(mtx); return false; }
 
         char t0str[24], t1str[24];
         fmtTs(t0, t0str, sizeof(t0str));
@@ -126,22 +107,29 @@ public:
                  trackDir_, t0str, t1str);
         fileReady = false;
 
-        // Use a temp file so a power cut during write never leaves corrupt XML.
         char tmpPath[88];
         snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", lastFile);
-        remove(tmpPath);  // clear any leftover from a previous interrupted export
+        remove(tmpPath);
 
-        FILE *lp = fopen(loopPath_, "rb");
-        if (!lp) { xSemaphoreGive(mtx); return false; }
-
+        // Read the loop header from the already-open write handle.
+        // Opening a second read handle via fopen("rb") sees the FAT directory-
+        // entry file_size which can be 0 while the write handle is open,
+        // causing all reads to return nothing.
+        fseek(loopFp_, 0, SEEK_SET);
         LoopHeader hdr = {};
-        fread(&hdr, sizeof(hdr), 1, lp);
-        if (hdr.magic != TRACK_LOOP_MAGIC || hdr.max_points == 0) {
-            fclose(lp); xSemaphoreGive(mtx); return false;
+        bool hdrOk = (fread(&hdr, sizeof(hdr), 1, loopFp_) == 1 &&
+                      hdr.magic == TRACK_LOOP_MAGIC &&
+                      hdr.max_points > 0);
+        if (!hdrOk) {
+            // Fall back to in-memory state — header may not have been flushed yet
+            hdr.magic      = TRACK_LOOP_MAGIC;
+            hdr.write_idx  = writeIdx_;
+            hdr.count      = count_;
+            hdr.max_points = maxPts_;
         }
 
         FILE *out = fopen(tmpPath, "w");
-        if (!out) { fclose(lp); xSemaphoreGive(mtx); return false; }
+        if (!out) { xSemaphoreGive(mtx); return false; }
 
         char trkName[48];
         snprintf(trkName, sizeof(trkName), "%s_to_%s", t0str, t1str);
@@ -155,15 +143,15 @@ public:
             "    <trkseg>\n", trkName);
 
         uint32_t stored = hdr.count < hdr.max_points ? hdr.count : hdr.max_points;
-        uint32_t oldest = (hdr.count < hdr.max_points) ? 0 : (hdr.write_idx % hdr.max_points);
+        uint32_t oldest = (hdr.count < hdr.max_points) ? 0u : (hdr.write_idx % hdr.max_points);
         int      written = 0;
 
         for (uint32_t i = 0; i < stored; i++) {
             uint32_t idx = (oldest + i) % hdr.max_points;
-            long     off = (long)(sizeof(LoopHeader) + idx * sizeof(TrackPoint));
-            fseek(lp, off, SEEK_SET);
+            long     off = (long)(sizeof(LoopHeader) + idx * (long)sizeof(TrackPoint));
+            fseek(loopFp_, off, SEEK_SET);
             TrackPoint pt = {};
-            fread(&pt, sizeof(pt), 1, lp);
+            if (fread(&pt, sizeof(pt), 1, loopFp_) != 1) continue;
             if (pt.unix_ts == 0 || pt.unix_ts < t0 || pt.unix_ts > t1) continue;
 
             time_t t = (time_t)pt.unix_ts;
@@ -194,13 +182,12 @@ public:
 
         fprintf(out, "    </trkseg>\n  </trk>\n</gpx>\n");
         fclose(out);
-        fclose(lp);
 
         xSemaphoreGive(mtx);
 
         if (written > 0) {
-            remove(lastFile);               // remove stale .gpx if it exists
-            rename(tmpPath, lastFile);      // atomic-ish promotion from .tmp
+            remove(lastFile);
+            rename(tmpPath, lastFile);
             fileReady = true;
             ESP_LOGI(TRACK_TAG, "Exported %d pts → %s", written, lastFile);
             return true;
@@ -209,7 +196,6 @@ public:
         return false;
     }
 
-    // Discard loop and re-create with new parameters.
     void reconfigure(uint8_t intervalSec, uint8_t loopHours) {
         if (mtx) xSemaphoreTake(mtx, portMAX_DELAY);
         if (loopFp_) { fclose(loopFp_); loopFp_ = nullptr; }
@@ -218,7 +204,7 @@ public:
         maxPts_      = (uint32_t)loopHours_ * 3600u / intervalSec_;
         writeIdx_    = 0;  count_    = 0;
         firstTs_     = 0;  lastTs_   = 0;
-        lastWriteTs_ = 0;
+        lastWriteTs_ = 0;  syncCtr_  = 0;
         remove(loopPath_);
         sdAvailable = openOrCreateLoop();
         if (mtx) xSemaphoreGive(mtx);
@@ -231,7 +217,6 @@ public:
     uint8_t  intervalSec()  const { return intervalSec_; }
     uint8_t  loopHours()    const { return loopHours_;   }
 
-    // Basename of lastFile for display.
     const char *lastFileName() const {
         const char *p = strrchr(lastFile, '/');
         return p ? p + 1 : lastFile;
@@ -245,6 +230,7 @@ private:
     uint32_t    firstTs_     = 0;
     uint32_t    lastTs_      = 0;
     uint32_t    lastWriteTs_ = 0;
+    uint32_t    syncCtr_     = 0;   // counts writes since last close+reopen
     uint8_t     intervalSec_ = 5;
     uint8_t     loopHours_   = 3;
     char        loopPath_[80] = {};
@@ -260,28 +246,22 @@ private:
             if (hdrOk) {
                 writeIdx_ = hdr.write_idx;
                 count_    = hdr.count < maxPts_ ? hdr.count : maxPts_;
+                syncCtr_  = 0;
                 readBoundaryTs();
                 ESP_LOGI(TRACK_TAG, "Loop re-opened: %u pts stored", count_);
                 return true;
             }
-
-            // Header is invalid (corrupt magic or wrong capacity).
-            // Attempt a data-recovery scan before falling back to recreation.
-            // This preserves recorded data that survived a mid-header power cut.
             if (recoverLoopState()) {
                 ESP_LOGW(TRACK_TAG, "Loop header recovered: count=%u write_idx=%u",
                          count_, writeIdx_);
                 return true;
             }
-
-            // File is the wrong size or completely unreadable — recreate.
-            ESP_LOGW(TRACK_TAG, "Loop recovery failed — recreating");
             fclose(loopFp_);
             loopFp_ = nullptr;
             remove(loopPath_);
+            ESP_LOGW(TRACK_TAG, "Loop recovery failed — recreating");
         }
 
-        // Create a fresh pre-allocated loop file.
         loopFp_ = fopen(loopPath_, "w+b");
         if (!loopFp_) {
             ESP_LOGE(TRACK_TAG, "Cannot create %s", loopPath_);
@@ -299,16 +279,25 @@ private:
             fwrite(zeroBuf, 1, chunk, loopFp_);
         }
         fflush(loopFp_);
+
+        // Close and reopen to force FATFS to commit the directory-entry
+        // file_size field.  Without this the file appears as 0 bytes to
+        // other file handles and to the file browser.
+        fclose(loopFp_);
+        loopFp_ = fopen(loopPath_, "r+b");
+        if (!loopFp_) {
+            ESP_LOGE(TRACK_TAG, "Cannot reopen loop after creation: %s", loopPath_);
+            return false;
+        }
+
         writeIdx_ = 0;
         count_    = 0;
+        syncCtr_  = 0;
         ESP_LOGI(TRACK_TAG, "Loop created: %u pts max (%u KB)",
                  maxPts_, (uint32_t)(sizeof(LoopHeader) + maxPts_ * sizeof(TrackPoint)) / 1024);
         return true;
     }
 
-    // Called when the loop file exists but the header magic/capacity is wrong.
-    // Scans data slots to reconstruct write_idx and count, then rewrites the
-    // header.  Returns false only if the file is the wrong size.
     bool recoverLoopState() {
         fseek(loopFp_, 0, SEEK_END);
         long fileSize    = ftell(loopFp_);
@@ -317,32 +306,23 @@ private:
             ESP_LOGW(TRACK_TAG, "Loop file too small (%ld < %ld)", fileSize, expectedMin);
             return false;
         }
-
         ESP_LOGW(TRACK_TAG, "Scanning %u slots to recover loop state…", maxPts_);
-
-        // Scan forward until we hit the first empty slot (ts==0).
-        // Empty slot ⟹ buffer was not full and write_idx = that slot.
         for (uint32_t i = 0; i < maxPts_; i++) {
             fseek(loopFp_, (long)(sizeof(LoopHeader) + i * (long)sizeof(TrackPoint)), SEEK_SET);
             TrackPoint pt = {};
             if (fread(&pt, sizeof(pt), 1, loopFp_) != 1) return false;
-
             if (pt.unix_ts == 0) {
                 writeIdx_ = i;
                 count_    = i;
+                syncCtr_  = 0;
                 rewriteHeader();
                 readBoundaryTs();
                 return true;
             }
         }
-
-        // All slots non-empty: buffer was full when power was lost.
-        // We cannot determine the true oldest slot without valid header state,
-        // so reset write_idx = 0.  This means new points will overwrite from
-        // slot 0 onward — correct ring-buffer behaviour, just not optimal
-        // ordering of the recovered data.
         writeIdx_ = 0;
         count_    = maxPts_;
+        syncCtr_  = 0;
         rewriteHeader();
         readBoundaryTs();
         return true;
@@ -355,37 +335,54 @@ private:
         fflush(loopFp_);
     }
 
+    // Periodically close and reopen the loop file so FATFS commits the
+    // directory-entry file_size visible to external readers (file browser, etc.)
+    void syncLoopFile() {
+        if (!loopFp_) return;
+        fflush(loopFp_);
+        fclose(loopFp_);
+        loopFp_ = fopen(loopPath_, "r+b");
+        if (!loopFp_) {
+            ESP_LOGE(TRACK_TAG, "Loop reopen after sync failed");
+            sdAvailable = false;
+        }
+    }
+
     void writePointToLoop(const TrackPoint &pt) {
         if (!loopFp_) return;
         long off = (long)(sizeof(LoopHeader) + writeIdx_ * (long)sizeof(TrackPoint));
         fseek(loopFp_, off, SEEK_SET);
-        fwrite(&pt, sizeof(pt), 1, loopFp_);
+        if (fwrite(&pt, sizeof(pt), 1, loopFp_) != 1) {
+            ESP_LOGE(TRACK_TAG, "Loop write failed at idx=%u", writeIdx_);
+            return;
+        }
 
         writeIdx_ = (writeIdx_ + 1) % maxPts_;
         if (count_ < maxPts_) count_++;
         lastTs_ = pt.unix_ts;
         if (firstTs_ == 0) firstTs_ = pt.unix_ts;
 
-        // Update header after every point so the file is always self-consistent.
-        // Power cut here (mid-header-write) is handled by recoverLoopState() on
-        // next boot — the data points themselves survive because they are written
-        // to the pre-allocated data region before the header is touched.
-        rewriteHeader();
-
-        // Track the oldest timestamp when the buffer has wrapped.
         if (count_ == maxPts_) {
             long oldest_off = (long)(sizeof(LoopHeader) + writeIdx_ * (long)sizeof(TrackPoint));
             fseek(loopFp_, oldest_off, SEEK_SET);
             TrackPoint oldest = {};
-            fread(&oldest, sizeof(oldest), 1, loopFp_);
-            if (oldest.unix_ts) firstTs_ = oldest.unix_ts;
+            if (fread(&oldest, sizeof(oldest), 1, loopFp_) == 1 && oldest.unix_ts)
+                firstTs_ = oldest.unix_ts;
+        }
+
+        rewriteHeader();
+
+        // Periodically close+reopen to keep the FAT directory entry current.
+        if (++syncCtr_ >= TRACK_SYNC_WRITES) {
+            syncCtr_ = 0;
+            syncLoopFile();
         }
     }
 
     void readBoundaryTs() {
         if (!loopFp_ || count_ == 0) return;
         uint32_t oldest = (count_ < maxPts_) ? 0u : (writeIdx_ % maxPts_);
-        uint32_t newest = (writeIdx_ == 0) ? (maxPts_ - 1) : (writeIdx_ - 1);
+        uint32_t newest = (writeIdx_ == 0)   ? (maxPts_ - 1) : (writeIdx_ - 1);
         TrackPoint pt = {};
         fseek(loopFp_, (long)(sizeof(LoopHeader) + oldest * (long)sizeof(TrackPoint)), SEEK_SET);
         fread(&pt, sizeof(pt), 1, loopFp_);
