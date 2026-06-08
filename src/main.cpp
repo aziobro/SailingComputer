@@ -1496,14 +1496,38 @@ static esp_err_t handleStorageInfo(httpd_req_t *req) {
 
 // ── File manager HTTP handlers ────────────────────────────────────────────────
 
+// httpd_query_key_value returns the raw percent-encoded string; decode it.
+static void urlDecode(char *dst, const char *src, size_t dstSize) {
+    size_t di = 0;
+    for (size_t i = 0; src[i] && di + 1 < dstSize; i++) {
+        if (src[i] == '%' && src[i+1] && src[i+2]) {
+            char hex[3] = { src[i+1], src[i+2], '\0' };
+            dst[di++] = (char)strtol(hex, nullptr, 16);
+            i += 2;
+        } else if (src[i] == '+') {
+            dst[di++] = ' ';
+        } else {
+            dst[di++] = src[i];
+        }
+    }
+    dst[di] = '\0';
+}
+
+// Read the "path" query parameter and percent-decode it into dst.
+static void queryPath(httpd_req_t *req, char *dst, size_t dstSize) {
+    dst[0] = '\0';
+    size_t qLen = httpd_req_get_url_query_len(req);
+    if (qLen == 0 || qLen >= dstSize + 64) return;
+    char qbuf[256];
+    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) != ESP_OK) return;
+    char raw[128] = {};
+    if (httpd_query_key_value(qbuf, "path", raw, sizeof(raw)) != ESP_OK) return;
+    urlDecode(dst, raw, dstSize);
+}
+
 static esp_err_t handleFilesList(httpd_req_t *req) {
     char path[128] = {};
-    size_t qLen = httpd_req_get_url_query_len(req);
-    if (qLen > 0 && qLen < sizeof(path) + 10) {
-        char qbuf[160];
-        if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK)
-            httpd_query_key_value(qbuf, "path", path, sizeof(path));
-    }
+    queryPath(req, path, sizeof(path));
     if (path[0] == '\0') strlcpy(path, storageMgr.mountPoint(), sizeof(path));
     const char *safe = storageMgr.safePath(path);
     if (!safe) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path"); return ESP_OK; }
@@ -1571,12 +1595,7 @@ static esp_err_t handleFilesCopy(httpd_req_t *req) {
 
 static esp_err_t handleFilesDownload(httpd_req_t *req) {
     char path[128] = {};
-    size_t qLen = httpd_req_get_url_query_len(req);
-    if (qLen > 0 && qLen < sizeof(path) + 10) {
-        char qbuf[160];
-        if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK)
-            httpd_query_key_value(qbuf, "path", path, sizeof(path));
-    }
+    queryPath(req, path, sizeof(path));
     const char *safe = storageMgr.safePath(path);
     if (!safe || !path[0]) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path"); return ESP_OK; }
     struct stat st;
