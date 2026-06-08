@@ -62,7 +62,7 @@ public:
         intervalSec_ = intervalSec ? intervalSec : 5;
         loopHours_   = loopHours   ? loopHours   : 3;
         maxPts_      = (uint32_t)loopHours_ * 3600u / intervalSec_;
-        trackDir_    = dir;
+        strlcpy(trackDir_, dir, sizeof(trackDir_));
         mtx          = xSemaphoreCreateMutex();
         mkdir(dir, 0755);
         snprintf(loopPath_, sizeof(loopPath_), "%s/.loop.bin", dir);
@@ -275,8 +275,8 @@ private:
     uint32_t    syncCtr_     = 0;   // counts writes since last close+reopen
     uint8_t     intervalSec_ = 5;
     uint8_t     loopHours_   = 3;
-    char        loopPath_[80] = {};
-    const char *trackDir_    = "/sdcard/tracks";
+    char        loopPath_[80]  = {};
+    char        trackDir_[64]  = "/sdcard/tracks";  // owned copy — NOT a pointer to caller's stack
 
     bool openOrCreateLoop() {
         loopFp_ = fopen(loopPath_, "r+b");
