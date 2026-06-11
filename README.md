@@ -19,9 +19,9 @@ An ESP32-P4-based sailing computer using the **Unicore UM982** dual-antenna GNSS
 - **ESP32-C6 coprocessor updates** — reflash the onboard WiFi/Bluetooth processor from a tested image bundled into the P4 firmware
 - **NVS-backed configuration** — all settings persist across reboots
 - **SD card storage** — marks, courses, and GPX files stored on SD card with SPIFFS fallback
-- **Mark & course manager** — save GPS positions as named marks, build courses from mark sequences, import from GPX
+- **Mark & course manager** — save GPS positions, create or edit ordered courses with port/starboard roundings, and import from GPX
 - **Race start sequence** — countdown clock (5 / 10 / 15 min, adjustable ±1 min), tap-to-sync with committee boat, time-to-start-line
-- **Race navigation** — bearing, distance, and ETA to next mark; previous/next mark controls
+- **Race navigation** — bearing, distance, closing-speed time-to-mark, VMG, SMG, boat heading, and CMG; previous/next mark controls
 - **Multi-lap courses** — select 1–5 laps and automatically repeat the course's interior marks before finishing
 - **Race stats** — elapsed time, leg splits, and marks-rounded summary on race completion
 - **SD card file manager** — browse, rename, copy, delete files and directories; format SD card
@@ -209,9 +209,17 @@ start and finish remain single occurrences.
 #### Racing (post-start)
 
 - **Elapsed clock** — time since the gun (green)
-- **Next mark** — name, distance (nm), true bearing, and ETA at current SOG
+- **Next mark** — name, distance, true bearing, CMG, VMG, measured SMG, and time-to-mark based on positive SMG
+- **Race compass** — phone-up (or north-up without sensor permission) with separate vectors for boat heading, CMG, and bearing to the mark
 - **← Prev Mark / Next Mark →** — step forward or backward through course legs
 - **End Race** — stops the timer and navigates to the race stats view
+
+Navigation terms:
+
+- **CMG** — course made good from GNSS COG: the direction the boat is moving over the ground
+- **VMG** — instantaneous SOG component in the direction of the next mark
+- **SMG** — filtered measured closing speed from the change in distance-to-mark
+- **Time to mark** — distance divided by positive SMG; hidden while the boat is not closing
 
 #### Race Stats
 
@@ -227,6 +235,7 @@ Displayed after **End Race** or automatic completion at the last mark:
 
 - **Mark library** — list all saved marks with coordinates; delete individual marks
 - **Add mark** — enter name + lat/lon manually, or tap "Use GPS Position" to capture current position
+- **Course editor** — create, rename, reorder, or delete courses; select saved marks and set each rounding to port or starboard
 - **Course list** — view saved courses with mark sequences and rounding directions
 - **GPX import** — upload a `.gpx` file to bulk-import waypoints as marks and routes as courses
 
@@ -362,6 +371,18 @@ The race engine exposes a REST API consumed by the web UI. All endpoints are una
 | POST | `/race/prevleg` | Step back to previous mark |
 
 Race state machine: `idle` → `countdown` → `racing` → `complete`
+
+## Course API
+
+Course modification requires HTTP Basic Auth. Courses cannot be edited or
+deleted while they are the active course in a countdown, race, or completed
+race view.
+
+| Method | Path | Body / Notes |
+|--------|------|--------------|
+| GET | `/courses` | List saved courses and ordered mark references |
+| POST | `/courses` | Create or edit: `{"id":"","name":"W/L","marks":[{"mark_id":"m123","port":true}]}` |
+| POST | `/courses/delete` | `{"id":"c123"}` — delete a saved course |
 
 ---
 

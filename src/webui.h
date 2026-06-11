@@ -251,6 +251,18 @@ inline const char* getWebUI() {
   .mark-row:last-child { border-bottom: 0; }
   .mark-name { color: #edf5fc; font-size: 1rem; font-weight: 800; }
   .mark-coords { margin-top: 3px; color: #89a8c1; font-size: 0.76rem; font-variant-numeric: tabular-nums; }
+  .course-editor { margin-bottom: 12px; padding: 12px; border: 1px solid #315a8b; border-radius: 10px; background: #081a34; }
+  .course-mark-edit { padding: 10px 0; border-bottom: 1px solid #1b3b61; }
+  .course-mark-edit:last-child { border-bottom: 0; }
+  .course-mark-line { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+  .course-mark-line select { margin: 0; }
+  .course-mark-controls { display: flex; gap: 6px; margin-top: 7px; }
+  .course-mark-controls .btn { min-width: 48px; min-height: 44px; padding: 8px 10px; }
+  .course-rounding { min-width: 66px !important; }
+  .course-list-item { padding: 12px 0; border-bottom: 1px solid #1e4080; }
+  .course-list-item:last-child { border-bottom: 0; }
+  .course-list-actions { display: flex; gap: 8px; margin-top: 9px; }
+  .course-list-actions .btn { flex: 1; }
 
   @media (max-width: 520px) {
     .row { grid-template-columns: 1fr; gap: 0; }
@@ -667,6 +679,11 @@ inline const char* getWebUI() {
       <!-- Compass -->
       <div id="compassSection" style="display:flex;flex-direction:column;align-items:center;margin-bottom:0.85rem">
         <canvas id="compassCanvas" width="220" height="220" style="display:block"></canvas>
+        <div style="display:flex;justify-content:center;gap:12px;flex-wrap:wrap;font-size:0.74rem;margin-top:5px">
+          <span style="color:#67c5ff">Boat <strong id="raceCompassHeading">--&deg;</strong></span>
+          <span style="color:#ffbb45">CMG <strong id="raceCompassCmg">--&deg;</strong></span>
+          <span style="color:#4fd39a">Mark <strong id="raceCompassMark">--&deg;</strong></span>
+        </div>
         <button id="compassEnableBtn" class="btn" onclick="requestCompassPermission()"
           style="margin-top:6px;display:none">
           Enable Compass
@@ -689,18 +706,35 @@ inline const char* getWebUI() {
       <!-- Racing: next mark info -->
       <div id="raceMarkInfo" style="display:none;background:#060f1e;border:1px solid #1a3050;border-radius:6px;padding:0.65rem 0.9rem;margin-bottom:0.75rem">
         <div id="raceNextMarkName" style="font-weight:bold;color:#5ab4e8;margin-bottom:6px;font-size:0.95rem">Next Mark</div>
-        <div style="display:flex;justify-content:space-between;align-items:baseline">
-          <span style="color:#7a9ab8;font-size:0.82rem">Distance</span>
-          <span id="raceMarkDist" style="font-variant-numeric:tabular-nums;color:#e0e8f0">-- nm</span>
+        <div class="stat-grid">
+          <div class="stat">
+            <div class="stat-label">Distance</div>
+            <div id="raceMarkDist" class="stat-value" style="font-size:1.25rem">-- nm</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Time To Mark</div>
+            <div id="raceMarkTTM" class="stat-value" style="font-size:1.25rem">--:--</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Bearing</div>
+            <div id="raceMarkBrg" class="stat-value" style="font-size:1.05rem">--&deg;</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">CMG</div>
+            <div id="raceMarkCmg" class="stat-value" style="font-size:1.05rem">--&deg;</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">VMG</div>
+            <div id="raceMarkVmg" class="stat-value" style="font-size:1.05rem">-- kt</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">SMG</div>
+            <div id="raceMarkSmg" class="stat-value" style="font-size:1.05rem">-- kt</div>
+          </div>
         </div>
-        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:4px">
-          <span style="color:#7a9ab8;font-size:0.82rem">Bearing</span>
-          <span id="raceMarkBrg"  style="font-variant-numeric:tabular-nums;color:#e0e8f0">--&deg;</span>
-        </div>
-        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:4px">
-          <span style="color:#7a9ab8;font-size:0.82rem">ETA</span>
-          <span id="raceMarkETA"  style="font-variant-numeric:tabular-nums;color:#e0e8f0">--:--</span>
-        </div>
+        <p style="font-size:0.7rem;color:#617f99;margin:0.55rem 0 0">
+          VMG is the current velocity component toward the mark. SMG is measured closing speed; time-to-mark uses positive SMG.
+        </p>
       </div>
 
       <div class="race-actions">
@@ -821,7 +855,25 @@ inline const char* getWebUI() {
 
   <!-- Courses -->
   <div class="card">
-    <h2>Courses</h2>
+    <div class="card-heading-row">
+      <h2>Courses</h2>
+      <button type="button" class="btn btn-primary" onclick="newCourse()">New Course</button>
+    </div>
+    <div id="courseEditor" class="course-editor" style="display:none">
+      <div id="courseEditorTitle" class="section-title" style="margin-top:0">New Course</div>
+      <label for="courseEditName">Course Name</label>
+      <input id="courseEditName" type="text" maxlength="31" placeholder="e.g. Wednesday Windward/Leeward">
+      <div class="section-title">Mark Sequence</div>
+      <div id="courseEditorMarks"></div>
+      <button type="button" class="btn" style="width:100%;margin-top:9px" onclick="addCourseMark()">Add Mark</button>
+      <p style="font-size:0.76rem;color:#7895af;margin:0.65rem 0">
+        Put marks in rounding order. P means leave the mark to port; S means leave it to starboard.
+      </p>
+      <div style="display:flex;gap:8px">
+        <button type="button" class="btn" style="flex:1" onclick="cancelCourseEdit()">Cancel</button>
+        <button type="button" class="btn btn-primary" style="flex:2" onclick="saveCourse()">Save Course</button>
+      </div>
+    </div>
     <div id="courseList">
       <p style="color:#5a7a9a;font-size:0.85rem">Loading courses&hellip;</p>
     </div>
@@ -1034,6 +1086,7 @@ function showPage(id) {
   if (id === 'config') loadConfig();
   if (id === 'marks')  { loadMarks(); loadCourses(); }
   if (id === 'start')  { loadRaceState(); loadRaceMarksAndCourses(); startRacePolling(); initRaceCompass(); }
+  if (id !== 'start')  { stopRaceCompass(); }
   if (id === 'tracks') { startTrackPolling(); }
   if (id !== 'tracks') { stopTrackPolling(); }
   if (id !== 'system') { stopC6Polling(); }
@@ -1596,6 +1649,9 @@ var racePollTimer    = null;
 var raceStateCache   = null;   // latest /race/state response
 var raceCourseCache  = [];     // full course objects from /courses
 var raceMarkMapCache = {};     // mark id → name map from /marks
+var markClosingKey = '';
+var markClosingSamples = [];
+var markSmgFiltered = null;
 
 // ── Compass ───────────────────────────────────────────────────────────────────
 var compassHeading   = null;   // degrees, 0=North, from deviceorientation
@@ -1626,7 +1682,7 @@ function requestCompassPermission() {
 }
 
 function initRaceCompass() {
-  drawCompass();
+  if (!compassRafId) drawCompassLoop();
   if (typeof DeviceOrientationEvent === 'undefined') {
     document.getElementById('compassUnavail').style.display = '';
     return;
@@ -1639,9 +1695,39 @@ function initRaceCompass() {
   }
 }
 
+function stopRaceCompass() {
+  if (compassRafId) cancelAnimationFrame(compassRafId);
+  compassRafId = null;
+}
+
 function drawCompassLoop() {
   drawCompass();
   compassRafId = requestAnimationFrame(drawCompassLoop);
+}
+
+function drawRaceCompassVector(ctx, deg, length, color, width, dashed) {
+  var a = deg * Math.PI / 180;
+  var tx = Math.sin(a) * length;
+  var ty = -Math.cos(a) * length;
+  ctx.save();
+  ctx.setLineDash(dashed ? [7, 5] : []);
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(tx, ty);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  var px = Math.cos(a), py = Math.sin(a);
+  ctx.beginPath();
+  ctx.moveTo(tx, ty);
+  ctx.lineTo(tx - Math.sin(a) * 13 + px * 6, ty + Math.cos(a) * 13 + py * 6);
+  ctx.lineTo(tx - Math.sin(a) * 13 - px * 6, ty + Math.cos(a) * 13 - py * 6);
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.restore();
 }
 
 function drawCompass() {
@@ -1652,7 +1738,20 @@ function drawCompass() {
   var cx = w / 2, cy = h / 2, r = cx - 8;
   ctx.clearRect(0, 0, w, h);
 
-  var hdg = compassHeading != null ? compassHeading : 0;
+  var phoneHdg = compassHeading != null ? compassHeading : 0;
+  var state  = raceStateCache;
+  var status = raceStatusCache;
+  var boatHdg = status && status.hdtValid ? Number(status.heading) : null;
+  var cmg = status && status.cogValid ? Number(status.cog) : null;
+  var markBrg = null;
+  if (state && status && state.state === 'racing' && state.nextMark &&
+      state.nextMark.lat != null && state.nextMark.lon != null &&
+      status.lat != null && status.lon != null) {
+    markBrg = bearingDeg(status.lat, status.lon, state.nextMark.lat, state.nextMark.lon);
+  }
+  setText('raceCompassHeading', boatHdg != null ? Math.round(boatHdg) + '\u00b0' : '--\u00b0');
+  setText('raceCompassCmg', cmg != null ? Math.round(cmg) + '\u00b0' : '--\u00b0');
+  setText('raceCompassMark', markBrg != null ? Math.round(markBrg) + '\u00b0' : '--\u00b0');
 
   // Outer ring
   ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
@@ -1662,7 +1761,7 @@ function drawCompass() {
   // Rotating rose
   ctx.save();
   ctx.translate(cx, cy);
-  ctx.rotate(-hdg * Math.PI / 180);
+  ctx.rotate(-phoneHdg * Math.PI / 180);
 
   // Tick marks
   for (var i = 0; i < 360; i += 5) {
@@ -1686,51 +1785,28 @@ function drawCompass() {
     ctx.fillText(c[0], Math.sin(a) * (r - 22), -Math.cos(a) * (r - 22));
   });
 
-  // Mark bearing arrow (green, absolute bearing so it rotates with the rose)
-  var state  = raceStateCache;
-  var status = raceStatusCache;
-  if (state && status && state.state === 'racing' && state.nextMark &&
-      state.nextMark.lat && status.lat) {
-    var mb = bearingDeg(status.lat, status.lon, state.nextMark.lat, state.nextMark.lon);
-    var ma = mb * Math.PI / 180;
-    var aLen = r - 28;
-    // Shaft
-    ctx.beginPath();
-    ctx.moveTo(0, 0);
-    ctx.lineTo(Math.sin(ma) * aLen, -Math.cos(ma) * aLen);
-    ctx.strokeStyle = '#4caf82'; ctx.lineWidth = 3; ctx.stroke();
-    // Head
-    var tx = Math.sin(ma) * aLen, ty = -Math.cos(ma) * aLen;
-    var px = Math.cos(ma), py = Math.sin(ma);
-    ctx.beginPath();
-    ctx.moveTo(tx, ty);
-    ctx.lineTo(tx - Math.sin(ma)*13 + px*6, ty + Math.cos(ma)*13 + py*6);
-    ctx.lineTo(tx - Math.sin(ma)*13 - px*6, ty + Math.cos(ma)*13 - py*6);
-    ctx.closePath(); ctx.fillStyle = '#4caf82'; ctx.fill();
-    // Tail (small back line so direction is unambiguous)
-    ctx.beginPath();
-    ctx.moveTo(0, 0);
-    ctx.lineTo(-Math.sin(ma) * 14, Math.cos(ma) * 14);
-    ctx.strokeStyle = '#2a6a48'; ctx.lineWidth = 2; ctx.stroke();
-  }
+  // Absolute vectors rotate with the phone-up rose.
+  if (cmg != null) drawRaceCompassVector(ctx, cmg, r - 42, '#ffbb45', 3, true);
+  if (boatHdg != null) drawRaceCompassVector(ctx, boatHdg, r - 34, '#67c5ff', 4, false);
+  if (markBrg != null) drawRaceCompassVector(ctx, markBrg, r - 25, '#4fd39a', 3, false);
 
   ctx.restore();
 
-  // Fixed heading indicator — blue triangle at top = direction phone is facing
+  // Fixed top indicator is the phone direction; boat heading is the blue vector.
   ctx.beginPath();
   ctx.moveTo(cx,     cy - r + 2);
   ctx.lineTo(cx - 8, cy - r + 16);
   ctx.lineTo(cx + 8, cy - r + 16);
-  ctx.closePath(); ctx.fillStyle = '#5ab4e8'; ctx.fill();
+  ctx.closePath(); ctx.fillStyle = '#d7e8f6'; ctx.fill();
 
   // Center dot
   ctx.beginPath(); ctx.arc(cx, cy, 3, 0, Math.PI * 2);
   ctx.fillStyle = '#e0e8f0'; ctx.fill();
 
-  // Heading readout at bottom
+  // Phone orientation readout; without permission the display remains north-up.
   ctx.font = '11px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   ctx.fillStyle = compassHeading != null ? '#7a9ab8' : '#2a4a6a';
-  ctx.fillText(compassHeading != null ? Math.round(hdg) + '°' : 'no sensor', cx, cy + r - 12);
+  ctx.fillText(compassHeading != null ? 'phone ' + Math.round(phoneHdg) + '°' : 'north up', cx, cy + r - 12);
 }
 
 function startRacePolling() {
@@ -1776,6 +1852,7 @@ function renderRacePage(d) {
   var now   = d.server_now_ms;
   var t0    = d.t0_ms;
   document.getElementById('start').classList.toggle('race-live', state !== 'idle');
+  if (state !== 'racing') resetMarkClosingSpeed();
 
   setupView.style.display    = (state === 'idle')    ? '' : 'none';
   activeView.style.display   = (state === 'countdown' || state === 'racing') ? '' : 'none';
@@ -1834,6 +1911,7 @@ function renderRacePage(d) {
         markInfo.style.display   = 'none';
         nextLegBtn.style.display = 'none';
         prevLegBtn.style.display = (d.legIdx > 0) ? '' : 'none';
+        resetMarkClosingSpeed();
       }
     }
   }
@@ -1983,19 +2061,91 @@ function updateTTL(raceD) {
   document.getElementById('raceTTL').textContent = fmtHMS(ttlSec);
 }
 
+function resetMarkClosingSpeed() {
+  markClosingKey = '';
+  markClosingSamples = [];
+  markSmgFiltered = null;
+}
+
+function measuredSmg(markKey, distanceNm) {
+  if (markClosingKey !== markKey) {
+    resetMarkClosingSpeed();
+    markClosingKey = markKey;
+  }
+
+  var now = Date.now();
+  var last = markClosingSamples.length ? markClosingSamples[markClosingSamples.length - 1] : null;
+  if (last && now - last.time > 3000) {
+    resetMarkClosingSpeed();
+    markClosingKey = markKey;
+    last = null;
+  }
+  if (!last || now - last.time >= 400)
+    markClosingSamples.push({time:now, distance:distanceNm});
+  markClosingSamples = markClosingSamples.filter(function(sample) {
+    return now - sample.time <= 10000;
+  });
+
+  var anchor = null;
+  for (var i = 0; i < markClosingSamples.length; i++) {
+    if (now - markClosingSamples[i].time >= 4000) {
+      anchor = markClosingSamples[i];
+      break;
+    }
+  }
+  if (!anchor) return markSmgFiltered;
+
+  var elapsedHours = (now - anchor.time) / 3600000;
+  if (elapsedHours <= 0) return markSmgFiltered;
+  var rawSmg = (anchor.distance - distanceNm) / elapsedHours;
+  if (!isFinite(rawSmg) || Math.abs(rawSmg) > 60) return markSmgFiltered;
+  markSmgFiltered = markSmgFiltered == null ? rawSmg :
+    markSmgFiltered * 0.7 + rawSmg * 0.3;
+  return markSmgFiltered;
+}
+
 function updateMarkInfo(mark) {
   if (!raceStatusCache || !mark) return;
-  var lat = raceStatusCache.lat, lon = raceStatusCache.lon;
-  var sog = raceStatusCache ? (raceStatusCache.sog || 0) : 0;
+  var lat = Number(raceStatusCache.lat), lon = Number(raceStatusCache.lon);
+  if (!raceStatusCache.fix || !isFinite(lat) || !isFinite(lon)) {
+    resetMarkClosingSpeed();
+    setText('raceMarkDist', '-- nm');
+    setText('raceMarkBrg', '--\u00b0');
+    setText('raceMarkCmg', '--\u00b0');
+    setText('raceMarkVmg', '-- kt');
+    setText('raceMarkSmg', '-- kt');
+    setText('raceMarkTTM', '--:--');
+    return;
+  }
+
+  var sog = Number(raceStatusCache.sog) || 0;
   var dist = haversineNm(lat, lon, mark.lat, mark.lon);
   var brg  = bearingDeg(lat, lon, mark.lat, mark.lon);
-  document.getElementById('raceMarkDist').textContent = dist.toFixed(2) + ' nm';
-  document.getElementById('raceMarkBrg').textContent  = Math.round(brg) + '° T';
-  if (sog >= 0.1) {
-    document.getElementById('raceMarkETA').textContent = fmtHMS(Math.round((dist / sog) * 3600));
-  } else {
-    document.getElementById('raceMarkETA').textContent = '--:--';
+  var cmg = raceStatusCache.cogValid ? Number(raceStatusCache.cog) : null;
+  var vmg = null;
+  if (cmg != null && isFinite(cmg)) {
+    var courseError = ((cmg - brg + 540) % 360) - 180;
+    vmg = sog * Math.cos(courseError * Math.PI / 180);
   }
+
+  var markKey = String(mark.lat) + ',' + String(mark.lon);
+  var smg = measuredSmg(markKey, dist);
+  document.getElementById('raceMarkDist').textContent = dist.toFixed(2) + ' nm';
+  document.getElementById('raceMarkBrg').textContent  = Math.round(brg) + '\u00b0 T';
+  document.getElementById('raceMarkCmg').textContent =
+    cmg != null && isFinite(cmg) ? Math.round(cmg) + '\u00b0 T' : '--\u00b0';
+  document.getElementById('raceMarkVmg').textContent =
+    vmg != null ? vmg.toFixed(1) + ' kt' : '-- kt';
+  document.getElementById('raceMarkSmg').textContent =
+    smg != null ? smg.toFixed(1) + ' kt' : '-- kt';
+
+  var smgEl = document.getElementById('raceMarkSmg');
+  smgEl.style.color = smg == null ? '#e0e8f0' : (smg > 0.1 ? '#4fd39a' : '#ffbb45');
+  var vmgEl = document.getElementById('raceMarkVmg');
+  vmgEl.style.color = vmg == null ? '#e0e8f0' : (vmg > 0.1 ? '#4fd39a' : '#ffbb45');
+
+  document.getElementById('raceMarkTTM').textContent =
+    smg != null && smg > 0.1 ? fmtHMS(Math.round((dist / smg) * 3600)) : '--:--';
 }
 
 function haversineNm(lat1, lon1, lat2, lon2) {
@@ -2228,6 +2378,8 @@ function addMark() {
       document.getElementById('mkLat').value  = '';
       document.getElementById('mkLon').value  = '';
       loadMarks();
+      loadCourses();
+      loadRaceMarksAndCourses();
     } else { toast('Save failed', false); }
   }).catch(function() { toast('Request failed', false); });
 }
@@ -2237,10 +2389,14 @@ function deleteMark(id) {
   fetch('/marks/delete', { method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({id:id})
-  }).then(r => r.json()).then(function(res) {
-    if (res.ok) { toast('Mark deleted'); loadMarks(); }
-    else toast('Delete failed', false);
-  }).catch(function() { toast('Request failed', false); });
+  }).then(parseJsonResponse).then(function() {
+    toast('Mark deleted');
+    loadMarks();
+    loadCourses();
+    loadRaceMarksAndCourses();
+  }).catch(function(err) {
+    toast(err.message || 'Could not delete mark', false);
+  });
 }
 
 function useGpsForMark() {
@@ -2252,33 +2408,203 @@ function useGpsForMark() {
   }).catch(function() { toast('Failed to get GPS', false); });
 }
 
+var coursePageCache = [];
+var courseEditorMarkCache = [];
+var courseEditorId = '';
+var courseEditorRefs = [];
+
 function loadCourses() {
-  fetch('/courses').then(r => r.json()).then(function(courses) {
-    var el = document.getElementById('courseList');
-    if (!courses.length) {
-      el.innerHTML = '<p style="color:#5a7a9a;font-size:0.85rem">No courses saved. Import a GPX file to add courses.</p>';
-      return;
-    }
-    // Also fetch marks so we can show names instead of IDs
-    fetch('/marks').then(r => r.json()).then(function(marks) {
-      var markMap = {};
-      marks.forEach(function(m) { markMap[m.id] = m.name; });
-      var html = courses.map(function(c) {
-        var markNames = c.marks.map(function(ref) {
-          var n = markMap[ref.mark_id] || ref.mark_id;
-          var rnd = ref.port ? '<span style="font-size:0.68rem;color:#4caf82">P</span>' : '<span style="font-size:0.68rem;color:#e8a830">S</span>';
-          return '<span style="display:inline-block;background:#0d2244;border:1px solid #1e4080;border-radius:4px;padding:1px 6px;margin:2px;font-size:0.78rem">' + escHtml(n) + ' ' + rnd + '</span>';
-        }).join('<span style="color:#5a7a9a;margin:0 2px">&#8594;</span>');
-        return '<div style="border-bottom:1px solid #1e4080;padding:10px 0">' +
-          '<div style="font-weight:bold;color:#e0e8f0;margin-bottom:6px">' + escHtml(c.name) +
-          ' <span style="font-size:0.72rem;color:#5a7a9a">(' + c.marks.length + ' marks)</span></div>' +
-          '<div style="line-height:2">' + (markNames || '<em style="color:#5a7a9a">No marks</em>') + '</div>' +
-          '</div>';
-      }).join('');
-      el.innerHTML = html;
-    });
+  Promise.all([
+    fetch('/courses').then(function(r) { return r.json(); }),
+    fetch('/marks').then(function(r) { return r.json(); })
+  ]).then(function(res) {
+    coursePageCache = res[0];
+    courseEditorMarkCache = res[1];
+    renderCourseList();
+    if (document.getElementById('courseEditor').style.display !== 'none')
+      renderCourseEditorMarks();
   }).catch(function() {
-    document.getElementById('courseList').innerHTML = '<p style="color:#e85a5a;font-size:0.85rem">Failed to load courses.</p>';
+    document.getElementById('courseList').innerHTML =
+      '<p style="color:#e85a5a;font-size:0.85rem">Failed to load courses.</p>';
+  });
+}
+
+function renderCourseList() {
+  var el = document.getElementById('courseList');
+  if (!coursePageCache.length) {
+    el.innerHTML = '<p style="color:#5a7a9a;font-size:0.85rem">No courses saved. Create one from the mark library or import a GPX route.</p>';
+    return;
+  }
+
+  var markMap = {};
+  courseEditorMarkCache.forEach(function(m) { markMap[m.id] = m.name; });
+  el.innerHTML = coursePageCache.map(function(c) {
+    var markNames = c.marks.map(function(ref) {
+      var n = markMap[ref.mark_id] || ref.mark_id;
+      var rnd = ref.port ?
+        '<span style="font-size:0.68rem;color:#4caf82">P</span>' :
+        '<span style="font-size:0.68rem;color:#e8a830">S</span>';
+      return '<span style="display:inline-block;background:#0d2244;border:1px solid #1e4080;border-radius:4px;padding:2px 7px;margin:2px;font-size:0.8rem">' +
+        escHtml(n) + ' ' + rnd + '</span>';
+    }).join('<span style="color:#5a7a9a;margin:0 2px">&#8594;</span>');
+
+    return '<div class="course-list-item">' +
+      '<div style="font-weight:bold;color:#edf5fc;font-size:1rem;margin-bottom:6px">' + escHtml(c.name) +
+      ' <span style="font-size:0.72rem;color:#7895af">(' + c.marks.length + ' marks)</span></div>' +
+      '<div style="line-height:2">' + (markNames || '<em style="color:#5a7a9a">No marks</em>') + '</div>' +
+      '<div class="course-list-actions">' +
+        '<button type="button" class="btn" onclick="editCourse(\'' + escHtml(c.id) + '\')">Edit</button>' +
+        '<button type="button" class="btn btn-danger" onclick="deleteCourse(\'' + escHtml(c.id) + '\')">Delete</button>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+}
+
+function newCourse() {
+  if (!courseEditorMarkCache.length) {
+    toast('Add at least one mark before creating a course', false);
+    return;
+  }
+  courseEditorId = '';
+  courseEditorRefs = [{mark_id:courseEditorMarkCache[0].id, port:true}];
+  document.getElementById('courseEditName').value = '';
+  document.getElementById('courseEditorTitle').textContent = 'New Course';
+  document.getElementById('courseEditor').style.display = '';
+  renderCourseEditorMarks();
+  document.getElementById('courseEditName').focus();
+}
+
+function editCourse(id) {
+  var course = coursePageCache.filter(function(c) { return c.id === id; })[0];
+  if (!course) { toast('Course not found', false); return; }
+  courseEditorId = course.id;
+  courseEditorRefs = course.marks.map(function(ref) {
+    return {mark_id:ref.mark_id, port:ref.port !== false};
+  });
+  document.getElementById('courseEditName').value = course.name || '';
+  document.getElementById('courseEditorTitle').textContent = 'Edit Course';
+  document.getElementById('courseEditor').style.display = '';
+  renderCourseEditorMarks();
+  document.getElementById('courseEditor').scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+function cancelCourseEdit() {
+  courseEditorId = '';
+  courseEditorRefs = [];
+  document.getElementById('courseEditor').style.display = 'none';
+}
+
+function addCourseMark() {
+  if (courseEditorRefs.length >= 12) {
+    toast('A course can contain at most 12 marks', false);
+    return;
+  }
+  if (!courseEditorMarkCache.length) {
+    toast('No marks available', false);
+    return;
+  }
+  courseEditorRefs.push({mark_id:courseEditorMarkCache[0].id, port:true});
+  renderCourseEditorMarks();
+}
+
+function setCourseMark(index, markId) {
+  if (courseEditorRefs[index]) courseEditorRefs[index].mark_id = markId;
+}
+
+function toggleCourseRounding(index) {
+  if (!courseEditorRefs[index]) return;
+  courseEditorRefs[index].port = !courseEditorRefs[index].port;
+  renderCourseEditorMarks();
+}
+
+function moveCourseMark(index, delta) {
+  var target = index + delta;
+  if (target < 0 || target >= courseEditorRefs.length) return;
+  var ref = courseEditorRefs[index];
+  courseEditorRefs[index] = courseEditorRefs[target];
+  courseEditorRefs[target] = ref;
+  renderCourseEditorMarks();
+}
+
+function removeCourseMark(index) {
+  courseEditorRefs.splice(index, 1);
+  renderCourseEditorMarks();
+}
+
+function renderCourseEditorMarks() {
+  var el = document.getElementById('courseEditorMarks');
+  if (!courseEditorRefs.length) {
+    el.innerHTML = '<p style="color:#ffbb45;font-size:0.82rem;padding:8px 0">Add at least one mark.</p>';
+    return;
+  }
+
+  el.innerHTML = courseEditorRefs.map(function(ref, index) {
+    var options = courseEditorMarkCache.map(function(mark) {
+      return '<option value="' + escHtml(mark.id) + '"' +
+        (mark.id === ref.mark_id ? ' selected' : '') + '>' + escHtml(mark.name) + '</option>';
+    }).join('');
+    var roundColor = ref.port ? '#4fd39a' : '#ffbb45';
+    var roundText = ref.port ? 'PORT' : 'STBD';
+    return '<div class="course-mark-edit">' +
+      '<div class="course-mark-line">' +
+        '<select aria-label="Course mark ' + (index + 1) + '" onchange="setCourseMark(' + index + ',this.value)">' +
+          options +
+        '</select>' +
+        '<span style="color:#7895af;font-weight:800">#' + (index + 1) + '</span>' +
+      '</div>' +
+      '<div class="course-mark-controls">' +
+        '<button type="button" class="btn course-rounding" style="color:' + roundColor + '" onclick="toggleCourseRounding(' + index + ')">' + roundText + '</button>' +
+        '<button type="button" class="btn" aria-label="Move mark up" onclick="moveCourseMark(' + index + ',-1)"' + (index === 0 ? ' disabled' : '') + '>&uarr;</button>' +
+        '<button type="button" class="btn" aria-label="Move mark down" onclick="moveCourseMark(' + index + ',1)"' + (index === courseEditorRefs.length - 1 ? ' disabled' : '') + '>&darr;</button>' +
+        '<button type="button" class="btn btn-danger" style="margin-left:auto" aria-label="Remove mark" onclick="removeCourseMark(' + index + ')">Remove</button>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+}
+
+function parseJsonResponse(r) {
+  return r.text().then(function(text) {
+    var data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch(e) {}
+    if (!r.ok || data.ok === false)
+      throw new Error(data.error || text || ('Request failed (' + r.status + ')'));
+    return data;
+  });
+}
+
+function saveCourse() {
+  var name = document.getElementById('courseEditName').value.trim();
+  if (!name) { toast('Enter a course name', false); return; }
+  if (!courseEditorRefs.length) { toast('Add at least one mark', false); return; }
+
+  fetch('/courses', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:courseEditorId, name:name, marks:courseEditorRefs})
+  }).then(parseJsonResponse).then(function(res) {
+    toast(courseEditorId ? 'Course updated' : 'Course created');
+    cancelCourseEdit();
+    loadCourses();
+    loadRaceMarksAndCourses();
+  }).catch(function(err) {
+    toast(err.message || 'Could not save course', false);
+  });
+}
+
+function deleteCourse(id) {
+  var course = coursePageCache.filter(function(c) { return c.id === id; })[0];
+  if (!confirm('Delete course "' + (course ? course.name : id) + '"?')) return;
+  fetch('/courses/delete', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:id})
+  }).then(parseJsonResponse).then(function() {
+    if (courseEditorId === id) cancelCourseEdit();
+    toast('Course deleted');
+    loadCourses();
+    loadRaceMarksAndCourses();
+  }).catch(function(err) {
+    toast(err.message || 'Could not delete course', false);
   });
 }
 

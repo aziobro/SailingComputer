@@ -1767,10 +1767,42 @@ static esp_err_t handleDeleteMark(httpd_req_t *req) {
     const char *id = nullptr;
     cJSON *v;
     if (obj && (v = cJSON_GetObjectItem(obj, "id")) && cJSON_IsString(v)) id = v->valuestring;
-    bool ok = id && storageMgr.deleteMark(id);
+    char markId[16] = "";
+    if (id) strlcpy(markId, id, sizeof(markId));
     cJSON_Delete(obj);
+
+    if (!markId[0]) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Mark ID is required\"}");
+        return ESP_OK;
+    }
+
+    Course *courses = (Course *)malloc(MAX_COURSES * sizeof(Course));
+    if (!courses) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_OK;
+    }
+    int courseCount = storageMgr.loadCourses(courses, MAX_COURSES);
+    for (int i = 0; i < courseCount; i++) {
+        for (int j = 0; j < courses[i].mark_count; j++) {
+            if (strcmp(courses[i].marks[j].mark_id, markId) == 0) {
+                free(courses);
+                httpd_resp_set_status(req, "409 Conflict");
+                httpd_resp_set_type(req, "application/json");
+                httpd_resp_sendstr(req,
+                    "{\"ok\":false,\"error\":\"Mark is used by a course; edit the course first\"}");
+                return ESP_OK;
+            }
+        }
+    }
+    free(courses);
+
+    bool ok = storageMgr.deleteMark(markId);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, ok ? "{\"ok\":true}" : "{\"ok\":false}", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send(req,
+        ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"Mark not found\"}",
+        HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -1783,6 +1815,166 @@ static esp_err_t handleGetCourses(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json ? json : "[]", HTTPD_RESP_USE_STRLEN);
     if (json) free(json);
+    return ESP_OK;
+}
+
+static esp_err_t sendCourseError(httpd_req_t *req, const char *status,
+                                 const char *message) {
+    cJSON *obj = cJSON_CreateObject();
+    char *json = NULL;
+    if (obj) {
+        cJSON_AddBoolToObject(obj, "ok", false);
+        cJSON_AddStringToObject(obj, "error", message);
+        json = cJSON_PrintUnformatted(obj);
+        cJSON_Delete(obj);
+    }
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json ? json : "{\"ok\":false}", HTTPD_RESP_USE_STRLEN);
+    if (json) free(json);
+    return ESP_OK;
+}
+
+static esp_err_t handleSaveCourse(httpd_req_t *req) {
+    if (!checkAuth(req)) return ESP_OK;
+
+    char body[3072];
+    int bodyLen = readBody(req, body, sizeof(body));
+    if (bodyLen == -2)
+        return sendCourseError(req, "413 Payload Too Large", "Course data is too large");
+    if (bodyLen < 0)
+        return sendCourseError(req, "400 Bad Request", "Could not read course data");
+
+    cJSON *obj = cJSON_Parse(body);
+    if (!obj)
+        return sendCourseError(req, "400 Bad Request", "Invalid course JSON");
+
+    cJSON *idObj = cJSON_GetObjectItem(obj, "id");
+    cJSON *nameObj = cJSON_GetObjectItem(obj, "name");
+    cJSON *marksObj = cJSON_GetObjectItem(obj, "marks");
+    if (!cJSON_IsString(nameObj) || nameObj->valuestring[0] == '\0' ||
+        !cJSON_IsArray(marksObj)) {
+        cJSON_Delete(obj);
+        return sendCourseError(req, "400 Bad Request",
+                               "Course name and mark sequence are required");
+    }
+
+    int requestedMarks = cJSON_GetArraySize(marksObj);
+    if (requestedMarks < 1 || requestedMarks > MAX_COURSE_MARKS) {
+        cJSON_Delete(obj);
+        return sendCourseError(req, "400 Bad Request",
+                               "A course must contain 1 to 12 marks");
+    }
+
+    Course course = {};
+    bool editing = cJSON_IsString(idObj) && idObj->valuestring[0] != '\0';
+    if (editing) {
+        Course *courses = (Course *)malloc(MAX_COURSES * sizeof(Course));
+        if (!courses) {
+            cJSON_Delete(obj);
+            return sendCourseError(req, "500 Internal Server Error", "Out of memory");
+        }
+        int courseCount = storageMgr.loadCourses(courses, MAX_COURSES);
+        bool found = false;
+        for (int i = 0; i < courseCount; i++) {
+            if (strcmp(courses[i].id, idObj->valuestring) == 0) {
+                course = courses[i];  // preserve start/finish metadata from imported courses
+                found = true;
+                break;
+            }
+        }
+        free(courses);
+        if (!found) {
+            cJSON_Delete(obj);
+            return sendCourseError(req, "404 Not Found", "Course not found");
+        }
+        if (raceData.state != RACE_IDLE &&
+            strcmp(raceData.courseId, course.id) == 0) {
+            cJSON_Delete(obj);
+            return sendCourseError(req, "409 Conflict",
+                                   "The active course cannot be edited during a race");
+        }
+    } else {
+        storageMgr.generateCourseId(course.id, sizeof(course.id));
+    }
+
+    Mark marks[MAX_MARKS];
+    int markCount = storageMgr.loadMarks(marks, MAX_MARKS);
+    course.mark_count = 0;
+    strlcpy(course.name, nameObj->valuestring, sizeof(course.name));
+
+    cJSON *markObj;
+    cJSON_ArrayForEach(markObj, marksObj) {
+        cJSON *markIdObj = cJSON_GetObjectItem(markObj, "mark_id");
+        if (!cJSON_IsString(markIdObj) || markIdObj->valuestring[0] == '\0') {
+            cJSON_Delete(obj);
+            return sendCourseError(req, "400 Bad Request",
+                                   "Every course position must reference a mark");
+        }
+
+        bool found = false;
+        for (int i = 0; i < markCount; i++) {
+            if (strcmp(marks[i].id, markIdObj->valuestring) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            cJSON_Delete(obj);
+            return sendCourseError(req, "400 Bad Request",
+                                   "Course contains a mark that no longer exists");
+        }
+
+        CourseMarkRef &ref = course.marks[course.mark_count++];
+        strlcpy(ref.mark_id, markIdObj->valuestring, sizeof(ref.mark_id));
+        cJSON *portObj = cJSON_GetObjectItem(markObj, "port");
+        ref.port_rounding = !cJSON_IsBool(portObj) || cJSON_IsTrue(portObj);
+    }
+    cJSON_Delete(obj);
+
+    if (!storageMgr.saveCourse(course))
+        return sendCourseError(req, "500 Internal Server Error", "Could not save course");
+
+    char response[80];
+    snprintf(response, sizeof(response), "{\"ok\":true,\"id\":\"%s\"}", course.id);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleDeleteCourse(httpd_req_t *req) {
+    if (!checkAuth(req)) return ESP_OK;
+
+    char body[128];
+    if (readBody(req, body, sizeof(body)) < 0)
+        return sendCourseError(req, "400 Bad Request", "Could not read course data");
+
+    cJSON *obj = cJSON_Parse(body);
+    cJSON *idObj = obj ? cJSON_GetObjectItem(obj, "id") : NULL;
+    if (!cJSON_IsString(idObj) || idObj->valuestring[0] == '\0') {
+        cJSON_Delete(obj);
+        return sendCourseError(req, "400 Bad Request", "Course ID is required");
+    }
+
+    char id[16];
+    strlcpy(id, idObj->valuestring, sizeof(id));
+    cJSON_Delete(obj);
+
+    if (raceData.state != RACE_IDLE && strcmp(raceData.courseId, id) == 0)
+        return sendCourseError(req, "409 Conflict",
+                               "The active course cannot be deleted during a race");
+
+    if (!storageMgr.deleteCourse(id))
+        return sendCourseError(req, "404 Not Found", "Course not found");
+
+    if (strcmp(raceData.courseId, id) == 0) {
+        raceData.courseId[0] = '\0';
+        raceData.legIdx = 0;
+        raceData.laps = 1;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
 }
 
@@ -2646,6 +2838,8 @@ static void startWebServer() {
     reg(webServer, "/marks",           HTTP_POST, handlePostMark);    // auth — add mark
     reg(webServer, "/marks/delete",    HTTP_POST, handleDeleteMark);  // auth — delete mark
     reg(webServer, "/courses",         HTTP_GET,  handleGetCourses);  // public — course list
+    reg(webServer, "/courses",         HTTP_POST, handleSaveCourse);  // auth — add/edit course
+    reg(webServer, "/courses/delete",  HTTP_POST, handleDeleteCourse);// auth — delete course
     reg(webServer, "/storage/info",    HTTP_GET,  handleStorageInfo); // public — partition stats
     reg(webServer, "/gpx/import",      HTTP_POST, handleGpxImport);   // auth — GPX file import
     reg(webServer, "/files/list",      HTTP_GET,  handleFilesList);    // public — directory listing
