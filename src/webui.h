@@ -239,7 +239,7 @@ inline const char* getWebUI() {
   .firmware-version { font-size: 1.05rem; overflow-wrap: anywhere; }
   .progress-track { height: 10px; overflow: hidden; border-radius: 999px; background: #07182f; }
   .progress-fill { height: 100%; width: 0; border-radius: inherit; background: var(--blue); transition: width 0.25s; }
-  .race-line-card h2, #tracks .card h2[onclick] { min-height: 44px; padding: 12px 0; }
+  .race-line-card h2, .race-course-card h2, #tracks .card h2[onclick] { min-height: 44px; padding: 12px 0; }
   #raceCourseSelect, #lineMarkSel0, #lineMarkSel1, #gpxFile { margin-bottom: 0; }
   .mark-row {
     display: grid;
@@ -885,31 +885,36 @@ inline const char* getWebUI() {
 
   <!-- Course -->
   <div class="card race-course-card">
-    <h2>Course</h2>
-    <div style="display:flex;gap:8px;align-items:center;margin-bottom:0.5rem">
-      <select id="raceCourseSelect"
-        style="flex:1;background:#091a36;border:1px solid #1e4080;color:#e0e8f0;padding:8px;border-radius:5px;font-size:0.85rem">
-        <option value="">&#8212; no course &#8212;</option>
-      </select>
-      <button class="btn btn-primary" onclick="setRaceCourse()">Use</button>
-    </div>
-    <!-- Selected course detail (expanded with laps) -->
-    <div id="raceCourseDetail" style="display:none;margin:0.75rem 0 0.25rem">
-      <div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.5px;color:#7a9ab8;margin-bottom:6px">Course Sequence</div>
-      <div id="raceCourseMarks" style="line-height:2.1"></div>
-    </div>
-    <!-- Lap selector -->
-    <div id="raceLapSelector" style="display:none;margin-top:0.9rem">
-      <div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.5px;color:#7a9ab8;margin-bottom:6px">Laps</div>
-      <div style="display:flex;gap:6px">
-        <button class="btn" id="lapBtn1" onclick="setLaps(1)">1</button>
-        <button class="btn" id="lapBtn2" onclick="setLaps(2)">2</button>
-        <button class="btn" id="lapBtn3" onclick="setLaps(3)">3</button>
-        <button class="btn" id="lapBtn4" onclick="setLaps(4)">4</button>
-        <button class="btn" id="lapBtn5" onclick="setLaps(5)">5</button>
+    <h2 onclick="toggleRaceCourse()" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;margin:0">
+      Course
+      <span id="raceCourseChevron" style="font-size:0.9rem;color:#5a7a9a;transition:transform 0.2s">&#9660;</span>
+    </h2>
+    <div id="raceCourseBody" style="margin-top:1rem">
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:0.5rem">
+        <select id="raceCourseSelect"
+          style="flex:1;background:#091a36;border:1px solid #1e4080;color:#e0e8f0;padding:8px;border-radius:5px;font-size:0.85rem">
+          <option value="">&#8212; no course &#8212;</option>
+        </select>
+        <button class="btn btn-primary" onclick="setRaceCourse()">Use</button>
       </div>
+      <!-- Selected course detail (expanded with laps) -->
+      <div id="raceCourseDetail" style="display:none;margin:0.75rem 0 0.25rem">
+        <div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.5px;color:#7a9ab8;margin-bottom:6px">Course Sequence</div>
+        <div id="raceCourseMarks" style="line-height:2.1"></div>
+      </div>
+      <!-- Lap selector -->
+      <div id="raceLapSelector" style="display:none;margin-top:0.9rem">
+        <div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.5px;color:#7a9ab8;margin-bottom:6px">Laps</div>
+        <div style="display:flex;gap:6px">
+          <button class="btn" id="lapBtn1" onclick="setLaps(1)">1</button>
+          <button class="btn" id="lapBtn2" onclick="setLaps(2)">2</button>
+          <button class="btn" id="lapBtn3" onclick="setLaps(3)">3</button>
+          <button class="btn" id="lapBtn4" onclick="setLaps(4)">4</button>
+          <button class="btn" id="lapBtn5" onclick="setLaps(5)">5</button>
+        </div>
+      </div>
+      <div id="raceCourseStatus" style="font-size:0.8rem;color:#5a7a9a;margin-top:8px"></div>
     </div>
-    <div id="raceCourseStatus" style="font-size:0.8rem;color:#5a7a9a;margin-top:8px"></div>
   </div>
 
 </div>
@@ -2392,6 +2397,15 @@ function toggleStartLine() {
   if (!body) return;
   var collapsed = body.style.display === 'none';
   body.style.display    = collapsed ? '' : 'none';
+  chevron.style.transform = collapsed ? '' : 'rotate(-90deg)';
+}
+
+function toggleRaceCourse() {
+  var body = document.getElementById('raceCourseBody');
+  var chevron = document.getElementById('raceCourseChevron');
+  if (!body) return;
+  var collapsed = body.style.display === 'none';
+  body.style.display = collapsed ? '' : 'none';
   chevron.style.transform = collapsed ? '' : 'rotate(-90deg)';
 }
 

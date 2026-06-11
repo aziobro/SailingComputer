@@ -23,7 +23,7 @@ An ESP32-P4-based sailing computer using the **Unicore UM982** dual-antenna GNSS
 - **SD card storage** — marks, courses, and GPX files stored on SD card with SPIFFS fallback
 - **Mark & course manager** — save GPS positions, create or edit ordered courses with port/starboard roundings, and import from GPX
 - **Race start sequence** — countdown clock (5 / 10 / 15 min, adjustable ±1 min), tap-to-sync with committee boat, time-to-start-line
-- **Live start and course editing** — shoot either line end, select saved start marks, or change the active course while the timer is running
+- **Live start and course editing** — collapsible Start Line and Course cards remain available while the timer is running
 - **Race navigation** — bearing, distance, closing-speed time-to-mark, VMG, SMG, boat heading, and CMG; previous/next mark controls
 - **Multi-lap courses** — select 1–5 laps and automatically repeat the course's interior marks before finishing
 - **Race stats** — elapsed time, leg splits, and marks-rounded summary on race completion
