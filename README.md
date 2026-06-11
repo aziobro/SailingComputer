@@ -13,16 +13,19 @@ An ESP32-P4-based sailing computer using the **Unicore UM982** dual-antenna GNSS
 - **BLE NMEA** — broadcasts NMEA over Bluetooth LE (NUS + HM-10 services) for SW Maps, iNavX, and other iOS/Android navigation apps
 - **NTRIP client with failover** — up to 3 correction sources (e.g. rtk2go, onocoy, rtkdata) with automatic failover after 3 consecutive failures
 - **HTTPS web dashboard** — live status (public), configuration and system management (password protected) at `https://sailingcomputer.local`
+- **Phone-first racing interface** — large controls, safe-area support, and a four-button bottom navigation designed for iPhone portrait use underway
 - **WiFi AP + STA modes** — creates its own hotspot or joins an existing network
 - **OTA firmware updates** — flash new firmware over WiFi from the System tab (no USB required after initial flash)
+- **ESP32-C6 coprocessor updates** — reflash the onboard WiFi/Bluetooth processor from a tested image bundled into the P4 firmware
 - **NVS-backed configuration** — all settings persist across reboots
 - **SD card storage** — marks, courses, and GPX files stored on SD card with SPIFFS fallback
 - **Mark & course manager** — save GPS positions as named marks, build courses from mark sequences, import from GPX
 - **Race start sequence** — countdown clock (5 / 10 / 15 min, adjustable ±1 min), tap-to-sync with committee boat, time-to-start-line
 - **Race navigation** — bearing, distance, and ETA to next mark; previous/next mark controls
+- **Multi-lap courses** — select 1–5 laps and automatically repeat the course's interior marks before finishing
 - **Race stats** — elapsed time, leg splits, and marks-rounded summary on race completion
 - **SD card file manager** — browse, rename, copy, delete files and directories; format SD card
-- **Track recording** — continuous loop buffer on SD card, GPX 1.1 export with heading/heel/SOG/COG extensions, configurable recording interval (1–60 s) and loop duration (1–24 h)
+- **Track recording** — auto-starting continuous loop buffer on SD card, time-range GPX export with heading/heel/SOG/COG extensions, configurable recording interval (1–60 s) and loop duration (1–24 h)
 
 ---
 
@@ -82,6 +85,10 @@ pio device monitor
 
 The upload port is set in `platformio.ini`. Adjust if your port differs.
 
+The current 32 MB partition table provides two 8 MB application slots. A full
+USB flash is required when first installing this layout; application-only OTA
+updates do not rewrite the partition table.
+
 ### OTA Updates (after initial flash)
 
 Use the included `flash.sh` script, or update manually:
@@ -90,6 +97,29 @@ Use the included `flash.sh` script, or update manually:
 2. Open `https://sailingcomputer.local` → **System** tab (login with admin credentials)
 3. Click **Choose .bin file** → select `.pio/build/esp32p4/firmware.bin`
 4. Click **Upload & Flash** — progress bar shows upload status, device restarts automatically
+
+### ESP32-C6 Coprocessor Updates
+
+The **System** page shows the C6 firmware currently running and the version
+bundled into the ESP32-P4 application. Press **Update ESP32-C6** to stream the
+bundled image to the coprocessor over the existing `esp_hosted` SDIO link.
+Progress remains visible in the web interface. When activation completes, the
+C6 and P4 restart so the WiFi transport can reconnect cleanly.
+
+The running value is the C6's `esp_hosted` protocol version. The bundled value
+and build date come from the embedded image metadata, so a custom image that
+keeps the same protocol version can still report a different bundled version.
+
+The bundled image is `src/c6_slave_fw.bin`. To replace it with another
+compatible `network_adapter` build:
+
+```bash
+cp path/to/network_adapter.bin src/c6_slave_fw.bin
+pio run -e esp32p4
+```
+
+The image must target the same ESP32-C6 hardware and SDIO wiring. Perform
+coprocessor updates ashore because WiFi disconnects at the end of the process.
 
 ---
 
@@ -110,9 +140,19 @@ Use the included `flash.sh` script, or update manually:
 
 ## Web Interface
 
-The single-page app has seven tabs in the navigation bar.
+The single-page app opens directly on **Race** and is designed for iPhone
+portrait use. The fixed bottom bar keeps the primary underway pages within
+thumb reach:
 
-### Status (public — no login required)
+- **Race** — start sequence, start line, course, and live race navigation
+- **Data** — GNSS, heading, motion, NTRIP, and connection status
+- **Marks** — mark library, courses, and GPX import
+- **More** — Track Recording, Files and Storage, Device Settings, System and Updates, and Log Out
+
+Controls use large touch targets, 16 px form text to avoid iOS zoom, and safe
+area padding for phones with a home indicator.
+
+### Data (public — no login required)
 
 Live display (500 ms refresh):
 
@@ -161,7 +201,10 @@ When both ends are set, **Time to Line** is shown during the countdown (distance
 
 #### Course
 
-Select an active course from saved courses. The selected course drives mark-by-mark navigation after the start.
+Select an active course from saved courses. The selected course drives
+mark-by-mark navigation after the start. For courses with distinct start and
+finish marks, choose **1–5 laps**; interior marks repeat for each lap while the
+start and finish remain single occurrences.
 
 #### Racing (post-start)
 
@@ -191,8 +234,8 @@ Displayed after **End Race** or automatic completion at the last mark:
 
 Loop-buffer track recording and GPX export.
 
-- **Loop recording** — Start/Stop toggle runs a circular buffer on SD card at `/sdcard/tracks/.loop.bin`; recording pauses automatically when GPS fix is lost
-- **Segment extraction** — tap **Select Start** to mark the beginning of a named segment; tap **Select Stop** to export the loop slice as a GPX file
+- **Loop recording** — the circular buffer auto-starts at boot on SD card at `/sdcard/tracks/.loop.bin`; it can be disabled manually and pauses automatically when GPS fix is lost
+- **Segment extraction** — choose start and end times with the range controls, then tap **Export GPX**
 - **File written indicator** — shows the filename of the last successfully exported GPX
 - **Recording Settings** — configure recording interval (1 / 5 / 10 / 30 / 60 s) and loop buffer duration (1 – 24 h); changing these settings recreates the loop file
 - Downloaded via the Files tab — no separate download UI
@@ -211,14 +254,15 @@ Browse the SD card (or SPIFFS) file system:
 - Device IP and NMEA TCP connection instructions
 - **Restart Device**
 - **UM982 Factory Reset** — sends `FRESET`, reconfigures signal groups and NMEA outputs (~15 s)
-- **Firmware Update (OTA)** — upload `.bin` file with live progress bar
+- **ESP32-C6 update** — compare running and bundled versions, then flash the onboard WiFi/Bluetooth coprocessor with live progress
+- **ESP32-P4 firmware update (OTA)** — upload `.bin` file with live progress bar
 - **BLE toggle** — enable/disable without a full config save/restart
 
 ### Authentication
 
 - Default credentials: **admin / admin**
 - Change the password in the Configuration tab → "Web Admin Password"
-- A **Log Out** button in the nav bar clears the browser's cached credentials
+- A **Log Out** action in the More menu clears the browser's cached credentials
 - Closing the browser tab also clears credentials (auto-logout via `beforeunload`)
 
 ---
@@ -278,13 +322,14 @@ Only run **UM982 Factory Reset** when:
 SailingComputer/
 ├── platformio.ini          # PlatformIO build config (ESP-IDF, board, port)
 ├── sdkconfig.defaults      # ESP-IDF build-time config (BLE, HTTPS, mbedTLS, OTA)
-├── partitions.csv          # Custom partition table (OTA + NVS)
+├── partitions.csv          # 32 MB table: dual 8 MB OTA slots + NVS + SPIFFS
 ├── flash.sh                # Build and OTA-upload helper script
 ├── certs/
 │   ├── cert.pem            # Self-signed TLS certificate (10-year validity)
 │   └── key.pem             # RSA-2048 private key
 └── src/
     ├── main.cpp            # WiFi, NMEA parsing, NTRIP, web server, OTA, race engine
+    ├── c6_slave_fw.bin     # Bundled ESP32-C6 esp_hosted network_adapter image
     ├── config.h            # Config struct + NVS load/save (ConfigManager)
     ├── storage.h           # StorageManager — SD card / SPIFFS, marks, courses JSON
     ├── gpx.h               # GPX file parser (waypoints → marks, routes → courses)
@@ -312,6 +357,7 @@ The race engine exposes a REST API consumed by the web UI. All endpoints are una
 | POST | `/race/duration` | `{"seconds":300}` — set sequence length (idle only) |
 | POST | `/race/startline` | `{"end":0,"lat":…,"lon":…}` or `{"end":0,"markId":"…"}` |
 | POST | `/race/course` | `{"courseId":"…","leg":0}` — set active course |
+| POST | `/race/laps` | `{"laps":2}` — select 1–5 laps (idle only) |
 | POST | `/race/nextleg` | Advance to next mark (auto-completes at last mark) |
 | POST | `/race/prevleg` | Step back to previous mark |
 
@@ -326,9 +372,18 @@ Race state machine: `idle` → `countdown` → `racing` → `complete`
 | GET | `/tracks/status` | Loop state JSON (running, count, timestamps, segment, last file) |
 | POST | `/tracks/loop/start` | Start loop recording |
 | POST | `/tracks/loop/stop` | Stop loop recording (also cancels open segment) |
-| POST | `/tracks/segment/start` | Mark current GPS time as segment start |
-| POST | `/tracks/segment/stop` | Mark end, export loop slice to GPX file |
+| POST | `/tracks/segment/export` | `{"t0":…,"t1":…}` — export a selected UTC time range |
 | POST | `/tracks/config` | `{"intervalSec":5,"loopHours":3}` — save settings + rebuild loop |
+
+## Firmware API
+
+Firmware-management endpoints require HTTP Basic Auth.
+
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/update` | Upload and install a raw ESP32-P4 application binary |
+| GET | `/c6/status` | Running/bundled C6 versions, image metadata, and update progress |
+| POST | `/c6/update` | Stream the bundled image to the ESP32-C6 and restart both processors |
 
 ---
 

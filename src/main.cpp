@@ -16,6 +16,8 @@
 #include "esp_netif.h"
 #include "esp_system.h"
 #include "esp_ota_ops.h"
+#include "esp_app_desc.h"
+#include "esp_app_format.h"
 #include "esp_http_server.h"
 #include "esp_https_server.h"
 #include "nvs_flash.h"
@@ -106,6 +108,8 @@ struct StartLineEnd {
     bool   set;
 };
 
+#define MAX_RACE_LEGS 64   // max mark roundings trackable per race (supports multi-lap)
+
 struct RaceData {
     RaceState    state;
     int64_t      t0_ms;                         // millis since boot when T-0 fires
@@ -114,7 +118,8 @@ struct RaceData {
     StartLineEnd line[2];                       // [0]=port end, [1]=starboard end
     char         courseId[16];
     int          legIdx;
-    int64_t      legTimes[MAX_COURSE_MARKS];    // time each mark was rounded (ms since boot)
+    int          laps;                          // number of laps (default 1)
+    int64_t      legTimes[MAX_RACE_LEGS];       // time each mark was rounded (ms since boot)
     int          legTimesCount;                 // how many marks have been rounded
 };
 
@@ -144,6 +149,22 @@ static QueueHandle_t nmeaParseQueue = NULL;
 static QueueHandle_t nmeaOutputQueue = NULL;
 static SemaphoreHandle_t telemetryMtx = NULL;
 static SemaphoreHandle_t uartNmeaMtx = NULL;
+
+// ESP32-C6 coprocessor firmware embedded into the P4 application image.
+extern const uint8_t c6_slave_fw_bin_start[] asm("_binary_c6_slave_fw_bin_start");
+extern const uint8_t c6_slave_fw_bin_end[]   asm("_binary_c6_slave_fw_bin_end");
+
+struct C6OtaStatus {
+    bool running;
+    int progress;
+    char phase[32];
+    char error[96];
+};
+
+static portMUX_TYPE c6OtaMux = portMUX_INITIALIZER_UNLOCKED;
+static C6OtaStatus c6OtaStatus = {false, 0, "Ready", ""};
+static bool c6VersionKnown = false;
+static esp_hosted_coprocessor_fwver_t c6RunningVersion = {};
 
 // NTRIP
 static int      ntripSock        = -1;
@@ -1430,6 +1451,224 @@ static esp_err_t handleOTA(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// ── ESP32-C6 coprocessor firmware update ─────────────────────────────────────
+
+static size_t c6EmbeddedFirmwareSize() {
+    return (size_t)(c6_slave_fw_bin_end - c6_slave_fw_bin_start);
+}
+
+static const esp_app_desc_t *c6EmbeddedAppDesc() {
+    const size_t offset = sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t);
+    if (c6EmbeddedFirmwareSize() < offset + sizeof(esp_app_desc_t)) return NULL;
+
+    const esp_image_header_t *header =
+        reinterpret_cast<const esp_image_header_t *>(c6_slave_fw_bin_start);
+    if (header->magic != ESP_IMAGE_HEADER_MAGIC ||
+        header->chip_id != ESP_CHIP_ID_ESP32C6) return NULL;
+
+    const esp_app_desc_t *desc =
+        reinterpret_cast<const esp_app_desc_t *>(c6_slave_fw_bin_start + offset);
+    return desc->magic_word == ESP_APP_DESC_MAGIC_WORD ? desc : NULL;
+}
+
+static bool c6ActivateSupported(const esp_hosted_coprocessor_fwver_t &version) {
+    return version.major1 > 2 || (version.major1 == 2 && version.minor1 >= 6);
+}
+
+static void setC6OtaStatus(bool running, int progress,
+                           const char *phase, const char *error = "") {
+    portENTER_CRITICAL(&c6OtaMux);
+    c6OtaStatus.running = running;
+    c6OtaStatus.progress = progress;
+    strlcpy(c6OtaStatus.phase, phase ? phase : "", sizeof(c6OtaStatus.phase));
+    strlcpy(c6OtaStatus.error, error ? error : "", sizeof(c6OtaStatus.error));
+    portEXIT_CRITICAL(&c6OtaMux);
+}
+
+static void refreshC6RunningVersion() {
+    esp_hosted_coprocessor_fwver_t version = {};
+    esp_err_t err = esp_hosted_get_coprocessor_fwversion(&version);
+
+    portENTER_CRITICAL(&c6OtaMux);
+    c6VersionKnown = (err == ESP_OK);
+    if (c6VersionKnown) c6RunningVersion = version;
+    portEXIT_CRITICAL(&c6OtaMux);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "[C6] Running firmware %u.%u.%u",
+                 (unsigned)version.major1, (unsigned)version.minor1,
+                 (unsigned)version.patch1);
+    } else {
+        ESP_LOGW(TAG, "[C6] Unable to read running firmware version: %s",
+                 esp_err_to_name(err));
+    }
+}
+
+static void failC6Ota(const char *operation, esp_err_t err) {
+    char message[96];
+    snprintf(message, sizeof(message), "%s: %s", operation, esp_err_to_name(err));
+    ESP_LOGE(TAG, "[C6 OTA] %s", message);
+    setC6OtaStatus(false, 0, "Update failed", message);
+}
+
+static void c6OtaTask(void *) {
+    const size_t firmwareSize = c6EmbeddedFirmwareSize();
+    if (!c6EmbeddedAppDesc() || firmwareSize == 0) {
+        ESP_LOGE(TAG, "[C6 OTA] Embedded image is invalid");
+        setC6OtaStatus(false, 0, "Update failed", "Embedded C6 image is invalid");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    esp_hosted_coprocessor_fwver_t runningVersion = {};
+    bool runningVersionKnown = false;
+    portENTER_CRITICAL(&c6OtaMux);
+    runningVersionKnown = c6VersionKnown;
+    runningVersion = c6RunningVersion;
+    portEXIT_CRITICAL(&c6OtaMux);
+
+    ESP_LOGI(TAG, "[C6 OTA] Starting transfer of %u bytes", (unsigned)firmwareSize);
+    setC6OtaStatus(true, 0, "Preparing C6");
+    esp_err_t err = esp_hosted_slave_ota_begin();
+    if (err != ESP_OK) {
+        failC6Ota("OTA begin failed", err);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    constexpr size_t CHUNK_SIZE = 1500;
+    size_t offset = 0;
+    while (offset < firmwareSize) {
+        const size_t chunk = MIN(CHUNK_SIZE, firmwareSize - offset);
+        err = esp_hosted_slave_ota_write(
+            const_cast<uint8_t *>(c6_slave_fw_bin_start + offset),
+            (uint32_t)chunk);
+        if (err != ESP_OK) {
+            esp_hosted_slave_ota_end();
+            failC6Ota("OTA write failed", err);
+            vTaskDelete(NULL);
+            return;
+        }
+
+        offset += chunk;
+        setC6OtaStatus(true, (int)(offset * 100 / firmwareSize),
+                       "Transferring firmware");
+    }
+
+    setC6OtaStatus(true, 100, "Verifying firmware");
+    err = esp_hosted_slave_ota_end();
+    if (err != ESP_OK) {
+        failC6Ota("OTA verification failed", err);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if (runningVersionKnown && c6ActivateSupported(runningVersion)) {
+        setC6OtaStatus(true, 100, "Activating firmware");
+        err = esp_hosted_slave_ota_activate();
+        if (err != ESP_OK) {
+            failC6Ota("OTA activation failed", err);
+            vTaskDelete(NULL);
+            return;
+        }
+    } else {
+        ESP_LOGW(TAG, "[C6 OTA] Current firmware does not expose the activation API; "
+                      "using legacy activation on host restart");
+    }
+
+    setC6OtaStatus(true, 100, "Restarting device");
+    ESP_LOGI(TAG, "[C6 OTA] Complete; restarting P4 to resync with C6");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    esp_restart();
+}
+
+static esp_err_t handleC6Status(httpd_req_t *req) {
+    if (!checkAuth(req)) return ESP_OK;
+
+    C6OtaStatus status;
+    bool versionKnown;
+    esp_hosted_coprocessor_fwver_t runningVersion;
+    portENTER_CRITICAL(&c6OtaMux);
+    status = c6OtaStatus;
+    versionKnown = c6VersionKnown;
+    runningVersion = c6RunningVersion;
+    portEXIT_CRITICAL(&c6OtaMux);
+
+    const esp_app_desc_t *available = c6EmbeddedAppDesc();
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_FAIL;
+    }
+
+    char running[32] = "Unknown";
+    if (versionKnown) {
+        snprintf(running, sizeof(running), "%u.%u.%u",
+                 (unsigned)runningVersion.major1, (unsigned)runningVersion.minor1,
+                 (unsigned)runningVersion.patch1);
+    }
+
+    cJSON_AddStringToObject(obj, "runningVersion", running);
+    cJSON_AddBoolToObject(obj, "runningVersionKnown", versionKnown);
+    cJSON_AddStringToObject(obj, "availableVersion",
+                            available ? available->version : "Invalid image");
+    cJSON_AddStringToObject(obj, "availableDate", available ? available->date : "");
+    cJSON_AddNumberToObject(obj, "imageBytes", (double)c6EmbeddedFirmwareSize());
+    cJSON_AddBoolToObject(obj, "imageValid", available != NULL);
+    cJSON_AddBoolToObject(obj, "activateSupported",
+                          versionKnown && c6ActivateSupported(runningVersion));
+    cJSON_AddBoolToObject(obj, "updating", status.running);
+    cJSON_AddNumberToObject(obj, "progress", status.progress);
+    cJSON_AddStringToObject(obj, "phase", status.phase);
+    cJSON_AddStringToObject(obj, "error", status.error);
+
+    char *json = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, json ? json : "{}", HTTPD_RESP_USE_STRLEN);
+    if (json) free(json);
+    return ESP_OK;
+}
+
+static esp_err_t handleC6Update(httpd_req_t *req) {
+    if (!checkAuth(req)) return ESP_OK;
+    if (!c6EmbeddedAppDesc()) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "Embedded C6 image is invalid");
+        return ESP_FAIL;
+    }
+
+    bool alreadyRunning;
+    portENTER_CRITICAL(&c6OtaMux);
+    alreadyRunning = c6OtaStatus.running;
+    if (!alreadyRunning) {
+        c6OtaStatus.running = true;
+        c6OtaStatus.progress = 0;
+        strlcpy(c6OtaStatus.phase, "Starting update", sizeof(c6OtaStatus.phase));
+        c6OtaStatus.error[0] = '\0';
+    }
+    portEXIT_CRITICAL(&c6OtaMux);
+
+    if (alreadyRunning) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Update already running\"}");
+        return ESP_OK;
+    }
+
+    if (xTaskCreate(c6OtaTask, "c6_ota", 8192, NULL, 5, NULL) != pdPASS) {
+        setC6OtaStatus(false, 0, "Update failed", "Could not start update task");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "Could not start C6 update task");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
 // ── Basic Auth helper ─────────────────────────────────────────────────────────
 // Returns true if the request carries valid admin credentials.
 // Sends a 401 response and returns false otherwise.
@@ -1564,6 +1803,30 @@ static esp_err_t handleStorageInfo(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// ── Race lap helpers ──────────────────────────────────────────────────────────
+
+// Returns the total number of marks to round for N laps of course c.
+// Interior marks (exclusive of first/last) are repeated N times.
+// Example: CM-A-E-CM (mark_count=4) with 2 laps → CM-A-E-A-E-CM (6 marks)
+static int effectiveMarkCount(const Course *c, int laps) {
+    if (!c || c->mark_count < 2) return 0;
+    if (c->mark_count < 3 || laps <= 1) return c->mark_count;
+    int interior = c->mark_count - 2;
+    return interior * laps + 2;
+}
+
+// Maps a logical leg index (0 … effectiveMarkCount-1) to the underlying CourseMarkRef.
+static const CourseMarkRef *effectiveMark(const Course *c, int laps, int idx) {
+    if (!c || idx < 0) return nullptr;
+    int effective = effectiveMarkCount(c, laps);
+    if (idx >= effective) return nullptr;
+    if (c->mark_count < 3 || laps <= 1) return (idx < c->mark_count) ? &c->marks[idx] : nullptr;
+    if (idx == 0) return &c->marks[0];
+    if (idx == effective - 1) return &c->marks[c->mark_count - 1];
+    int interior = c->mark_count - 2;
+    return &c->marks[1 + (idx - 1) % interior];
+}
+
 // ── Race sequence HTTP handlers ───────────────────────────────────────────────
 
 static esp_err_t handleRaceState(httpd_req_t *req) {
@@ -1586,6 +1849,7 @@ static esp_err_t handleRaceState(httpd_req_t *req) {
     cJSON_AddNumberToObject(obj, "duration_s",    raceData.duration_s);
     cJSON_AddStringToObject(obj, "courseId",      raceData.courseId);
     cJSON_AddNumberToObject(obj, "legIdx",        raceData.legIdx);
+    cJSON_AddNumberToObject(obj, "laps",          raceData.laps > 0 ? raceData.laps : 1);
 
     cJSON *lineArr = cJSON_AddArrayToObject(obj, "line");
     for (int i = 0; i < 2; i++) {
@@ -1605,12 +1869,15 @@ static esp_err_t handleRaceState(httpd_req_t *req) {
             int nc = storageMgr.loadCourses(courses, MAX_COURSES);
             for (int i = 0; i < nc; i++) {
                 if (strcmp(courses[i].id, raceData.courseId) == 0) {
+                    int effLaps   = raceData.laps > 0 ? raceData.laps : 1;
+                    int effCount  = effectiveMarkCount(&courses[i], effLaps);
                     cJSON_AddStringToObject(obj, "courseName",      courses[i].name);
-                    cJSON_AddNumberToObject(obj, "courseTotalMarks", courses[i].mark_count);
+                    cJSON_AddNumberToObject(obj, "courseTotalMarks", effCount);
 
-                    if (raceData.state == RACE_RACING && raceData.legIdx < courses[i].mark_count) {
+                    if (raceData.state == RACE_RACING && raceData.legIdx < effCount) {
                         // Next mark for live navigation
-                        const char *markId = courses[i].marks[raceData.legIdx].mark_id;
+                        const CourseMarkRef *cmr = effectiveMark(&courses[i], effLaps, raceData.legIdx);
+                        const char *markId = cmr ? cmr->mark_id : "";
                         Mark marks[MAX_MARKS];
                         int nm = storageMgr.loadMarks(marks, MAX_MARKS);
                         for (int j = 0; j < nm; j++) {
@@ -1631,8 +1898,9 @@ static esp_err_t handleRaceState(httpd_req_t *req) {
                         int nm = storageMgr.loadMarks(marks, MAX_MARKS);
                         cJSON *legsArr = cJSON_AddArrayToObject(obj, "legs");
                         int64_t prev = raceData.t0_ms;
-                        for (int k = 0; k < raceData.legTimesCount && k < courses[i].mark_count; k++) {
-                            const char *mid = courses[i].marks[k].mark_id;
+                        for (int k = 0; k < raceData.legTimesCount && k < effCount; k++) {
+                            const CourseMarkRef *cmr = effectiveMark(&courses[i], effLaps, k);
+                            const char *mid = cmr ? cmr->mark_id : "";
                             const char *mname = mid;
                             for (int j = 0; j < nm; j++) {
                                 if (strcmp(marks[j].id, mid) == 0) { mname = marks[j].name; break; }
@@ -1679,6 +1947,7 @@ static esp_err_t handleRaceStart(httpd_req_t *req) {
 static esp_err_t handleRaceStop(httpd_req_t *req) {
     memset(&raceData, 0, sizeof(raceData));
     raceData.duration_s = 300;
+    raceData.laps = 1;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -1839,6 +2108,28 @@ static esp_err_t handleRaceCourse(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static esp_err_t handleRaceLaps(httpd_req_t *req) {
+    if (raceData.state != RACE_IDLE) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"err\":\"can only set laps when idle\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    char body[32];
+    readBody(req, body, sizeof(body));
+    cJSON *obj = cJSON_Parse(body);
+    if (obj) {
+        cJSON *v = cJSON_GetObjectItem(obj, "laps");
+        if (v && cJSON_IsNumber(v)) {
+            int n = (int)v->valuedouble;
+            if (n >= 1 && n <= 5) raceData.laps = n;
+        }
+        cJSON_Delete(obj);
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 static esp_err_t handleRaceNextLeg(httpd_req_t *req) {
     if (raceData.state != RACE_RACING) {
         httpd_resp_set_type(req, "application/json");
@@ -1847,10 +2138,11 @@ static esp_err_t handleRaceNextLeg(httpd_req_t *req) {
     }
     int64_t now = (int64_t)(esp_timer_get_time() / 1000LL);
     // Record the time this mark was rounded
-    if (raceData.legIdx < MAX_COURSE_MARKS)
+    if (raceData.legTimesCount < MAX_RACE_LEGS)
         raceData.legTimes[raceData.legTimesCount++] = now;
 
     bool complete = false;
+    int effLaps = raceData.laps > 0 ? raceData.laps : 1;
     if (raceData.courseId[0]) {
         Course *courses = (Course *)malloc(MAX_COURSES * sizeof(Course));
         if (courses) {
@@ -1858,7 +2150,7 @@ static esp_err_t handleRaceNextLeg(httpd_req_t *req) {
             for (int i = 0; i < nc; i++) {
                 if (strcmp(courses[i].id, raceData.courseId) == 0) {
                     raceData.legIdx++;
-                    if (raceData.legIdx >= courses[i].mark_count) {
+                    if (raceData.legIdx >= effectiveMarkCount(&courses[i], effLaps)) {
                         raceData.state  = RACE_COMPLETE;
                         raceData.end_ms = now;
                         complete = true;
@@ -2318,7 +2610,7 @@ static void startWebServer() {
     // ── HTTPS server on port 443 ─────────────────────────────────────────────
     httpd_ssl_config_t ssl_cfg         = HTTPD_SSL_CONFIG_DEFAULT();
     ssl_cfg.httpd.max_open_sockets     = 10; // status poll + race poll + concurrent button clicks
-    ssl_cfg.httpd.max_uri_handlers     = 40; // default is 8
+    ssl_cfg.httpd.max_uri_handlers     = 48; // default is 8
     ssl_cfg.httpd.stack_size           = 10240;
     ssl_cfg.httpd.lru_purge_enable     = true;
     ssl_cfg.servercert                 = (const uint8_t *)server_cert_pem;
@@ -2346,6 +2638,8 @@ static void startWebServer() {
     reg(webServer, "/restart",     HTTP_POST, handleRestart);     // auth
     reg(webServer, "/um982reset",  HTTP_POST, handleUM982Reset);  // auth
     reg(webServer, "/update",      HTTP_POST, handleOTA);         // auth — OTA firmware upload
+    reg(webServer, "/c6/status",   HTTP_GET,  handleC6Status);    // auth — coprocessor versions/progress
+    reg(webServer, "/c6/update",   HTTP_POST, handleC6Update);    // auth — flash embedded coprocessor image
     reg(webServer, "/ble/toggle",  HTTP_POST, handleBleToggle);   // auth
     reg(webServer, "/logout",      HTTP_GET,  handleLogout);      // public — always returns 401 to bust browser auth cache
     reg(webServer, "/marks",           HTTP_GET,  handleGetMarks);    // public — mark list
@@ -2367,6 +2661,7 @@ static void startWebServer() {
     reg(webServer, "/race/duration",  HTTP_POST, handleRaceDuration); // public — set sequence length
     reg(webServer, "/race/startline", HTTP_POST, handleRaceStartLine);// public — set start line end
     reg(webServer, "/race/course",    HTTP_POST, handleRaceCourse);   // public — set active course
+    reg(webServer, "/race/laps",      HTTP_POST, handleRaceLaps);     // public — set lap count (idle only)
     reg(webServer, "/race/nextleg",   HTTP_POST, handleRaceNextLeg);  // public — advance to next mark
     reg(webServer, "/race/prevleg",   HTTP_POST, handleRacePrevLeg);  // public — go back to previous mark
     reg(webServer, "/race/end",          HTTP_POST, handleRaceEnd);      // public — end race, go to stats
@@ -2516,6 +2811,7 @@ extern "C" void app_main(void) {
     }
 
     raceData.duration_s = 300;  // 5-minute sequence default
+    raceData.laps = 1;
 
     setenv("TZ", "UTC0", 1);  // mktime must treat broken-down time as UTC
     tzset();
@@ -2575,6 +2871,7 @@ extern "C" void app_main(void) {
                  esp_err_to_name(hosted_err));
         return;
     }
+    refreshC6RunningVersion();
 
     wifi_init_config_t wifi_init = WIFI_INIT_CONFIG_DEFAULT();
     esp_err_t wifi_err = esp_wifi_init(&wifi_init);

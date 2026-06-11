@@ -67,8 +67,10 @@ public:
         mkdir(dir, 0755);
         snprintf(loopPath_, sizeof(loopPath_), "%s/.loop.bin", dir);
         sdAvailable = openOrCreateLoop();
-        if (sdAvailable)
-            ESP_LOGI(TRACK_TAG, "begin ok  maxPts=%u interval=%us", maxPts_, intervalSec_);
+        if (sdAvailable) {
+            loopRunning = true;  // auto-start — loop buffer is circular, always safe to run
+            ESP_LOGI(TRACK_TAG, "begin ok  maxPts=%u interval=%us loopRunning=true", maxPts_, intervalSec_);
+        }
         return sdAvailable;
     }
 

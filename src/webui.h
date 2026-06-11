@@ -9,92 +9,319 @@ inline const char* getWebUI() {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sailing Computer</title>
 <style>
+  :root {
+    color-scheme: dark;
+    --bg: #071426;
+    --panel: #0d2244;
+    --panel-deep: #081a34;
+    --line: #24508d;
+    --muted: #8ca8c1;
+    --blue: #67c5ff;
+    --green: #4fd39a;
+    --amber: #ffbb45;
+    --red: #ff6b6b;
+    --nav-height: 68px;
+  }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: system-ui, sans-serif; background: #0a1628; color: #e0e8f0; min-height: 100vh; }
-  header { background: #0d2244; padding: 16px 24px; border-bottom: 2px solid #1e4080; }
-  header h1 { font-size: 1.4rem; color: #5ab4e8; letter-spacing: 1px; }
-  header span { font-size: 0.8rem; color: #7a9ab8; margin-left: 8px; }
-  nav { display: flex; background: #0d2244; border-bottom: 1px solid #1e4080; }
-  nav button { flex: 1; padding: 10px; background: none; border: none; color: #7a9ab8;
-               cursor: pointer; font-size: 0.9rem; transition: all 0.2s; }
-  nav button.active, nav button:hover { color: #5ab4e8; border-bottom: 2px solid #5ab4e8; }
-  nav button.logout { flex: 0; padding: 10px 14px; color: #c05050; font-size: 0.8rem; }
-  nav button.logout:hover { color: #e06060; border-bottom: 2px solid #e06060; }
-  .page { display: none; padding: 20px; max-width: 700px; margin: 0 auto; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: var(--bg);
+    color: #edf5fc;
+    min-height: 100vh;
+    padding-bottom: calc(var(--nav-height) + env(safe-area-inset-bottom));
+  }
+  button, input, select { font: inherit; touch-action: manipulation; }
+  button { -webkit-tap-highlight-color: transparent; }
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    min-height: 58px;
+    padding: calc(8px + env(safe-area-inset-top)) 14px 8px;
+    background: rgba(9, 28, 54, 0.97);
+    border-bottom: 1px solid var(--line);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+  }
+  .app-name { color: #7d9bb7; font-size: 0.68rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+  header h1 { color: #edf5fc; font-size: 1.25rem; line-height: 1.15; }
+  .header-status { display: flex; gap: 6px; align-items: center; }
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    min-height: 30px;
+    padding: 4px 8px;
+    border: 1px solid #254568;
+    border-radius: 999px;
+    background: #08182c;
+    color: #9bb3c9;
+    font-size: 0.7rem;
+    font-weight: 800;
+    white-space: nowrap;
+  }
+  .status-pill.ok { border-color: #287d60; color: #65e0aa; }
+  .status-pill.rtk { border-color: #2f79a8; color: #74ceff; }
+  .status-pill.warn { border-color: #8a6424; color: #ffd078; }
+  .status-pill.err { border-color: #7a3535; color: #ff8585; }
+
+  nav {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 50;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    min-height: var(--nav-height);
+    padding-bottom: env(safe-area-inset-bottom);
+    background: rgba(8, 25, 47, 0.98);
+    border-top: 1px solid var(--line);
+    box-shadow: 0 -6px 18px rgba(0, 0, 0, 0.35);
+  }
+  nav button {
+    min-width: 0;
+    min-height: var(--nav-height);
+    padding: 8px 4px;
+    background: none;
+    border: none;
+    border-top: 3px solid transparent;
+    color: #8da6bd;
+    cursor: pointer;
+    font-size: 0.76rem;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  nav button.active { color: var(--blue); background: #0e294d; border-top-color: var(--blue); }
+  .more-backdrop {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 55;
+    background: rgba(0, 0, 0, 0.55);
+  }
+  .more-backdrop.open { display: block; }
+  .more-menu {
+    position: fixed;
+    left: 10px;
+    right: 10px;
+    bottom: calc(var(--nav-height) + env(safe-area-inset-bottom) + 8px);
+    z-index: 60;
+    display: none;
+    padding: 10px;
+    border: 1px solid #315a8b;
+    border-radius: 14px;
+    background: #0c2343;
+    box-shadow: 0 14px 40px rgba(0, 0, 0, 0.5);
+  }
+  .more-menu.open { display: block; }
+  .more-menu button {
+    width: 100%;
+    min-height: 50px;
+    padding: 10px 12px;
+    border: 0;
+    border-bottom: 1px solid #1b3b61;
+    background: transparent;
+    color: #e5f0f8;
+    text-align: left;
+    font-weight: 700;
+  }
+  .more-menu button:last-of-type { border-bottom: 0; }
+  .more-menu .danger-link { color: #ff8585; }
+  .device-meta { padding: 8px 12px 4px; color: #7895af; font-size: 0.74rem; }
+
+  .page { display: none; padding: 12px 12px 28px; max-width: 700px; margin: 0 auto; }
   .page.active { display: block; }
 
-  .card { background: #0d2244; border: 1px solid #1e4080; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-  .card h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; color: #5ab4e8; margin-bottom: 12px; }
+  .card { background: var(--panel); border: 1px solid #234b80; border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+  .card h2 { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 1px; color: var(--blue); margin-bottom: 12px; }
+  .card-heading-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .card-heading-row h2 { margin: 0; }
+  details.card { padding: 0; }
+  details.card > summary {
+    min-height: 54px;
+    padding: 16px 14px;
+    color: var(--blue);
+    cursor: pointer;
+    font-size: 0.82rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    list-style-position: inside;
+    text-transform: uppercase;
+  }
+  details.card[open] > summary { border-bottom: 1px solid #234b80; }
+  .details-body { padding: 14px; }
 
-  .stat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; }
-  .stat { background: #091a36; border-radius: 6px; padding: 12px; text-align: center; }
-  .stat-label { font-size: 0.7rem; color: #5a7a9a; text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .stat { min-width: 0; background: var(--panel-deep); border: 1px solid #173a66; border-radius: 8px; padding: 12px 8px; text-align: center; }
+  .stat-label { font-size: 0.68rem; color: #7f9db8; text-transform: uppercase; letter-spacing: 0.5px; }
   .stat-value { font-size: 1.4rem; font-weight: bold; color: #e0e8f0; margin-top: 4px; font-variant-numeric: tabular-nums; }
-  .stat-value.ok  { color: #4caf82; }
-  .stat-value.rtk { color: #5ab4e8; }
-  .stat-value.warn { color: #e8a830; }
-  .stat-value.err { color: #e85a5a; }
+  .primary-stats .stat-value { font-size: clamp(1.8rem, 9vw, 2.5rem); }
+  .stat-value.ok  { color: var(--green); }
+  .stat-value.rtk { color: var(--blue); }
+  .stat-value.warn { color: var(--amber); }
+  .stat-value.err { color: var(--red); }
+  .fix-inline { display: flex; align-items: center; gap: 8px; color: #8ca8c1; font-size: 0.75rem; white-space: nowrap; }
+  .fix-inline .stat-value { margin: 0; font-size: 0.85rem; }
 
-  label { display: block; margin-bottom: 4px; font-size: 0.8rem; color: #7a9ab8; }
-  input, select { width: 100%; padding: 8px 10px; background: #091a36; border: 1px solid #1e4080;
-                  border-radius: 5px; color: #e0e8f0; font-size: 0.9rem; margin-bottom: 12px; }
-  input:focus { outline: none; border-color: #5ab4e8; }
+  label { display: block; margin-bottom: 6px; font-size: 0.84rem; color: #9ab2c7; }
+  input, select {
+    width: 100%;
+    min-height: 48px;
+    padding: 10px 12px;
+    background: #07182f;
+    border: 1px solid #315a8b;
+    border-radius: 8px;
+    color: #edf5fc;
+    font-size: 16px;
+    margin-bottom: 14px;
+  }
+  input:focus, select:focus { outline: 2px solid #4eb7f4; outline-offset: 1px; border-color: #4eb7f4; }
+  input[type=range] { min-height: 44px; padding: 0; border: 0; background: transparent; }
   .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 
-  button.btn { padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer;
-               font-size: 0.9rem; font-weight: bold; transition: opacity 0.2s; }
+  button.btn, #tracks button:not(.btn) {
+    min-height: 48px;
+    padding: 11px 16px;
+    border: 1px solid #365d88;
+    border-radius: 8px;
+    background: #173a61;
+    color: #edf5fc;
+    cursor: pointer;
+    font-size: 0.95rem;
+    font-weight: 800;
+    transition: opacity 0.2s;
+  }
   button.btn:hover { opacity: 0.85; }
-  button.btn-primary { background: #1e6eb8; color: #fff; }
-  button.btn-danger  { background: #8b2020; color: #fff; }
+  button.btn-primary { background: #1676c7; border-color: #2e94e4; color: #fff; }
+  button.btn-danger  { background: #8b2929; border-color: #b24747; color: #fff; }
+  button:disabled { opacity: 0.45; cursor: default; }
 
-  .toast { display: none; position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
-           padding: 10px 20px; border-radius: 6px; font-size: 0.9rem; z-index: 100; }
+  .toast { display: none; position: fixed; bottom: calc(var(--nav-height) + env(safe-area-inset-bottom) + 14px);
+           left: 12px; right: 12px; padding: 12px 16px; border-radius: 8px; font-size: 0.95rem;
+           font-weight: 700; text-align: center; z-index: 100; }
   .section-title { font-size: 0.8rem; font-weight: bold; text-transform: uppercase;
-                   letter-spacing: 0.5px; color: #5ab4e8; margin: 16px 0 8px;
+                   letter-spacing: 0.5px; color: var(--blue); margin: 16px 0 8px;
                    border-bottom: 1px solid #1e4080; padding-bottom: 4px; }
-  .toggle-row { display: flex; align-items: center; margin-bottom: 12px; }
+  .toggle-row { display: flex; align-items: center; min-height: 48px; margin-bottom: 12px; }
   .toggle-row label { margin: 0 0 0 8px; font-size: 0.9rem; color: #e0e8f0; }
-  input[type=checkbox] { width: auto; margin: 0; accent-color: #5ab4e8; transform: scale(1.3); cursor: pointer; }
+  input[type=checkbox] { width: 24px; height: 24px; min-height: 24px; margin: 0; accent-color: #5ab4e8; cursor: pointer; }
 
   /* Instrument panel */
   .instruments { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; align-items: flex-start; }
   .instrument  { display: flex; flex-direction: column; align-items: center; gap: 6px; }
   .instrument-label { font-size: 0.7rem; color: #5a7a9a; text-transform: uppercase; letter-spacing: 0.5px; }
   .instr-legend { font-size: 0.72rem; color: #8899aa; margin-top: 2px; }
+  .instrument svg { max-width: 100%; height: auto; }
+
+  #start.page.active { display: flex; flex-direction: column; }
+  #start .race-sequence-card { order: 1; }
+  #start .race-line-card { order: 2; }
+  #start .race-course-card { order: 3; }
+  #start.race-live .race-sequence-card { order: 1; }
+  #start.race-live .race-line-card,
+  #start.race-live .race-course-card { display: none; }
+  .race-actions { display: flex; gap: 10px; }
+  .race-actions .btn { min-height: 56px; }
+  #raceClock { font-size: clamp(4.2rem, 20vw, 6rem) !important; }
+  #compassCanvas { width: min(220px, 62vw); height: auto; }
+  #raceLapSelector .btn { flex: 1; min-width: 48px; padding-left: 8px; padding-right: 8px; }
+  #fileList .btn, #markList .btn { min-width: 44px; min-height: 44px; }
+  #configForm > .btn { width: 100%; min-height: 58px; }
+  #marks .card > button.btn-primary { width: 100%; }
+  .firmware-action { width: 100%; min-height: 58px !important; }
+  .firmware-version { font-size: 1.05rem; overflow-wrap: anywhere; }
+  .progress-track { height: 10px; overflow: hidden; border-radius: 999px; background: #07182f; }
+  .progress-fill { height: 100%; width: 0; border-radius: inherit; background: var(--blue); transition: width 0.25s; }
+  .race-line-card h2, #tracks .card h2[onclick] { min-height: 44px; padding: 12px 0; }
+  #raceCourseSelect, #lineMarkSel0, #lineMarkSel1, #gpxFile { margin-bottom: 0; }
+  .mark-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px;
+    align-items: center;
+    min-height: 64px;
+    padding: 10px 0;
+    border-bottom: 1px solid #1e4080;
+  }
+  .mark-row:last-child { border-bottom: 0; }
+  .mark-name { color: #edf5fc; font-size: 1rem; font-weight: 800; }
+  .mark-coords { margin-top: 3px; color: #89a8c1; font-size: 0.76rem; font-variant-numeric: tabular-nums; }
+
+  @media (max-width: 520px) {
+    .row { grid-template-columns: 1fr; gap: 0; }
+    .card { padding: 12px; }
+    .page { padding-left: 10px; padding-right: 10px; }
+    .instruments { flex-direction: column; align-items: stretch; }
+    .instrument { width: 100%; }
+    input, select { font-size: 16px !important; }
+  }
+
+  @media (min-width: 760px) {
+    body { padding-bottom: 0; }
+    nav {
+      position: sticky;
+      top: 58px;
+      bottom: auto;
+      display: flex;
+      justify-content: center;
+      min-height: 54px;
+      padding-bottom: 0;
+      border-top: 0;
+      border-bottom: 1px solid var(--line);
+      box-shadow: none;
+    }
+    nav button { flex: 0 1 150px; min-height: 54px; border-top: 0; border-bottom: 3px solid transparent; }
+    nav button.active { border-top-color: transparent; border-bottom-color: var(--blue); }
+    .more-menu { left: auto; right: calc(50% - 350px); bottom: auto; top: 118px; width: 330px; }
+    .page { padding-top: 20px; }
+    .stat-grid { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+  }
 </style>
 </head>
 <body>
 <header>
-  <h1>&#9741; Sailing Computer</h1>
-  <span id="deviceIP"></span><span id="fwVersion" style="font-size:0.75rem;color:#3a6a8a;margin-left:10px"></span>
+  <div>
+    <div class="app-name">Sailing Computer</div>
+    <h1 id="pageTitle">Race</h1>
+  </div>
+  <div class="header-status">
+    <span id="headerFix" class="status-pill err">GPS --</span>
+    <span id="headerNtrip" class="status-pill warn">NTRIP --</span>
+  </div>
 </header>
-<nav>
-  <button class="active" onclick="showPage('status',this)">Status</button>
-  <button onclick="showPage('config',this)">Configuration</button>
-  <button onclick="showPage('start',this)">Race</button>
-  <button onclick="showPage('marks',this)">Marks/Routes</button>
-  <button onclick="showPage('tracks',this)">Tracks</button>
-  <button onclick="showPage('files',this)">Files</button>
-  <button onclick="showPage('system',this)">System</button>
-  <button class="logout" onclick="doLogout()">&#x23FB; Log Out</button>
+<nav aria-label="Primary">
+  <button class="active" data-page="start" onclick="showPage('start')">Race</button>
+  <button data-page="status" onclick="showPage('status')">Data</button>
+  <button data-page="marks" onclick="showPage('marks')">Marks</button>
+  <button id="moreNavButton" aria-expanded="false" onclick="toggleMoreMenu()">More</button>
 </nav>
+<div id="moreBackdrop" class="more-backdrop" onclick="closeMoreMenu()"></div>
+<div id="moreMenu" class="more-menu" role="menu">
+  <button role="menuitem" onclick="showPage('tracks')">Track recording</button>
+  <button role="menuitem" onclick="showPage('files')">Files and storage</button>
+  <button role="menuitem" onclick="showPage('config')">Device settings</button>
+  <button role="menuitem" onclick="showPage('system')">System and updates</button>
+  <button role="menuitem" class="danger-link" onclick="doLogout()">Log out</button>
+  <div class="device-meta">Device <span id="deviceIP">--</span> <span id="fwVersion"></span></div>
+</div>
 
 <!-- STATUS PAGE -->
-<div id="status" class="page active">
+<div id="status" class="page">
   <div class="card">
-    <h2>GNSS Fix</h2>
-    <div class="stat-grid">
-      <div class="stat"><div class="stat-label">Fix Type</div><div class="stat-value" id="s-fix">--</div></div>
-      <div class="stat"><div class="stat-label">Satellites</div><div class="stat-value" id="s-sats">--</div></div>
-      <div class="stat"><div class="stat-label">Latitude</div><div class="stat-value" id="s-lat">--</div></div>
-      <div class="stat"><div class="stat-label">Longitude</div><div class="stat-value" id="s-lon">--</div></div>
+    <div class="card-heading-row">
+      <h2>On the Water</h2>
+      <div class="fix-inline"><span class="stat-value" id="s-fix">--</span><span>SAT <strong id="s-sats">--</strong></span></div>
+    </div>
+    <div class="stat-grid primary-stats">
+      <div class="stat"><div class="stat-label">Speed (kts)</div><div class="stat-value" id="s-sog">--</div></div>
       <div class="stat"><div class="stat-label">True Heading</div><div class="stat-value" id="s-hdt">--&deg;</div></div>
-      <div class="stat"><div class="stat-label">Roll</div><div class="stat-value" id="s-roll">--&deg;</div></div>
-      <div class="stat"><div class="stat-label">Heading Src</div><div class="stat-value" id="s-hdtsrc" style="font-size:0.9rem">--</div></div>
-      <div class="stat"><div class="stat-label">SOG (kts)</div><div class="stat-value" id="s-sog">--</div></div>
       <div class="stat"><div class="stat-label">COG</div><div class="stat-value" id="s-cog">--&deg;</div></div>
-      <div class="stat"><div class="stat-label">HDOP</div><div class="stat-value" id="s-hdop">--</div></div>
-      <div class="stat"><div class="stat-label">Altitude (m)</div><div class="stat-value" id="s-alt">--</div></div>
+      <div class="stat"><div class="stat-label">Heel</div><div class="stat-value" id="s-roll">--&deg;</div></div>
     </div>
   </div>
   <div class="card">
@@ -179,7 +406,7 @@ inline const char* getWebUI() {
     <h2>Sailing Performance</h2>
     <div class="stat-grid">
       <div class="stat">
-        <div class="stat-label">Tack</div>
+        <div class="stat-label">Likely Tack</div>
         <div class="stat-value" id="s-tack">--</div>
         <div style="font-size:0.7rem;color:#8899aa;margin-top:2px" id="s-tack-sub">from heel angle</div>
       </div>
@@ -194,35 +421,49 @@ inline const char* getWebUI() {
         <div style="font-size:0.7rem;color:#8899aa;margin-top:2px" id="s-lateral-dir">sideways speed</div>
       </div>
       <div class="stat">
-        <div class="stat-label">Drive</div>
+        <div class="stat-label">Forward Speed</div>
         <div class="stat-value" id="s-drive">--</div>
         <div style="font-size:0.7rem;color:#8899aa;margin-top:2px">fwd speed (kts)</div>
       </div>
     </div>
     <div id="s-favor-row" style="display:none;margin-top:0.6rem;padding:0.5rem 0.7rem;border-radius:6px;background:#0d1f33;font-size:0.8rem">
-      <span style="color:#8899aa">Current favor: </span>
+      <span style="color:#8899aa">Estimated favor: </span>
       <span id="s-favor-val" style="font-weight:bold"></span>
       <span id="s-favor-desc" style="color:#8899aa;margin-left:0.4rem"></span>
     </div>
     <p style="font-size:0.75rem;color:#556677;margin:0.5rem 0 0">
-      Leeway = COG &minus; Heading &mdash; includes keel slip &amp; tidal current.
-      Tack from heel angle (&gt;3&deg; threshold). Current favor = lateral drift toward windward.
+      Leeway = COG &minus; Heading and includes both keel slip and current.
+      Tack is estimated from heel (&gt;3&deg;). Favor is estimated from cross-track motion.
     </p>
   </div>
-  <div class="card">
-    <h2>Connections</h2>
-    <div class="stat-grid">
-      <div class="stat"><div class="stat-label">WiFi Mode</div><div class="stat-value" id="s-wifimode">--</div></div>
-      <div class="stat"><div class="stat-label">IP Address</div><div class="stat-value" id="s-ip" style="font-size:0.9rem">--</div></div>
-      <div class="stat"><div class="stat-label">NTRIP</div><div class="stat-value" id="s-ntrip">--</div></div>
-      <div class="stat"><div class="stat-label">NTRIP Source</div><div class="stat-value" id="s-ntrip-src" style="font-size:0.85rem">--</div></div>
-      <div class="stat"><div class="stat-label">RTCM In / UART</div><div class="stat-value" id="s-rtcm">0</div></div>
-      <div class="stat"><div class="stat-label">RTCM Frames / Type</div><div class="stat-value" id="s-rtcm-frames">0</div></div>
-      <div class="stat"><div class="stat-label">UM982 AUX UART</div><div class="stat-value" id="s-rtcm-uart">--</div></div>
-      <div class="stat"><div class="stat-label">NMEA Bytes</div><div class="stat-value" id="s-nmea-bytes">0</div><div style="font-size:0.7rem;color:#8899aa;margin-top:2px" id="s-nmea-lines">-- sentences</div></div>
-      <div class="stat" id="s-ble-tile" style="display:none"><div class="stat-label">Bluetooth GPS</div><div class="stat-value" id="s-ble">--</div></div>
+  <details class="card">
+    <summary>Position and GNSS details</summary>
+    <div class="details-body">
+      <div class="stat-grid">
+        <div class="stat"><div class="stat-label">Latitude</div><div class="stat-value" id="s-lat" style="font-size:1rem">--</div></div>
+        <div class="stat"><div class="stat-label">Longitude</div><div class="stat-value" id="s-lon" style="font-size:1rem">--</div></div>
+        <div class="stat"><div class="stat-label">Heading Source</div><div class="stat-value" id="s-hdtsrc" style="font-size:0.9rem">--</div></div>
+        <div class="stat"><div class="stat-label">HDOP</div><div class="stat-value" id="s-hdop">--</div></div>
+        <div class="stat"><div class="stat-label">Altitude</div><div class="stat-value" id="s-alt">--</div></div>
+      </div>
     </div>
-  </div>
+  </details>
+  <details class="card">
+    <summary>Connections and diagnostics</summary>
+    <div class="details-body">
+      <div class="stat-grid">
+        <div class="stat"><div class="stat-label">WiFi Mode</div><div class="stat-value" id="s-wifimode">--</div></div>
+        <div class="stat"><div class="stat-label">IP Address</div><div class="stat-value" id="s-ip" style="font-size:0.9rem">--</div></div>
+        <div class="stat"><div class="stat-label">NTRIP</div><div class="stat-value" id="s-ntrip">--</div></div>
+        <div class="stat"><div class="stat-label">NTRIP Source</div><div class="stat-value" id="s-ntrip-src" style="font-size:0.85rem">--</div></div>
+        <div class="stat"><div class="stat-label">RTCM In / UART</div><div class="stat-value" id="s-rtcm">0</div></div>
+        <div class="stat"><div class="stat-label">RTCM Frames / Type</div><div class="stat-value" id="s-rtcm-frames">0</div></div>
+        <div class="stat"><div class="stat-label">UM982 AUX UART</div><div class="stat-value" id="s-rtcm-uart">--</div></div>
+        <div class="stat"><div class="stat-label">NMEA Bytes</div><div class="stat-value" id="s-nmea-bytes">0</div><div style="font-size:0.7rem;color:#8899aa;margin-top:2px" id="s-nmea-lines">-- sentences</div></div>
+        <div class="stat" id="s-ble-tile" style="display:none"><div class="stat-label">Bluetooth GPS</div><div class="stat-value" id="s-ble">--</div></div>
+      </div>
+    </div>
+  </details>
 </div>
 
 <!-- CONFIG PAGE -->
@@ -317,10 +558,44 @@ inline const char* getWebUI() {
     <p id="ble-status-text" style="font-size:0.85rem;margin-top:0.5rem;color:#8899aa">--</p>
   </div>
   <div class="card">
-    <h2>Firmware Update (OTA)</h2>
+    <h2>WiFi Coprocessor Firmware</h2>
+    <p style="font-size:0.85rem;color:#8ca8c1;margin-bottom:0.85rem">
+      Updates the onboard ESP32-C6 that provides WiFi and Bluetooth. The tested
+      firmware is bundled into this Sailing Computer build.
+    </p>
+    <div class="stat-grid" style="margin-bottom:0.75rem">
+      <div class="stat">
+        <div class="stat-label">C6 Running</div>
+        <div class="stat-value firmware-version" id="c6RunningVersion">--</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">C6 Bundled</div>
+        <div class="stat-value firmware-version" id="c6AvailableVersion">--</div>
+      </div>
+    </div>
+    <p id="c6ImageDetails" style="font-size:0.78rem;color:#7895af;margin-bottom:0.75rem">Checking bundled image...</p>
+    <p style="font-size:0.75rem;color:#7895af;margin:-0.35rem 0 0.75rem">
+      Running reports the C6 protocol version; Bundled reports this image's
+      build version. Use the bundled build date to identify a custom image.
+    </p>
+    <div id="c6Progress" style="display:none;margin-bottom:0.85rem">
+      <div class="progress-track">
+        <div id="c6Bar" class="progress-fill"></div>
+      </div>
+      <p id="c6Status" style="font-size:0.85rem;color:#a9bfd2;margin:0.4rem 0 0">Ready</p>
+    </div>
+    <button id="c6UpdateButton" type="button" class="btn btn-primary firmware-action"
+            onclick="startC6Update()" disabled>Update ESP32-C6</button>
+    <p style="font-size:0.8rem;color:#ffcf75;margin:0.65rem 0 0">
+      Do this ashore, not during a race. WiFi will disconnect briefly and the
+      complete Sailing Computer will restart when the update finishes.
+    </p>
+  </div>
+  <div class="card">
+    <h2>Main Firmware (ESP32-P4)</h2>
     <p style="font-size:0.85rem;color:#7a9ab8;margin-bottom:1rem;">
       Build with PlatformIO, then upload
-      <code style="background:#0a1628;padding:2px 6px;border-radius:4px">.pio/build/esp32dev/firmware.bin</code>.
+      <code style="background:#0a1628;padding:2px 6px;border-radius:4px">.pio/build/esp32p4/firmware.bin</code>.
       The device will restart automatically after a successful flash.
     </p>
     <!-- enctype here is ignored — startOTA() uses XHR with Content-Type: application/octet-stream (raw binary) -->
@@ -349,28 +624,36 @@ inline const char* getWebUI() {
 
 <!-- RACING PAGE -->
 <!-- START / RACE SEQUENCE PAGE -->
-<div id="start" class="page">
+<div id="start" class="page active">
 
   <!-- Race Clock -->
-  <div class="card">
+  <div class="card race-sequence-card">
     <h2>Race Sequence</h2>
 
     <!-- IDLE: duration picker + arm button -->
     <div id="raceSetupView">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:0.75rem">
+        <div class="stat" style="padding:9px 8px">
+          <div class="stat-label">Course</div>
+          <div id="raceSetupCourse" style="margin-top:4px;color:#edf5fc;font-size:0.88rem;font-weight:800">None</div>
+        </div>
+        <div class="stat" style="padding:9px 8px">
+          <div class="stat-label">Start Line</div>
+          <div id="raceSetupLine" style="margin-top:4px;color:#ffbb45;font-size:0.88rem;font-weight:800">Not set</div>
+        </div>
+      </div>
+      <div style="text-align:center;color:#9ab2c7;font-size:0.82rem;margin-top:0.25rem">Start countdown</div>
       <div style="display:flex;align-items:center;justify-content:center;gap:16px;margin:1rem 0">
         <button class="btn" onclick="adjustDuration(-60)" style="font-size:1.1rem;padding:8px 14px">&#8722;1</button>
         <div id="raceDurationDisplay" style="font-size:3.2rem;font-weight:bold;font-variant-numeric:tabular-nums;color:#e0e8f0;min-width:90px;text-align:center">5:00</div>
         <button class="btn" onclick="adjustDuration(60)"  style="font-size:1.1rem;padding:8px 14px">+1</button>
       </div>
-      <div style="display:flex;gap:8px;justify-content:center;margin-bottom:1.25rem">
+      <div style="display:flex;gap:8px;justify-content:center;margin-bottom:1rem">
         <button class="btn" id="durBtn5"  onclick="setDuration(300)"> 5 min</button>
         <button class="btn" id="durBtn10" onclick="setDuration(600)">10 min</button>
         <button class="btn" id="durBtn15" onclick="setDuration(900)">15 min</button>
       </div>
-      <div style="display:flex;gap:10px">
-        <button class="btn btn-primary" style="flex:1;padding:12px" onclick="armRace()">ARM SEQUENCE</button>
-        <button class="btn" onclick="resetRace()">Reset</button>
-      </div>
+      <button id="armRaceBtn" class="btn btn-primary" style="width:100%;min-height:58px" onclick="armRace()">ARM 5:00 START</button>
     </div>
 
     <!-- COUNTDOWN / RACING: live clock -->
@@ -379,16 +662,26 @@ inline const char* getWebUI() {
       <div id="raceClock"
            onclick="syncRace()" title="Tap to sync to nearest minute"
            style="font-size:5rem;font-weight:bold;text-align:center;font-variant-numeric:tabular-nums;cursor:pointer;padding:0.4rem 0 0;border-radius:8px;line-height:1">0:00</div>
-      <div style="text-align:center;font-size:0.68rem;color:#2a5a7a;margin-bottom:0.9rem">tap to sync</div>
+      <div style="text-align:center;font-size:0.68rem;color:#2a5a7a;margin-bottom:0.75rem">tap to sync</div>
+
+      <!-- Compass -->
+      <div id="compassSection" style="display:flex;flex-direction:column;align-items:center;margin-bottom:0.85rem">
+        <canvas id="compassCanvas" width="220" height="220" style="display:block"></canvas>
+        <button id="compassEnableBtn" class="btn" onclick="requestCompassPermission()"
+          style="margin-top:6px;display:none">
+          Enable Compass
+        </button>
+        <div id="compassUnavail" style="display:none;font-size:0.75rem;color:#3a6a8a;margin-top:4px">Compass not available</div>
+      </div>
 
       <!-- Pre-start: time to line -->
       <div id="racePreInfo" style="background:#060f1e;border:1px solid #1a3050;border-radius:6px;padding:0.65rem 0.9rem;margin-bottom:0.75rem">
         <div style="display:flex;justify-content:space-between;align-items:baseline">
-          <span style="color:#7a9ab8;font-size:0.82rem">Time to Line</span>
+          <span style="color:#9ab2c7;font-size:0.82rem">Est. time to line</span>
           <span id="raceTTL" style="font-variant-numeric:tabular-nums;color:#e0e8f0;font-size:1.1rem;font-weight:bold">--:--</span>
         </div>
         <div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:4px">
-          <span style="color:#7a9ab8;font-size:0.82rem">Speed (SOG)</span>
+          <span style="color:#9ab2c7;font-size:0.82rem">At current SOG</span>
           <span id="raceTTLSog" style="font-variant-numeric:tabular-nums;color:#aac8e0;font-size:0.9rem">-- kts</span>
         </div>
       </div>
@@ -410,10 +703,11 @@ inline const char* getWebUI() {
         </div>
       </div>
 
-      <div style="display:flex;gap:10px">
+      <div class="race-actions">
         <button id="racePrevLegBtn" class="btn" style="flex:1;display:none" onclick="prevLeg()">&#8592; Prev Mark</button>
         <button id="raceNextLegBtn" class="btn btn-primary" style="flex:1;display:none" onclick="nextLeg()">Next Mark &#8594;</button>
-        <button class="btn btn-danger" onclick="endRace()">End Race</button>
+        <button id="raceCancelBtn" class="btn btn-danger" style="display:none" onclick="resetRace()">Cancel Start</button>
+        <button id="raceEndBtn" class="btn btn-danger" style="display:none" onclick="endRace()">Finish Race</button>
       </div>
     </div>
 
@@ -432,7 +726,7 @@ inline const char* getWebUI() {
   </div>
 
   <!-- Start Line (collapsible) -->
-  <div class="card">
+  <div class="card race-line-card">
     <h2 onclick="toggleStartLine()" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;margin:0">
       Start Line
       <span id="startLineChevron" style="font-size:0.9rem;color:#5a7a9a;transition:transform 0.2s">&#9660;</span>
@@ -441,7 +735,7 @@ inline const char* getWebUI() {
       <div style="margin-bottom:1.1rem">
         <div class="section-title">Port End (Pin)</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px">
-          <button class="btn" style="white-space:nowrap" onclick="useGpsForLine(0)">&#8982; GPS</button>
+          <button class="btn" style="white-space:nowrap" onclick="useGpsForLine(0)">Set Here</button>
           <select id="lineMarkSel0" onchange="useMarkForLine(0)"
             style="flex:1;min-width:0;background:#091a36;border:1px solid #1e4080;color:#e0e8f0;padding:6px 8px;border-radius:5px;font-size:0.85rem">
             <option value="">&#8212; saved mark &#8212;</option>
@@ -452,7 +746,7 @@ inline const char* getWebUI() {
       <div>
         <div class="section-title">Starboard End (Boat)</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px">
-          <button class="btn" style="white-space:nowrap" onclick="useGpsForLine(1)">&#8982; GPS</button>
+          <button class="btn" style="white-space:nowrap" onclick="useGpsForLine(1)">Set Here</button>
           <select id="lineMarkSel1" onchange="useMarkForLine(1)"
             style="flex:1;min-width:0;background:#091a36;border:1px solid #1e4080;color:#e0e8f0;padding:6px 8px;border-radius:5px;font-size:0.85rem">
             <option value="">&#8212; saved mark &#8212;</option>
@@ -464,16 +758,32 @@ inline const char* getWebUI() {
   </div>
 
   <!-- Course -->
-  <div class="card">
+  <div class="card race-course-card">
     <h2>Course</h2>
-    <div style="display:flex;gap:8px;align-items:center">
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:0.5rem">
       <select id="raceCourseSelect"
         style="flex:1;background:#091a36;border:1px solid #1e4080;color:#e0e8f0;padding:8px;border-radius:5px;font-size:0.85rem">
         <option value="">&#8212; no course &#8212;</option>
       </select>
-      <button class="btn btn-primary" onclick="setRaceCourse()">Set</button>
+      <button class="btn btn-primary" onclick="setRaceCourse()">Use</button>
     </div>
-    <div id="raceCourseStatus" style="font-size:0.8rem;color:#5a7a9a;margin-top:6px"></div>
+    <!-- Selected course detail (expanded with laps) -->
+    <div id="raceCourseDetail" style="display:none;margin:0.75rem 0 0.25rem">
+      <div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.5px;color:#7a9ab8;margin-bottom:6px">Course Sequence</div>
+      <div id="raceCourseMarks" style="line-height:2.1"></div>
+    </div>
+    <!-- Lap selector -->
+    <div id="raceLapSelector" style="display:none;margin-top:0.9rem">
+      <div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.5px;color:#7a9ab8;margin-bottom:6px">Laps</div>
+      <div style="display:flex;gap:6px">
+        <button class="btn" id="lapBtn1" onclick="setLaps(1)">1</button>
+        <button class="btn" id="lapBtn2" onclick="setLaps(2)">2</button>
+        <button class="btn" id="lapBtn3" onclick="setLaps(3)">3</button>
+        <button class="btn" id="lapBtn4" onclick="setLaps(4)">4</button>
+        <button class="btn" id="lapBtn5" onclick="setLaps(5)">5</button>
+      </div>
+    </div>
+    <div id="raceCourseStatus" style="font-size:0.8rem;color:#5a7a9a;margin-top:8px"></div>
   </div>
 
 </div>
@@ -493,7 +803,7 @@ inline const char* getWebUI() {
         <input id="mkName" type="text" placeholder="e.g. Pin End" maxlength="31">
       </div>
       <div>
-        <button class="btn btn-primary" style="margin-top:22px;width:100%" onclick="useGpsForMark()">&#8982; Use GPS Position</button>
+        <button class="btn btn-primary" style="margin-top:22px;width:100%" onclick="useGpsForMark()">Use Current Position</button>
       </div>
     </div>
     <div class="row">
@@ -677,29 +987,72 @@ function hideAuthWall(page) {
 function retryAuth(page) {
   // Re-attempt auth by fetching /config — browser will re-prompt for credentials
   fetch('/config').then(function(r) {
-    if (r.ok) { hideAuthWall(page); if (page === 'config') loadConfig(); }
+    if (r.ok) {
+      hideAuthWall(page);
+      if (page === 'config') loadConfig();
+      if (page === 'system') { loadC6Status(); startC6Polling(); }
+    }
     else showAuthWall(page);
   }).catch(function() { showAuthWall(page); });
 }
 
-function showPage(id, btn) {
+var PAGE_TITLES = {
+  start: 'Race',
+  status: 'Sailing Data',
+  marks: 'Marks',
+  tracks: 'Track Recording',
+  files: 'Files and Storage',
+  config: 'Device Settings',
+  system: 'System'
+};
+
+function toggleMoreMenu() {
+  var menu = document.getElementById('moreMenu');
+  var backdrop = document.getElementById('moreBackdrop');
+  var btn = document.getElementById('moreNavButton');
+  var open = !menu.classList.contains('open');
+  menu.classList.toggle('open', open);
+  backdrop.classList.toggle('open', open);
+  btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function closeMoreMenu() {
+  document.getElementById('moreMenu').classList.remove('open');
+  document.getElementById('moreBackdrop').classList.remove('open');
+  document.getElementById('moreNavButton').setAttribute('aria-expanded', 'false');
+}
+
+function showPage(id) {
+  closeMoreMenu();
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
   document.getElementById(id).classList.add('active');
-  btn.classList.add('active');
+  var directBtn = document.querySelector('nav button[data-page="' + id + '"]');
+  (directBtn || document.getElementById('moreNavButton')).classList.add('active');
+  document.getElementById('pageTitle').textContent = PAGE_TITLES[id] || 'Sailing Computer';
+  window.scrollTo(0, 0);
   if (id === 'config') loadConfig();
   if (id === 'marks')  { loadMarks(); loadCourses(); }
-  if (id === 'start')  { loadRaceState(); loadRaceMarksAndCourses(); startRacePolling(); }
+  if (id === 'start')  { loadRaceState(); loadRaceMarksAndCourses(); startRacePolling(); initRaceCompass(); }
   if (id === 'tracks') { startTrackPolling(); }
   if (id !== 'tracks') { stopTrackPolling(); }
+  if (id !== 'system') { stopC6Polling(); }
   if (id === 'files')  { initFilesPage(); }
   if (id === 'system') {
     fetch('/config').then(function(r) {
-      if (r.ok) hideAuthWall('system');
+      if (r.ok) {
+        hideAuthWall('system');
+        loadC6Status();
+        startC6Polling();
+      }
       else showAuthWall('system');
     }).catch(function() { showAuthWall('system'); });
   }
 }
+
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') closeMoreMenu();
+});
 
 function toast(msg, ok=true) {
   const el = document.getElementById('toast');
@@ -787,7 +1140,7 @@ function updateStatus() {
       // Current favor: lateral drift component toward windward on current tack.
       // Port tack: windward = port → favorable when lateral < 0 → favor = -lateral
       // Starboard tack: windward = starboard → favorable when lateral > 0 → favor = +lateral
-      var favorRow = document.getElementById('s-favor-row');
+    var favorRow = document.getElementById('s-favor-row');
       if (tack !== 'unknown') {
         var favor = tack === 'port' ? -lateral : lateral;
         favorRow.style.display = '';
@@ -796,13 +1149,13 @@ function updateStatus() {
         favorVal.textContent = (favor >= 0 ? '+' : '') + favor.toFixed(2) + ' kts';
         if (favor > 0.1) {
           favorVal.style.color  = '#4ade80';
-          favorDesc.textContent = 'current helping — stay on ' + tack + ' tack';
+          favorDesc.textContent = 'cross-track drift favors ' + tack + ' tack';
         } else if (favor < -0.1) {
           favorVal.style.color  = '#f87171';
-          favorDesc.textContent = 'current hurting — consider tacking';
+          favorDesc.textContent = 'cross-track drift opposes ' + tack + ' tack';
         } else {
           favorVal.style.color  = '#8899aa';
-          favorDesc.textContent = 'current neutral';
+          favorDesc.textContent = 'cross-track drift is neutral';
         }
       } else {
         favorRow.style.display = 'none';
@@ -840,6 +1193,12 @@ function updateStatus() {
     ntrip.textContent = d.ntripConnected ? 'Connected' : 'Off';
     ntrip.className = 'stat-value ' + (d.ntripConnected ? 'ok' : 'err');
     setText('s-ntrip-src', d.ntripConnected ? 'Source ' + (d.ntripActiveIdx||0) : '--');
+    var headerFix = document.getElementById('headerFix');
+    headerFix.textContent = 'GPS ' + (d.fixLabel || '--');
+    headerFix.className = 'status-pill ' + (fixColors[d.fix] || 'err');
+    var headerNtrip = document.getElementById('headerNtrip');
+    headerNtrip.textContent = d.ntripConnected ? 'NTRIP ON' : 'NTRIP OFF';
+    headerNtrip.className = 'status-pill ' + (d.ntripConnected ? 'ok' : 'warn');
 
     // BLE status tile — only show if BLE is enabled
     var bleTile = document.getElementById('s-ble-tile');
@@ -883,7 +1242,7 @@ updateStatus();
 
 // ── Instrument initialisation ─────────────────────────────────────────────────
 
-function initCompass() {
+function initNavigationInstruments() {
   var ticks = document.getElementById('c-ticks');
   var lbls  = document.getElementById('c-labels');
   if (!ticks) return;
@@ -977,7 +1336,7 @@ function updateHeel(roll, valid) {
 }
 
 // Initialise on load
-initCompass();
+initNavigationInstruments();
 initHeelScale();
 
 const SOURCE_LABELS = ['Source 1 (Primary)', 'Source 2 (Failover)', 'Source 3 (Failover)'];
@@ -1108,6 +1467,87 @@ function doUM982Reset() {
   toast('UM982 reset in progress (~15s)...');
   fetch('/um982reset', {method:'POST'}).catch(()=>{});
 }
+
+var c6PollTimer = null;
+var c6ReloadScheduled = false;
+
+function startC6Polling() {
+  if (!c6PollTimer) c6PollTimer = setInterval(loadC6Status, 750);
+}
+
+function stopC6Polling() {
+  if (c6PollTimer) clearInterval(c6PollTimer);
+  c6PollTimer = null;
+}
+
+function loadC6Status() {
+  fetch('/c6/status', {cache:'no-store'}).then(function(r) {
+    if (r.status === 401) {
+      stopC6Polling();
+      showAuthWall('system');
+      throw new Error('Login required');
+    }
+    if (!r.ok) throw new Error('Status request failed (' + r.status + ')');
+    return r.json();
+  }).then(function(d) {
+    setText('c6RunningVersion', d.runningVersion || 'Unknown');
+    setText('c6AvailableVersion', d.availableVersion || 'Invalid');
+    setText('c6ImageDetails',
+      (d.availableDate ? 'Built ' + d.availableDate + ' · ' : '') +
+      formatBytes(d.imageBytes || 0) +
+      (d.activateSupported ? ' · Remote activation supported' : ' · Legacy activation'));
+
+    var button = document.getElementById('c6UpdateButton');
+    var progress = document.getElementById('c6Progress');
+    var bar = document.getElementById('c6Bar');
+    var status = document.getElementById('c6Status');
+    var pct = Math.max(0, Math.min(100, Number(d.progress) || 0));
+
+    button.disabled = !!d.updating || !d.imageValid;
+    button.textContent = d.updating ? 'Updating ESP32-C6…' : 'Update ESP32-C6';
+    progress.style.display = (d.updating || d.error) ? '' : 'none';
+    bar.style.width = pct + '%';
+    bar.style.background = d.error ? '#ff6b6b' : '#67c5ff';
+    status.textContent = d.error ? d.error : (d.phase + (d.updating && pct < 100 ? ' · ' + pct + '%' : ''));
+    status.style.color = d.error ? '#ff8585' : '#a9bfd2';
+
+    if (d.phase === 'Restarting device' && !c6ReloadScheduled) {
+      c6ReloadScheduled = true;
+      status.textContent = 'Update complete. WiFi is restarting; reconnecting shortly…';
+      setTimeout(function() { window.location.reload(); }, 10000);
+    }
+  }).catch(function(e) {
+    if (c6ReloadScheduled) {
+      setText('c6Status', 'WiFi is restarting; reconnecting shortly…');
+    } else {
+      console.error('C6 status error:', e);
+    }
+  });
+}
+
+function startC6Update() {
+  var running = document.getElementById('c6RunningVersion').textContent;
+  var available = document.getElementById('c6AvailableVersion').textContent;
+  if (!confirm('Update the ESP32-C6 from ' + running + ' to bundled ' + available +
+      '?\n\nWiFi will disconnect and the Sailing Computer will restart.')) return;
+
+  var button = document.getElementById('c6UpdateButton');
+  button.disabled = true;
+  document.getElementById('c6Progress').style.display = '';
+  setText('c6Status', 'Starting update…');
+
+  fetch('/c6/update', {method:'POST'}).then(function(r) {
+    if (!r.ok) return r.text().then(function(t) { throw new Error(t || 'Update request failed'); });
+    startC6Polling();
+    loadC6Status();
+  }).catch(function(e) {
+    button.disabled = false;
+    var status = document.getElementById('c6Status');
+    status.textContent = e.message || 'Could not start update';
+    status.style.color = '#ff8585';
+  });
+}
+
 function startOTA(e) {
   e.preventDefault();
   var file = document.getElementById('otaFile').files[0];
@@ -1151,9 +1591,147 @@ function startOTA(e) {
 
 // ── Start / Race Sequence ─────────────────────────────────────────────────────
 
-var raceStatusCache = null;   // latest /status payload — updated by updateStatus()
-var racePollTimer   = null;
-var raceStateCache  = null;   // latest /race/state response
+var raceStatusCache  = null;   // latest /status payload — updated by updateStatus()
+var racePollTimer    = null;
+var raceStateCache   = null;   // latest /race/state response
+var raceCourseCache  = [];     // full course objects from /courses
+var raceMarkMapCache = {};     // mark id → name map from /marks
+
+// ── Compass ───────────────────────────────────────────────────────────────────
+var compassHeading   = null;   // degrees, 0=North, from deviceorientation
+var compassRafId     = null;
+
+function onDeviceOrientation(e) {
+  if (e.webkitCompassHeading != null) {
+    compassHeading = e.webkitCompassHeading;           // iOS: true bearing 0-360
+  } else if (e.alpha != null) {
+    compassHeading = (360 - e.alpha + 360) % 360;     // Android approximation
+  }
+}
+
+function startCompassListener() {
+  window.addEventListener('deviceorientation', onDeviceOrientation, true);
+  document.getElementById('compassEnableBtn').style.display = 'none';
+  if (!compassRafId) drawCompassLoop();
+}
+
+function requestCompassPermission() {
+  if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+    DeviceOrientationEvent.requestPermission().then(function(s) {
+      if (s === 'granted') startCompassListener();
+    }).catch(function() {});
+  } else {
+    startCompassListener();
+  }
+}
+
+function initRaceCompass() {
+  drawCompass();
+  if (typeof DeviceOrientationEvent === 'undefined') {
+    document.getElementById('compassUnavail').style.display = '';
+    return;
+  }
+  if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+    // iOS 13+: must be triggered by a user gesture — show button
+    document.getElementById('compassEnableBtn').style.display = '';
+  } else {
+    startCompassListener();
+  }
+}
+
+function drawCompassLoop() {
+  drawCompass();
+  compassRafId = requestAnimationFrame(drawCompassLoop);
+}
+
+function drawCompass() {
+  var canvas = document.getElementById('compassCanvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  var w = canvas.width, h = canvas.height;
+  var cx = w / 2, cy = h / 2, r = cx - 8;
+  ctx.clearRect(0, 0, w, h);
+
+  var hdg = compassHeading != null ? compassHeading : 0;
+
+  // Outer ring
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fillStyle = '#060f1e'; ctx.fill();
+  ctx.strokeStyle = '#1e4080'; ctx.lineWidth = 2; ctx.stroke();
+
+  // Rotating rose
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(-hdg * Math.PI / 180);
+
+  // Tick marks
+  for (var i = 0; i < 360; i += 5) {
+    var a = i * Math.PI / 180;
+    var big = (i % 30 === 0);
+    var len = big ? 11 : (i % 10 === 0 ? 7 : 4);
+    ctx.beginPath();
+    ctx.moveTo(Math.sin(a) * (r - len), -Math.cos(a) * (r - len));
+    ctx.lineTo(Math.sin(a) * (r - 1),  -Math.cos(a) * (r - 1));
+    ctx.strokeStyle = big ? '#2e6ab0' : '#1a3a60';
+    ctx.lineWidth = big ? 1.5 : 1;
+    ctx.stroke();
+  }
+
+  // Cardinal labels
+  [['N',0,'#e85a5a'],['E',90,'#c0d8f0'],['S',180,'#c0d8f0'],['W',270,'#c0d8f0']].forEach(function(c) {
+    var a = c[1] * Math.PI / 180;
+    ctx.font = 'bold ' + (c[0]==='N'?'15':'12') + 'px sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = c[2];
+    ctx.fillText(c[0], Math.sin(a) * (r - 22), -Math.cos(a) * (r - 22));
+  });
+
+  // Mark bearing arrow (green, absolute bearing so it rotates with the rose)
+  var state  = raceStateCache;
+  var status = raceStatusCache;
+  if (state && status && state.state === 'racing' && state.nextMark &&
+      state.nextMark.lat && status.lat) {
+    var mb = bearingDeg(status.lat, status.lon, state.nextMark.lat, state.nextMark.lon);
+    var ma = mb * Math.PI / 180;
+    var aLen = r - 28;
+    // Shaft
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(Math.sin(ma) * aLen, -Math.cos(ma) * aLen);
+    ctx.strokeStyle = '#4caf82'; ctx.lineWidth = 3; ctx.stroke();
+    // Head
+    var tx = Math.sin(ma) * aLen, ty = -Math.cos(ma) * aLen;
+    var px = Math.cos(ma), py = Math.sin(ma);
+    ctx.beginPath();
+    ctx.moveTo(tx, ty);
+    ctx.lineTo(tx - Math.sin(ma)*13 + px*6, ty + Math.cos(ma)*13 + py*6);
+    ctx.lineTo(tx - Math.sin(ma)*13 - px*6, ty + Math.cos(ma)*13 - py*6);
+    ctx.closePath(); ctx.fillStyle = '#4caf82'; ctx.fill();
+    // Tail (small back line so direction is unambiguous)
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(-Math.sin(ma) * 14, Math.cos(ma) * 14);
+    ctx.strokeStyle = '#2a6a48'; ctx.lineWidth = 2; ctx.stroke();
+  }
+
+  ctx.restore();
+
+  // Fixed heading indicator — blue triangle at top = direction phone is facing
+  ctx.beginPath();
+  ctx.moveTo(cx,     cy - r + 2);
+  ctx.lineTo(cx - 8, cy - r + 16);
+  ctx.lineTo(cx + 8, cy - r + 16);
+  ctx.closePath(); ctx.fillStyle = '#5ab4e8'; ctx.fill();
+
+  // Center dot
+  ctx.beginPath(); ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+  ctx.fillStyle = '#e0e8f0'; ctx.fill();
+
+  // Heading readout at bottom
+  ctx.font = '11px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = compassHeading != null ? '#7a9ab8' : '#2a4a6a';
+  ctx.fillText(compassHeading != null ? Math.round(hdg) + '°' : 'no sensor', cx, cy + r - 12);
+}
 
 function startRacePolling() {
   if (racePollTimer) return;
@@ -1197,6 +1775,7 @@ function renderRacePage(d) {
   var state = d.state || 'idle';
   var now   = d.server_now_ms;
   var t0    = d.t0_ms;
+  document.getElementById('start').classList.toggle('race-live', state !== 'idle');
 
   setupView.style.display    = (state === 'idle')    ? '' : 'none';
   activeView.style.display   = (state === 'countdown' || state === 'racing') ? '' : 'none';
@@ -1206,6 +1785,7 @@ function renderRacePage(d) {
     var durSec = d.duration_s || 300;
     var durMin = Math.floor(durSec / 60);
     document.getElementById('raceDurationDisplay').textContent = durMin + ':00';
+    document.getElementById('armRaceBtn').textContent = 'ARM ' + durMin + ':00 START';
     ['5','10','15'].forEach(function(m) {
       var btn = document.getElementById('durBtn' + m);
       if (btn) btn.style.background = (durSec === parseInt(m) * 60) ? '#1e5080' : '';
@@ -1220,6 +1800,8 @@ function renderRacePage(d) {
     var markInfo   = document.getElementById('raceMarkInfo');
     var nextLegBtn = document.getElementById('raceNextLegBtn');
     var prevLegBtn = document.getElementById('racePrevLegBtn');
+    var cancelBtn  = document.getElementById('raceCancelBtn');
+    var endBtn     = document.getElementById('raceEndBtn');
 
     if (remainingMs > 0) {
       var secs = Math.ceil(remainingMs / 1000);
@@ -1231,6 +1813,8 @@ function renderRacePage(d) {
       markInfo.style.display = 'none';
       nextLegBtn.style.display = 'none';
       prevLegBtn.style.display = 'none';
+      cancelBtn.style.display = '';
+      endBtn.style.display = 'none';
       updateTTL(d);
     } else {
       var elapsed = -remainingMs;
@@ -1238,6 +1822,8 @@ function renderRacePage(d) {
       clock.style.color      = '#4caf82';
       phaseLabel.textContent = 'RACING';
       preInfo.style.display  = 'none';
+      cancelBtn.style.display = 'none';
+      endBtn.style.display = '';
       if (d.nextMark) {
         markInfo.style.display   = '';
         nextLegBtn.style.display = '';
@@ -1286,30 +1872,98 @@ function renderRacePage(d) {
 
   // Start line status
   if (d.line) {
+    var setEnds = 0;
     [0, 1].forEach(function(i) {
       var el = document.getElementById('lineStatus' + i);
       if (!el) return;
       var end = d.line[i];
       if (end && end.set) {
+        setEnds++;
         el.style.color = '#4caf82';
-        el.textContent = end.name + ' — ' + Number(end.lat).toFixed(5) + ', ' + Number(end.lon).toFixed(5);
+        el.textContent = end.name + ' - set';
       } else {
         el.style.color = '#5a7a9a';
         el.textContent = 'Not set';
       }
     });
+    var setupLine = document.getElementById('raceSetupLine');
+    if (setupLine) {
+      setupLine.textContent = setEnds === 2 ? 'Ready' : setEnds === 1 ? '1 end set' : 'Not set';
+      setupLine.style.color = setEnds === 2 ? '#4fd39a' : '#ffbb45';
+    }
   }
 
-  // Course status text (selector value managed separately by loadRaceMarksAndCourses)
-  var courseStatusEl = document.getElementById('raceCourseStatus');
-  if (courseStatusEl) {
-    if (d.courseId) {
-      courseStatusEl.style.color = '#4caf82';
-      courseStatusEl.textContent = 'Active — leg ' + ((d.legIdx || 0) + 1);
+  // Course list highlight + detail + lap selector
+  renderRaceCourseCard(d);
+}
+
+function markChip(name, port) {
+  var rnd = port ? '<span style="font-size:0.65rem;color:#4caf82">P</span>' : '<span style="font-size:0.65rem;color:#e8a830">S</span>';
+  return '<span style="display:inline-block;background:#0d2244;border:1px solid #1e4080;border-radius:4px;padding:1px 6px;margin:2px;font-size:0.78rem">' + escHtml(name) + ' ' + rnd + '</span>';
+}
+
+function renderRaceCourseCard(d) {
+  var activeCourseId = d ? (d.courseId || '') : '';
+  var activeLaps     = d ? (d.laps || 1) : 1;
+  var state          = d ? (d.state || 'idle') : 'idle';
+
+  // Expanded sequence for selected course
+  var detailEl = document.getElementById('raceCourseDetail');
+  var marksEl  = document.getElementById('raceCourseMarks');
+  var lapSelEl = document.getElementById('raceLapSelector');
+  var statusEl = document.getElementById('raceCourseStatus');
+
+  var activeCourse = raceCourseCache.filter(function(c) { return c.id === activeCourseId; })[0] || null;
+
+  if (activeCourse) {
+    var setupCourse = document.getElementById('raceSetupCourse');
+    if (setupCourse) setupCourse.textContent = activeCourse.name;
+    // Build expanded mark list
+    var raw = activeCourse.marks;
+    var expanded = [];
+    if (raw.length >= 3 && activeLaps > 1) {
+      expanded.push(raw[0]);
+      var interior = raw.slice(1, raw.length - 1);
+      for (var lap = 0; lap < activeLaps; lap++) {
+        interior.forEach(function(m) { expanded.push(m); });
+      }
+      expanded.push(raw[raw.length - 1]);
     } else {
-      courseStatusEl.style.color = '#5a7a9a';
-      courseStatusEl.textContent = 'No course selected';
+      expanded = raw.slice();
     }
+
+    if (marksEl) {
+      marksEl.innerHTML = expanded.map(function(ref) {
+        return markChip(raceMarkMapCache[ref.mark_id] || ref.mark_id, ref.port);
+      }).join('<span style="color:#5a7a9a;margin:0 1px">&#8594;</span>');
+    }
+    if (detailEl) detailEl.style.display = '';
+    if (lapSelEl) {
+      lapSelEl.style.display = '';
+      [1,2,3,4,5].forEach(function(n) {
+        var btn = document.getElementById('lapBtn' + n);
+        if (btn) btn.style.background = (activeLaps === n) ? '#1e5080' : '';
+      });
+    }
+    if (statusEl) {
+      if (state === 'racing') {
+        statusEl.style.color = '#4caf82';
+        statusEl.textContent = 'Active — leg ' + ((d.legIdx || 0) + 1) + ' of ' + expanded.length;
+      } else if (state === 'idle') {
+        statusEl.style.color = '#4caf82';
+        var lapLabel = activeLaps > 1 ? ' · ' + activeLaps + ' laps' : '';
+        statusEl.textContent = activeCourse.name + lapLabel + ' — ' + expanded.length + ' marks';
+      } else {
+        statusEl.style.color = '#4caf82';
+        statusEl.textContent = 'Active — ' + activeCourse.name;
+      }
+    }
+  } else {
+    var setupCourse = document.getElementById('raceSetupCourse');
+    if (setupCourse) setupCourse.textContent = 'None';
+    if (detailEl) detailEl.style.display = 'none';
+    if (lapSelEl) lapSelEl.style.display = 'none';
+    if (statusEl) { statusEl.style.color = '#5a7a9a'; statusEl.textContent = 'No course selected'; }
   }
 }
 
@@ -1380,6 +2034,7 @@ function armRace() {
 }
 
 function endRace() {
+  if (!confirm('Finish this race and show the results?')) return;
   fetch('/race/end', {method:'POST'}).then(function(r) { return r.json(); }).then(function(d) {
     if (d.ok) loadRaceState(); else toast('Failed: ' + (d.err || ''), false);
   }).catch(function() { toast('Request failed', false); });
@@ -1413,6 +2068,15 @@ function setDuration(sec) {
   fetch('/race/duration', {method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({seconds: sec})
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) loadRaceState();
+  }).catch(function() {});
+}
+
+function setLaps(n) {
+  fetch('/race/laps', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({laps: n})
   }).then(function(r) { return r.json(); }).then(function(d) {
     if (d.ok) loadRaceState();
   }).catch(function() {});
@@ -1454,7 +2118,6 @@ function setRaceCourse() {
   }).then(function(r) { return r.json(); }).then(function(d) {
     if (d.ok) {
       toast(courseId ? 'Course set' : 'Course cleared');
-      // Keep selector stable while the next poll arrives
       if (sel) sel.value = courseId;
       loadRaceState();
     } else toast('Failed', false);
@@ -1501,23 +2164,27 @@ function loadRaceMarksAndCourses() {
     });
   }).catch(function() {});
 
-  // Courses + race state fetched together so options exist before value is set
+  // Courses + marks + race state fetched together so options exist before value is set
   Promise.all([
     fetch('/courses').then(function(r) { return r.json(); }),
+    fetch('/marks').then(function(r) { return r.json(); }),
     fetch('/race/state').then(function(r) { return r.json(); })
   ]).then(function(res) {
-    var courses = res[0], state = res[1];
+    raceCourseCache = res[0]; var marks = res[1], state = res[2];
+    raceMarkMapCache = {};
+    marks.forEach(function(m) { raceMarkMapCache[m.id] = m.name; });
     raceStateCache = state;
     var sel = document.getElementById('raceCourseSelect');
-    if (!sel) return;
-    while (sel.options.length > 1) sel.remove(1);
-    courses.forEach(function(c) {
-      var opt = document.createElement('option');
-      opt.value = c.id;
-      opt.textContent = c.name + ' (' + c.marks.length + ' marks)';
-      sel.appendChild(opt);
-    });
-    sel.value = state.courseId || '';
+    if (sel) {
+      while (sel.options.length > 1) sel.remove(1);
+      raceCourseCache.forEach(function(c) {
+        var opt = document.createElement('option');
+        opt.value = c.id;
+        opt.textContent = c.name + ' (' + c.marks.length + ' marks)';
+        sel.appendChild(opt);
+      });
+      sel.value = state.courseId || '';
+    }
     renderRacePage(state);
   }).catch(function() {});
 }
@@ -1531,21 +2198,15 @@ function loadMarks() {
       return;
     }
     var rows = marks.map(function(m) {
-      return '<tr>' +
-        '<td style="padding:6px 8px;color:#e0e8f0">' + escHtml(m.name) + '</td>' +
-        '<td style="padding:6px 8px;color:#aac8e0;font-variant-numeric:tabular-nums">' + m.lat.toFixed(7) + '</td>' +
-        '<td style="padding:6px 8px;color:#aac8e0;font-variant-numeric:tabular-nums">' + m.lon.toFixed(7) + '</td>' +
-        '<td style="padding:6px 8px"><span style="font-size:0.72rem;color:#5a7a9a">' + escHtml(m.id) + '</span></td>' +
-        '<td style="padding:6px 4px"><button class="btn btn-danger" style="padding:3px 10px;font-size:0.8rem" onclick="deleteMark(\'' + escHtml(m.id) + '\')">&#128465;</button></td>' +
-        '</tr>';
+      return '<div class="mark-row">' +
+        '<div><div class="mark-name">' + escHtml(m.name) + '</div>' +
+        '<div class="mark-coords">' + m.lat.toFixed(7) + ', ' + m.lon.toFixed(7) +
+        ' &nbsp; ' + escHtml(m.id) + '</div></div>' +
+        '<button class="btn btn-danger" aria-label="Delete ' + escHtml(m.name) +
+        '" onclick="deleteMark(\'' + escHtml(m.id) + '\')">Delete</button>' +
+        '</div>';
     }).join('');
-    el.innerHTML = '<table style="width:100%;border-collapse:collapse">' +
-      '<thead><tr style="font-size:0.72rem;color:#5a7a9a;text-transform:uppercase">' +
-      '<th style="text-align:left;padding:4px 8px">Name</th>' +
-      '<th style="text-align:left;padding:4px 8px">Lat</th>' +
-      '<th style="text-align:left;padding:4px 8px">Lon</th>' +
-      '<th style="text-align:left;padding:4px 8px">ID</th>' +
-      '<th></th></tr></thead><tbody>' + rows + '</tbody></table>';
+    el.innerHTML = rows;
   }).catch(function() {
     document.getElementById('markList').innerHTML = '<p style="color:#e85a5a;font-size:0.85rem">Failed to load marks.</p>';
   });
@@ -2031,6 +2692,12 @@ function saveTrackSettings() {
     else toast('Save failed', false);
   }).catch(function() { toast('Request failed', false); });
 }
+
+// Race is the phone-first home screen.
+loadRaceState();
+loadRaceMarksAndCourses();
+startRacePolling();
+initRaceCompass();
 </script>
 </body>
 </html>)rawhtml";
