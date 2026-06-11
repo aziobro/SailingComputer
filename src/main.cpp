@@ -30,6 +30,7 @@
 #include "config.h"
 #include "version.h"
 #include "webui.h"
+#include "crewui.h"
 #include "um982.h"
 #include "ble_nmea.h"
 #include "storage.h"
@@ -124,6 +125,34 @@ struct RaceData {
 };
 
 static RaceData raceData;
+
+struct CrewDisplayState {
+    char     phase[16];
+    char     mode[16];
+    char     activeMarkId[16];
+    char     nextMarkId[16];
+    char     startTarget[8];
+    char     priorities[4][24];
+    char     maneuver[64];
+    char     status[64];
+    int      targetHeading;
+    bool     locked;
+    uint32_t revision;
+};
+
+static CrewDisplayState crewDisplay;
+
+struct CrewResolvedState {
+    char key[112];
+    uint32_t loadedAt;
+    char courseName[32];
+    Mark activeMark;
+    Mark nextMark;
+    bool haveActive;
+    bool haveNext;
+};
+
+static CrewResolvedState crewResolved;
 
 // ── Track recorder ────────────────────────────────────────────────────────────
 
@@ -1107,6 +1136,13 @@ static esp_err_t handleRoot(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static esp_err_t handleCrewPage(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, getCrewUI(), HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 static esp_err_t handleStatus(httpd_req_t *req) {
     static const char *fixLabels[] = {
         "No Fix","GPS","DGPS","PPS","RTK Fixed","RTK Float",
@@ -2019,19 +2055,296 @@ static const CourseMarkRef *effectiveMark(const Course *c, int laps, int idx) {
     return &c->marks[1 + (idx - 1) % interior];
 }
 
+static bool stringInList(const char *value, const char *const *allowed, size_t count) {
+    if (!value) return false;
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(value, allowed[i]) == 0) return true;
+    }
+    return false;
+}
+
+static void setCrewPhase(const char *phase) {
+    if (strcmp(crewDisplay.phase, phase) == 0) return;
+    strlcpy(crewDisplay.phase, phase, sizeof(crewDisplay.phase));
+    crewDisplay.revision++;
+}
+
+static void updateRaceStateForTime(int64_t now) {
+    if (raceData.state == RACE_COUNTDOWN && now >= raceData.t0_ms) {
+        raceData.state = RACE_RACING;
+        if (strcmp(crewDisplay.phase, "prestart") == 0 ||
+            strcmp(crewDisplay.phase, "starting") == 0)
+            setCrewPhase("upwind");
+    }
+}
+
+static const char *raceStateName() {
+    return raceData.state == RACE_COUNTDOWN ? "countdown" :
+           raceData.state == RACE_RACING    ? "racing"    :
+           raceData.state == RACE_COMPLETE  ? "complete"  : "idle";
+}
+
+static bool appendMarkJson(char *json, size_t jsonSize, size_t *off,
+                           const Mark *mark) {
+    if (!mark) return appendFmt(json, jsonSize, off, "null");
+    bool ok = appendFmt(json, jsonSize, off, "{\"id\":");
+    ok = ok && appendJsonString(json, jsonSize, off, mark->id);
+    ok = ok && appendFmt(json, jsonSize, off, ",\"name\":");
+    ok = ok && appendJsonString(json, jsonSize, off, mark->name);
+    return ok && appendFmt(json, jsonSize, off, ",\"lat\":%.7f,\"lon\":%.7f}",
+                           mark->lat, mark->lon);
+}
+
+static esp_err_t handleCrewState(httpd_req_t *req) {
+    int64_t now = (int64_t)(esp_timer_get_time() / 1000LL);
+    updateRaceStateForTime(now);
+
+    char resolveKey[112];
+    snprintf(resolveKey, sizeof(resolveKey), "%u:%s:%d:%d:%s:%s",
+             crewDisplay.revision, raceData.courseId, raceData.legIdx,
+             raceData.laps, crewDisplay.activeMarkId, crewDisplay.nextMarkId);
+    uint32_t now32 = (uint32_t)now;
+    if (strcmp(resolveKey, crewResolved.key) != 0 ||
+        now32 - crewResolved.loadedAt >= 5000) {
+        memset(&crewResolved, 0, sizeof(crewResolved));
+        strlcpy(crewResolved.key, resolveKey, sizeof(crewResolved.key));
+        crewResolved.loadedAt = now32;
+
+        char activeId[16] = {};
+        char nextId[16] = {};
+        strlcpy(activeId, crewDisplay.activeMarkId, sizeof(activeId));
+        strlcpy(nextId, crewDisplay.nextMarkId, sizeof(nextId));
+
+        if (raceData.courseId[0] && (!activeId[0] || !nextId[0])) {
+            Course *courses = (Course *)malloc(MAX_COURSES * sizeof(Course));
+            if (courses) {
+                int count = storageMgr.loadCourses(courses, MAX_COURSES);
+                for (int i = 0; i < count; i++) {
+                    if (strcmp(courses[i].id, raceData.courseId) != 0) continue;
+                    strlcpy(crewResolved.courseName, courses[i].name,
+                            sizeof(crewResolved.courseName));
+                    int laps = raceData.laps > 0 ? raceData.laps : 1;
+                    if (!activeId[0]) {
+                        const CourseMarkRef *ref =
+                            effectiveMark(&courses[i], laps, raceData.legIdx);
+                        if (ref) strlcpy(activeId, ref->mark_id, sizeof(activeId));
+                    }
+                    if (!nextId[0]) {
+                        const CourseMarkRef *ref =
+                            effectiveMark(&courses[i], laps, raceData.legIdx + 1);
+                        if (ref) strlcpy(nextId, ref->mark_id, sizeof(nextId));
+                    }
+                    break;
+                }
+                free(courses);
+            }
+        }
+
+        if (activeId[0] || nextId[0]) {
+            Mark *marks = (Mark *)malloc(MAX_MARKS * sizeof(Mark));
+            if (marks) {
+                int count = storageMgr.loadMarks(marks, MAX_MARKS);
+                for (int i = 0; i < count; i++) {
+                    if (!crewResolved.haveActive && activeId[0] &&
+                        strcmp(marks[i].id, activeId) == 0) {
+                        crewResolved.activeMark = marks[i];
+                        crewResolved.haveActive = true;
+                    }
+                    if (!crewResolved.haveNext && nextId[0] &&
+                        strcmp(marks[i].id, nextId) == 0) {
+                        crewResolved.nextMark = marks[i];
+                        crewResolved.haveNext = true;
+                    }
+                }
+                free(marks);
+            }
+        }
+    }
+
+    int fix;
+    float lat, lon, hdg, speed, course, heel, leeway, lateral, drive;
+    bool hdgValid, heelValid, courseValid, sailingValid;
+    if (telemetryMtx) xSemaphoreTake(telemetryMtx, portMAX_DELAY);
+    fix = fixQuality;
+    lat = latitude;
+    lon = longitude;
+    hdg = heading;
+    hdgValid = hdtValid;
+    heel = roll;
+    heelValid = rollValid;
+    speed = sog;
+    course = cogFiltered;
+    courseValid = cogInitialized && sog >= cfgMgr.cfg.cogMinSog;
+    leeway = leewayAngle;
+    lateral = lateralDrift;
+    drive = driveSpeed;
+    sailingValid = sailingMetricsValid;
+    if (telemetryMtx) xSemaphoreGive(telemetryMtx);
+
+    char json[4096] = {};
+    size_t off = 0;
+    bool ok = appendFmt(json, sizeof(json), &off,
+        "{\"revision\":%u,\"phase\":", crewDisplay.revision);
+    ok = ok && appendJsonString(json, sizeof(json), &off, crewDisplay.phase);
+    ok = ok && appendFmt(json, sizeof(json), &off, ",\"mode\":");
+    ok = ok && appendJsonString(json, sizeof(json), &off, crewDisplay.mode);
+    ok = ok && appendFmt(json, sizeof(json), &off,
+        ",\"locked\":%s,\"startTarget\":",
+        crewDisplay.locked ? "true" : "false");
+    ok = ok && appendJsonString(json, sizeof(json), &off, crewDisplay.startTarget);
+    ok = ok && appendFmt(json, sizeof(json), &off, ",\"activeMarkId\":");
+    ok = ok && appendJsonString(json, sizeof(json), &off,
+                                crewDisplay.activeMarkId);
+    ok = ok && appendFmt(json, sizeof(json), &off, ",\"nextMarkId\":");
+    ok = ok && appendJsonString(json, sizeof(json), &off,
+                                crewDisplay.nextMarkId);
+    ok = ok && appendFmt(json, sizeof(json), &off,
+        ",\"targetHeading\":%d,\"maneuver\":", crewDisplay.targetHeading);
+    ok = ok && appendJsonString(json, sizeof(json), &off, crewDisplay.maneuver);
+    ok = ok && appendFmt(json, sizeof(json), &off, ",\"status\":");
+    ok = ok && appendJsonString(json, sizeof(json), &off, crewDisplay.status);
+    ok = ok && appendFmt(json, sizeof(json), &off, ",\"priorities\":[");
+    for (int i = 0; i < 4 && ok; i++) {
+        if (i) ok = appendFmt(json, sizeof(json), &off, ",");
+        ok = ok && appendJsonString(json, sizeof(json), &off,
+                                    crewDisplay.priorities[i]);
+    }
+    ok = ok && appendFmt(json, sizeof(json), &off,
+        "],\"server_now_ms\":%lld,\"race\":{\"state\":\"%s\","
+        "\"t0_ms\":%lld,\"end_ms\":%lld,\"duration_s\":%d,\"legIdx\":%d},"
+        "\"line\":[",
+        (long long)now, raceStateName(), (long long)raceData.t0_ms,
+        (long long)raceData.end_ms, raceData.duration_s, raceData.legIdx);
+
+    for (int i = 0; i < 2 && ok; i++) {
+        if (i) ok = appendFmt(json, sizeof(json), &off, ",");
+        ok = ok && appendFmt(json, sizeof(json), &off,
+            "{\"set\":%s,\"name\":", raceData.line[i].set ? "true" : "false");
+        ok = ok && appendJsonString(json, sizeof(json), &off, raceData.line[i].name);
+        ok = ok && appendFmt(json, sizeof(json), &off,
+            ",\"lat\":%.7f,\"lon\":%.7f}",
+            raceData.line[i].lat, raceData.line[i].lon);
+    }
+
+    ok = ok && appendFmt(json, sizeof(json), &off,
+        "],\"telemetry\":{\"fix\":%d,\"lat\":%.7f,\"lon\":%.7f,"
+        "\"heading\":%.2f,\"hdtValid\":%s,\"roll\":%.2f,\"rollValid\":%s,"
+        "\"sog\":%.2f,\"cog\":%.1f,"
+        "\"cogValid\":%s,\"leeway\":%.1f,\"lateralDrift\":%.2f,"
+        "\"driveSpeed\":%.2f,\"sailingValid\":%s},\"courseName\":",
+        fix, lat, lon, hdg, hdgValid ? "true" : "false",
+        heel, heelValid ? "true" : "false", speed, course,
+        courseValid ? "true" : "false", leeway, lateral, drive,
+        sailingValid ? "true" : "false");
+    ok = ok && appendJsonString(json, sizeof(json), &off,
+                                crewResolved.courseName);
+    ok = ok && appendFmt(json, sizeof(json), &off, ",\"activeMark\":");
+    ok = ok && appendMarkJson(json, sizeof(json), &off,
+                              crewResolved.haveActive ?
+                              &crewResolved.activeMark : nullptr);
+    ok = ok && appendFmt(json, sizeof(json), &off, ",\"nextMark\":");
+    ok = ok && appendMarkJson(json, sizeof(json), &off,
+                              crewResolved.haveNext ?
+                              &crewResolved.nextMark : nullptr);
+    ok = ok && appendFmt(json, sizeof(json), &off, "}");
+
+    if (!ok) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "Crew state JSON too large");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handleCrewStateUpdate(httpd_req_t *req) {
+    char body[1024];
+    if (readBody(req, body, sizeof(body)) < 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
+        return ESP_OK;
+    }
+    cJSON *obj = cJSON_Parse(body);
+    if (!obj) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_OK;
+    }
+
+    static const char *const phases[] = {
+        "prestart", "starting", "upwind", "downwind",
+        "reaching", "rounding", "finish", "custom"
+    };
+    static const char *const modes[] = {
+        "auto", "start", "navigation", "performance", "rounding", "custom"
+    };
+    static const char *const targets[] = {"line", "pin", "boat"};
+    static const char *const fields[] = {
+        "auto", "countdown", "time_line", "distance_line", "speed", "heading",
+        "course", "active_mark", "bearing_mark", "distance_mark",
+        "vmg_mark", "time_mark", "target_heading", "next_mark",
+        "maneuver", "status", "heel", "leeway", "drive_speed"
+    };
+
+    cJSON *v;
+    if ((v = cJSON_GetObjectItem(obj, "phase")) && cJSON_IsString(v) &&
+        stringInList(v->valuestring, phases, sizeof(phases) / sizeof(phases[0])))
+        strlcpy(crewDisplay.phase, v->valuestring, sizeof(crewDisplay.phase));
+    if ((v = cJSON_GetObjectItem(obj, "mode")) && cJSON_IsString(v) &&
+        stringInList(v->valuestring, modes, sizeof(modes) / sizeof(modes[0])))
+        strlcpy(crewDisplay.mode, v->valuestring, sizeof(crewDisplay.mode));
+    if ((v = cJSON_GetObjectItem(obj, "startTarget")) && cJSON_IsString(v) &&
+        stringInList(v->valuestring, targets, sizeof(targets) / sizeof(targets[0])))
+        strlcpy(crewDisplay.startTarget, v->valuestring,
+                sizeof(crewDisplay.startTarget));
+    if ((v = cJSON_GetObjectItem(obj, "activeMarkId")) && cJSON_IsString(v))
+        strlcpy(crewDisplay.activeMarkId, v->valuestring,
+                sizeof(crewDisplay.activeMarkId));
+    if ((v = cJSON_GetObjectItem(obj, "nextMarkId")) && cJSON_IsString(v))
+        strlcpy(crewDisplay.nextMarkId, v->valuestring,
+                sizeof(crewDisplay.nextMarkId));
+    if ((v = cJSON_GetObjectItem(obj, "maneuver")) && cJSON_IsString(v))
+        strlcpy(crewDisplay.maneuver, v->valuestring,
+                sizeof(crewDisplay.maneuver));
+    if ((v = cJSON_GetObjectItem(obj, "status")) && cJSON_IsString(v))
+        strlcpy(crewDisplay.status, v->valuestring, sizeof(crewDisplay.status));
+    if ((v = cJSON_GetObjectItem(obj, "targetHeading")) && cJSON_IsNumber(v)) {
+        int headingValue = v->valueint;
+        crewDisplay.targetHeading =
+            headingValue >= 0 && headingValue <= 359 ? headingValue : -1;
+    }
+    if ((v = cJSON_GetObjectItem(obj, "locked")) && cJSON_IsBool(v))
+        crewDisplay.locked = cJSON_IsTrue(v);
+
+    cJSON *priorities = cJSON_GetObjectItem(obj, "priorities");
+    if (cJSON_IsArray(priorities)) {
+        for (int i = 0; i < 4; i++) {
+            cJSON *field = cJSON_GetArrayItem(priorities, i);
+            if (cJSON_IsString(field) &&
+                stringInList(field->valuestring, fields,
+                             sizeof(fields) / sizeof(fields[0])))
+                strlcpy(crewDisplay.priorities[i], field->valuestring,
+                        sizeof(crewDisplay.priorities[i]));
+        }
+    }
+    crewDisplay.revision++;
+    cJSON_Delete(obj);
+
+    char response[64];
+    snprintf(response, sizeof(response), "{\"ok\":true,\"revision\":%u}",
+             crewDisplay.revision);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 // ── Race sequence HTTP handlers ───────────────────────────────────────────────
 
 static esp_err_t handleRaceState(httpd_req_t *req) {
     int64_t now = (int64_t)(esp_timer_get_time() / 1000LL);
 
-    // Auto-transition COUNTDOWN → RACING when T-0 passes
-    if (raceData.state == RACE_COUNTDOWN && now >= raceData.t0_ms)
-        raceData.state = RACE_RACING;
-
-    const char *stateStr =
-        raceData.state == RACE_COUNTDOWN ? "countdown" :
-        raceData.state == RACE_RACING    ? "racing"    :
-        raceData.state == RACE_COMPLETE  ? "complete"  : "idle";
+    updateRaceStateForTime(now);
+    const char *stateStr = raceStateName();
 
     cJSON *obj = cJSON_CreateObject();
     cJSON_AddStringToObject(obj, "state",         stateStr);
@@ -2131,6 +2444,7 @@ static esp_err_t handleRaceStart(httpd_req_t *req) {
     raceData.t0_ms = now + (int64_t)raceData.duration_s * 1000LL;
     raceData.state = RACE_COUNTDOWN;
     raceData.legIdx = 0;
+    setCrewPhase("starting");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -2140,6 +2454,7 @@ static esp_err_t handleRaceStop(httpd_req_t *req) {
     memset(&raceData, 0, sizeof(raceData));
     raceData.duration_s = 300;
     raceData.laps = 1;
+    setCrewPhase("prestart");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -2191,6 +2506,7 @@ static esp_err_t handleRaceEnd(httpd_req_t *req) {
     }
     raceData.state  = RACE_COMPLETE;
     raceData.end_ms = (int64_t)(esp_timer_get_time() / 1000LL);
+    setCrewPhase("finish");
     triggerRaceTrackExport();
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
@@ -2345,6 +2661,7 @@ static esp_err_t handleRaceNextLeg(httpd_req_t *req) {
                     if (raceData.legIdx >= effectiveMarkCount(&courses[i], effLaps)) {
                         raceData.state  = RACE_COMPLETE;
                         raceData.end_ms = now;
+                        setCrewPhase("finish");
                         complete = true;
                         triggerRaceTrackExport();
                     }
@@ -2802,7 +3119,7 @@ static void startWebServer() {
     // ── HTTPS server on port 443 ─────────────────────────────────────────────
     httpd_ssl_config_t ssl_cfg         = HTTPD_SSL_CONFIG_DEFAULT();
     ssl_cfg.httpd.max_open_sockets     = 10; // status poll + race poll + concurrent button clicks
-    ssl_cfg.httpd.max_uri_handlers     = 48; // default is 8
+    ssl_cfg.httpd.max_uri_handlers     = 56; // default is 8
     ssl_cfg.httpd.stack_size           = 10240;
     ssl_cfg.httpd.lru_purge_enable     = true;
     ssl_cfg.servercert                 = (const uint8_t *)server_cert_pem;
@@ -2824,6 +3141,8 @@ static void startWebServer() {
     // Auth model: public = /, /status, /logout
     //             HTTP Basic Auth required = all others (admin:adminPassword)
     reg(webServer, "/",            HTTP_GET,  handleRoot);        // public — SPA HTML
+    reg(webServer, "/crew",        HTTP_GET,  handleCrewPage);    // public — crew display
+    reg(webServer, "/display",     HTTP_GET,  handleCrewPage);    // public — crew display alias
     reg(webServer, "/status",      HTTP_GET,  handleStatus);      // public — live GNSS/NTRIP JSON
     reg(webServer, "/config",      HTTP_GET,  handleGetConfig);   // auth
     reg(webServer, "/config/save", HTTP_POST, handleSaveConfig);  // auth
@@ -2859,6 +3178,8 @@ static void startWebServer() {
     reg(webServer, "/race/nextleg",   HTTP_POST, handleRaceNextLeg);  // public — advance to next mark
     reg(webServer, "/race/prevleg",   HTTP_POST, handleRacePrevLeg);  // public — go back to previous mark
     reg(webServer, "/race/end",          HTTP_POST, handleRaceEnd);      // public — end race, go to stats
+    reg(webServer, "/crew/state",        HTTP_GET,  handleCrewState);       // public — combined display state
+    reg(webServer, "/crew/state",        HTTP_POST, handleCrewStateUpdate); // public — tactician controls
     reg(webServer, "/tracks/status",     HTTP_GET,  handleTrackStatus);     // public — track state
     reg(webServer, "/tracks/loop/start", HTTP_POST, handleTrackLoopStart);  // public — start loop
     reg(webServer, "/tracks/loop/stop",  HTTP_POST, handleTrackLoopStop);   // public — stop loop
@@ -3006,6 +3327,20 @@ extern "C" void app_main(void) {
 
     raceData.duration_s = 300;  // 5-minute sequence default
     raceData.laps = 1;
+    strlcpy(crewDisplay.phase, "prestart", sizeof(crewDisplay.phase));
+    strlcpy(crewDisplay.mode, "auto", sizeof(crewDisplay.mode));
+    strlcpy(crewDisplay.startTarget, "line", sizeof(crewDisplay.startTarget));
+    strlcpy(crewDisplay.priorities[0], "auto",
+            sizeof(crewDisplay.priorities[0]));
+    strlcpy(crewDisplay.priorities[1], "auto",
+            sizeof(crewDisplay.priorities[1]));
+    strlcpy(crewDisplay.priorities[2], "auto",
+            sizeof(crewDisplay.priorities[2]));
+    strlcpy(crewDisplay.priorities[3], "auto",
+            sizeof(crewDisplay.priorities[3]));
+    crewDisplay.targetHeading = -1;
+    crewDisplay.locked = true;
+    crewDisplay.revision = 1;
 
     setenv("TZ", "UTC0", 1);  // mktime must treat broken-down time as UTC
     tzset();

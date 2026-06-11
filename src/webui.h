@@ -222,11 +222,13 @@ inline const char* getWebUI() {
   #start .race-sequence-card { order: 1; }
   #start .race-line-card { order: 2; }
   #start .race-course-card { order: 3; }
-  #start.race-live .race-sequence-card { order: 1; }
-  #start.race-live .race-line-card,
-  #start.race-live .race-course-card { display: none; }
+  #start .crew-control-card { order: 4; }
   .race-actions { display: flex; gap: 10px; }
   .race-actions .btn { min-height: 56px; }
+  .crew-control-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+  .crew-priority-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+  .crew-control-actions { display: flex; gap: 10px; align-items: stretch; }
+  .crew-control-actions .btn { flex: 1; min-height: 54px; }
   #raceClock { font-size: clamp(4.2rem, 20vw, 6rem) !important; }
   #compassCanvas { width: min(220px, 62vw); height: auto; }
   #raceLapSelector .btn { flex: 1; min-width: 48px; padding-left: 8px; padding-right: 8px; }
@@ -266,6 +268,8 @@ inline const char* getWebUI() {
 
   @media (max-width: 520px) {
     .row { grid-template-columns: 1fr; gap: 0; }
+    .crew-control-grid, .crew-priority-grid { grid-template-columns: 1fr; gap: 0; }
+    .crew-control-actions { flex-direction: column; }
     .card { padding: 12px; }
     .page { padding-left: 10px; padding-right: 10px; }
     .instruments { flex-direction: column; align-items: stretch; }
@@ -683,6 +687,7 @@ inline const char* getWebUI() {
           <span style="color:#67c5ff">Boat <strong id="raceCompassHeading">--&deg;</strong></span>
           <span style="color:#ffbb45">CMG <strong id="raceCompassCmg">--&deg;</strong></span>
           <span style="color:#4fd39a">Mark <strong id="raceCompassMark">--&deg;</strong></span>
+          <span style="color:#c49cff">Heel <strong id="raceCompassHeel">--&deg;</strong></span>
         </div>
         <button id="compassEnableBtn" class="btn" onclick="requestCompassPermission()"
           style="margin-top:6px;display:none">
@@ -756,6 +761,93 @@ inline const char* getWebUI() {
         <div id="raceStatsLegs"></div>
       </div>
       <button class="btn btn-primary" style="width:100%;padding:12px" onclick="resetRace()">New Race</button>
+    </div>
+  </div>
+
+  <!-- Crew display controls -->
+  <div class="card crew-control-card">
+    <div class="card-heading-row">
+      <h2>Crew Display</h2>
+      <a href="/crew" target="_blank" rel="noopener"
+         style="color:#67c5ff;font-size:0.78rem;font-weight:800;text-decoration:none">OPEN DISPLAY</a>
+    </div>
+    <div class="crew-control-grid">
+      <div>
+        <label for="crewPhase">Race phase</label>
+        <select id="crewPhase">
+          <option value="prestart">Pre-start</option>
+          <option value="starting">Starting sequence</option>
+          <option value="upwind">Upwind leg</option>
+          <option value="downwind">Downwind leg</option>
+          <option value="reaching">Reaching leg</option>
+          <option value="rounding">Mark rounding</option>
+          <option value="finish">Finish</option>
+          <option value="custom">Free / custom</option>
+        </select>
+      </div>
+      <div>
+        <label for="crewMode">Shared display mode</label>
+        <select id="crewMode">
+          <option value="auto">Automatic by phase</option>
+          <option value="start">Start</option>
+          <option value="navigation">Navigation</option>
+          <option value="performance">Performance</option>
+          <option value="rounding">Mark rounding</option>
+          <option value="custom">Custom</option>
+        </select>
+      </div>
+      <div>
+        <label for="crewActiveMark">Active mark</label>
+        <select id="crewActiveMark">
+          <option value="">Automatic from course</option>
+        </select>
+      </div>
+      <div>
+        <label for="crewNextMark">Next mark</label>
+        <select id="crewNextMark">
+          <option value="">Automatic from course</option>
+        </select>
+      </div>
+      <div>
+        <label for="crewStartTarget">Start target</label>
+        <select id="crewStartTarget">
+          <option value="line">Start line</option>
+          <option value="pin">Pin end</option>
+          <option value="boat">Boat end</option>
+        </select>
+      </div>
+      <div>
+        <label for="crewTargetHeading">Target heading (optional)</label>
+        <input id="crewTargetHeading" type="number" min="0" max="359"
+               inputmode="numeric" placeholder="0-359">
+      </div>
+    </div>
+
+    <div class="section-title">Priority tiles</div>
+    <div class="crew-priority-grid">
+      <div><label for="crewPriority0">Priority 1</label><select id="crewPriority0"></select></div>
+      <div><label for="crewPriority1">Priority 2</label><select id="crewPriority1"></select></div>
+      <div><label for="crewPriority2">Priority 3</label><select id="crewPriority2"></select></div>
+      <div><label for="crewPriority3">Priority 4</label><select id="crewPriority3"></select></div>
+    </div>
+
+    <label for="crewManeuver">Maneuver / preparation message</label>
+    <input id="crewManeuver" type="text" maxlength="63"
+           placeholder="e.g. Bear away / set">
+    <label for="crewStatus">Status message</label>
+    <input id="crewStatus" type="text" maxlength="63"
+           placeholder="e.g. Lift +7 degrees">
+
+    <div class="toggle-row">
+      <input id="crewLocked" type="checkbox">
+      <label for="crewLocked">Lock crew displays to the shared view</label>
+    </div>
+    <div class="crew-control-actions">
+      <button class="btn btn-primary" onclick="pushCrewDisplay()">Push To Crew Displays</button>
+      <button class="btn" onclick="loadCrewControlState()">Reload Controls</button>
+    </div>
+    <div id="crewControlStatus" style="margin-top:9px;color:#6f91ad;font-size:0.78rem">
+      Loading crew display state...
     </div>
   </div>
 
@@ -1085,7 +1177,7 @@ function showPage(id) {
   window.scrollTo(0, 0);
   if (id === 'config') loadConfig();
   if (id === 'marks')  { loadMarks(); loadCourses(); }
-  if (id === 'start')  { loadRaceState(); loadRaceMarksAndCourses(); startRacePolling(); initRaceCompass(); }
+  if (id === 'start')  { loadRaceState(); loadRaceMarksAndCourses(); loadCrewControlState(); startRacePolling(); initRaceCompass(); }
   if (id !== 'start')  { stopRaceCompass(); }
   if (id === 'tracks') { startTrackPolling(); }
   if (id !== 'tracks') { stopTrackPolling(); }
@@ -1649,6 +1741,7 @@ var racePollTimer    = null;
 var raceStateCache   = null;   // latest /race/state response
 var raceCourseCache  = [];     // full course objects from /courses
 var raceMarkMapCache = {};     // mark id → name map from /marks
+var crewControlState = null;
 var markClosingKey = '';
 var markClosingSamples = [];
 var markSmgFiltered = null;
@@ -1742,6 +1835,7 @@ function drawCompass() {
   var state  = raceStateCache;
   var status = raceStatusCache;
   var boatHdg = status && status.hdtValid ? Number(status.heading) : null;
+  var heel = status && status.rollValid ? Number(status.roll) : null;
   var cmg = status && status.cogValid ? Number(status.cog) : null;
   var markBrg = null;
   if (state && status && state.state === 'racing' && state.nextMark &&
@@ -1752,6 +1846,10 @@ function drawCompass() {
   setText('raceCompassHeading', boatHdg != null ? Math.round(boatHdg) + '\u00b0' : '--\u00b0');
   setText('raceCompassCmg', cmg != null ? Math.round(cmg) + '\u00b0' : '--\u00b0');
   setText('raceCompassMark', markBrg != null ? Math.round(markBrg) + '\u00b0' : '--\u00b0');
+  setText('raceCompassHeel', heel != null ?
+    Math.abs(heel).toFixed(1) + '\u00b0 ' +
+      (Math.abs(heel) < 0.5 ? 'LEVEL' : heel > 0 ? 'STBD' : 'PORT') :
+    '--\u00b0');
 
   // Outer ring
   ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
@@ -2312,6 +2410,7 @@ function loadRaceMarksAndCourses() {
       });
       if (cur) sel.value = cur;
     });
+    populateCrewMarkSelects(marks);
   }).catch(function() {});
 
   // Courses + marks + race state fetched together so options exist before value is set
@@ -2337,6 +2436,143 @@ function loadRaceMarksAndCourses() {
     }
     renderRacePage(state);
   }).catch(function() {});
+}
+
+var crewFieldOptions = [
+  ['auto', 'Automatic for view'],
+  ['countdown', 'Race countdown / time'],
+  ['distance_line', 'Distance to start line'],
+  ['time_line', 'Time to start line'],
+  ['speed', 'Boat speed'],
+  ['heading', 'Heading'],
+  ['course', 'Course over ground'],
+  ['active_mark', 'Active mark'],
+  ['bearing_mark', 'Bearing to mark'],
+  ['distance_mark', 'Distance to mark'],
+  ['vmg_mark', 'VMG to mark'],
+  ['time_mark', 'Time to mark'],
+  ['target_heading', 'Target heading'],
+  ['next_mark', 'Next mark'],
+  ['maneuver', 'Maneuver message'],
+  ['status', 'Status message'],
+  ['heel', 'Heel / roll'],
+  ['leeway', 'Leeway'],
+  ['drive_speed', 'Drive speed']
+];
+
+function initCrewPrioritySelects() {
+  [0, 1, 2, 3].forEach(function(index) {
+    var select = document.getElementById('crewPriority' + index);
+    if (!select || select.options.length) return;
+    crewFieldOptions.forEach(function(field) {
+      var option = document.createElement('option');
+      option.value = field[0];
+      option.textContent = field[1];
+      select.appendChild(option);
+    });
+  });
+}
+
+function populateCrewMarkSelects(marks) {
+  ['crewActiveMark', 'crewNextMark'].forEach(function(id) {
+    var select = document.getElementById(id);
+    if (!select) return;
+    var current = select.value;
+    while (select.options.length > 1) select.remove(1);
+    marks.forEach(function(mark) {
+      var option = document.createElement('option');
+      option.value = mark.id;
+      option.textContent = mark.name;
+      select.appendChild(option);
+    });
+    select.value = current;
+  });
+  renderCrewControlState();
+}
+
+function renderCrewControlState() {
+  if (!crewControlState) return;
+  initCrewPrioritySelects();
+  var d = crewControlState;
+  document.getElementById('crewPhase').value = d.phase || 'prestart';
+  document.getElementById('crewMode').value = d.mode || 'auto';
+  document.getElementById('crewStartTarget').value = d.startTarget || 'line';
+  document.getElementById('crewActiveMark').value = d.activeMarkId || '';
+  document.getElementById('crewNextMark').value = d.nextMarkId || '';
+  document.getElementById('crewTargetHeading').value =
+    Number(d.targetHeading) >= 0 ? d.targetHeading : '';
+  document.getElementById('crewManeuver').value = d.maneuver || '';
+  document.getElementById('crewStatus').value = d.status || '';
+  document.getElementById('crewLocked').checked = !!d.locked;
+  (d.priorities || ['auto', 'auto', 'auto', 'auto']).forEach(function(field, index) {
+    var select = document.getElementById('crewPriority' + index);
+    if (select) select.value = field || 'auto';
+  });
+  document.getElementById('crewControlStatus').textContent =
+    'Shared state revision ' + d.revision + (d.locked ? ' - local view changes locked' : ' - local views allowed');
+}
+
+function loadCrewControlState() {
+  initCrewPrioritySelects();
+  fetch('/crew/state', {cache:'no-store'}).then(function(r) {
+    return r.json();
+  }).then(function(d) {
+    crewControlState = {
+      revision: d.revision,
+      phase: d.phase,
+      mode: d.mode,
+      startTarget: d.startTarget,
+      targetHeading: d.targetHeading,
+      maneuver: d.maneuver,
+      status: d.status,
+      locked: d.locked,
+      priorities: d.priorities,
+      activeMarkId: d.activeMarkId || '',
+      nextMarkId: d.nextMarkId || ''
+    };
+    renderCrewControlState();
+  }).catch(function() {
+    document.getElementById('crewControlStatus').textContent =
+      'Could not load crew display state';
+  });
+}
+
+function pushCrewDisplay() {
+  var headingText = document.getElementById('crewTargetHeading').value.trim();
+  var heading = headingText === '' ? -1 : parseInt(headingText, 10);
+  if (headingText !== '' && (!isFinite(heading) || heading < 0 || heading > 359)) {
+    toast('Target heading must be 0-359', false);
+    return;
+  }
+  var payload = {
+    phase: document.getElementById('crewPhase').value,
+    mode: document.getElementById('crewMode').value,
+    activeMarkId: document.getElementById('crewActiveMark').value,
+    nextMarkId: document.getElementById('crewNextMark').value,
+    startTarget: document.getElementById('crewStartTarget').value,
+    targetHeading: heading,
+    maneuver: document.getElementById('crewManeuver').value.trim(),
+    status: document.getElementById('crewStatus').value.trim(),
+    locked: document.getElementById('crewLocked').checked,
+    priorities: [0, 1, 2, 3].map(function(index) {
+      return document.getElementById('crewPriority' + index).value;
+    })
+  };
+  var status = document.getElementById('crewControlStatus');
+  status.textContent = 'Pushing update...';
+  fetch('/crew/state', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(payload)
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (!d.ok) throw new Error('Update failed');
+    status.textContent = 'Pushed to crew displays - revision ' + d.revision;
+    toast('Crew displays updated');
+    loadCrewControlState();
+  }).catch(function() {
+    status.textContent = 'Crew display update failed';
+    toast('Crew display update failed', false);
+  });
 }
 
 // ── Marks / Routes ────────────────────────────────────────────────────────────
@@ -3022,6 +3258,7 @@ function saveTrackSettings() {
 // Race is the phone-first home screen.
 loadRaceState();
 loadRaceMarksAndCourses();
+loadCrewControlState();
 startRacePolling();
 initRaceCompass();
 </script>

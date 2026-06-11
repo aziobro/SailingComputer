@@ -14,6 +14,8 @@ An ESP32-P4-based sailing computer using the **Unicore UM982** dual-antenna GNSS
 - **NTRIP client with failover** — up to 3 correction sources (e.g. rtk2go, onocoy, rtkdata) with automatic failover after 3 consecutive failures
 - **HTTPS web dashboard** — live status (public), configuration and system management (password protected) at `https://sailingcomputer.local`
 - **Phone-first racing interface** — large controls, safe-area support, and a four-button bottom navigation designed for iPhone portrait use underway
+- **Helmsman / trimmer crew display** — synchronized, daylight-readable iPad display at `/crew`, remotely controlled from the Race page
+- **Crew heel display** — select heel/roll as a priority tile, with explicit port or starboard direction
 - **WiFi AP + STA modes** — creates its own hotspot or joins an existing network
 - **OTA firmware updates** — flash new firmware over WiFi from the System tab (no USB required after initial flash)
 - **ESP32-C6 coprocessor updates** — reflash the onboard WiFi/Bluetooth processor from a tested image bundled into the P4 firmware
@@ -21,6 +23,7 @@ An ESP32-P4-based sailing computer using the **Unicore UM982** dual-antenna GNSS
 - **SD card storage** — marks, courses, and GPX files stored on SD card with SPIFFS fallback
 - **Mark & course manager** — save GPS positions, create or edit ordered courses with port/starboard roundings, and import from GPX
 - **Race start sequence** — countdown clock (5 / 10 / 15 min, adjustable ±1 min), tap-to-sync with committee boat, time-to-start-line
+- **Live start and course editing** — shoot either line end, select saved start marks, or change the active course while the timer is running
 - **Race navigation** — bearing, distance, closing-speed time-to-mark, VMG, SMG, boat heading, and CMG; previous/next mark controls
 - **Multi-lap courses** — select 1–5 laps and automatically repeat the course's interior marks before finishing
 - **Race stats** — elapsed time, leg splits, and marks-rounded summary on race completion
@@ -151,6 +154,27 @@ thumb reach:
 
 Controls use large touch targets, 16 px form text to avoid iOS zoom, and safe
 area padding for phones with a home indicator.
+
+### Crew Display
+
+Open `https://sailingcomputer.local/crew` (or `/display`) on each helm or
+trimmer iPad. The page is optimized for full-screen landscape use, remains
+usable in portrait, and refreshes shared display state without page reloads.
+
+The **Crew Display** card on the Race page controls:
+
+- Race phase and automatic or forced display mode
+- Active and next marks, including automatic course following
+- Start-line target and optional target heading
+- Four priority data tiles
+- Heel/roll as an available priority field
+- Maneuver and status messages
+- Whether crew members may cycle views locally
+
+Crew displays poll one combined state endpoint every 250 ms. Tactician changes
+increment a shared revision, which returns every connected display to the
+newly pushed shared view. Live countdown values are interpolated locally
+between updates for a smooth clock.
 
 ### Data (public — no login required)
 
